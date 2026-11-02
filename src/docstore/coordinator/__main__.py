@@ -28,8 +28,9 @@ def main() -> None:
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8100"))
     map_path = os.environ.get("SHARD_MAP_PATH", settings.SHARD_MAP_PATH)
+    terms_path = os.environ.get("TERMS_PATH", None)
 
-    service = CoordinatorService(settings, map_path=map_path)
+    service = CoordinatorService(settings, map_path=map_path, terms_path=terms_path)
     app = build_coordinator_app(settings, service)
     uvicorn.run(app, host=host, port=port, log_config=None)
 

@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +45,72 @@ from docstore.common.models import (
 from docstore.router.shard_map import ShardMapManager, create_default_3_shard_map
 
 logger = get_logger(__name__)
+
+
+def normalize_url(url: str | None) -> str:
+    """Normalize a node address URL for robust host/port comparisons."""
+    if not url:
+        return ""
+    clean = url.strip()
+    clean = clean.removeprefix("http://").removeprefix("https://").rstrip("/")
+    return clean.lower()
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Flush directory metadata to disk."""
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(str(dir_path), flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+class _DurableShardTerms(dict[str, int]):
+    """In-memory term dictionary with synchronous, durable atomic persistence on disk."""
+
+    def __init__(
+        self,
+        initial: dict[str, int],
+        on_persist: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(initial)
+        self._on_persist = on_persist
+
+    def __setitem__(self, key: str, value: int) -> None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"Shard term must be a positive integer >= 1, got {value!r}")
+        old_val = self.get(key)
+        super().__setitem__(key, value)
+        if self._on_persist is not None:
+            try:
+                self._on_persist()
+            except Exception:
+                if old_val is not None:
+                    super().__setitem__(key, old_val)
+                else:
+                    super().pop(key, None)
+                raise
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        old_state = dict(self)
+        temp = dict(*args, **kwargs)
+        for k, v in temp.items():
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise ValueError(f"Shard term must be a positive integer >= 1, got {v!r}")
+            super().__setitem__(k, v)
+        if self._on_persist is not None:
+            try:
+                self._on_persist()
+            except Exception:
+                self.clear()
+                super().update(old_state)
+                raise
 
 
 @dataclass
@@ -75,6 +144,7 @@ class CoordinatorService:
         settings: Settings,
         map_path: Path | str | None = None,
         shard_map_path: Path | str | None = None,
+        terms_path: Path | str | None = None,
     ) -> None:
         self.settings = settings
         chosen_path = shard_map_path or map_path
@@ -88,9 +158,11 @@ class CoordinatorService:
         else:
             self.map_mgr.reload()
 
+        self.terms_path = Path(terms_path) if terms_path else target_path.parent / "terms.json"
+        recovered_terms = self._load_terms(self.terms_path)
+
         self.nodes: dict[str, RegisteredNode] = {}
         self.leases: dict[str, ActiveLease] = {}  # shard_id -> ActiveLease
-        self.shard_terms: dict[str, int] = {}  # shard_id -> current term
         self.replica_states: dict[str, ReplicaState] = {}  # shard_id -> ReplicaState
         self.failover_metrics: list[dict[str, Any]] = []
         self.failover_in_progress: set[str] = set()
@@ -103,10 +175,72 @@ class CoordinatorService:
 
         self.migration_mgr = MigrationManager(settings.DATA_DIR, settings.CLUSTER_SECRET)
 
-        # Initialize shard terms
+        # Initialize shard terms with recovered terms or default 1
+        initial_terms: dict[str, int] = {}
         for entry in self.map_mgr.shard_map.entries:
-            self.shard_terms[entry.shard_id] = 1
+            initial_terms[entry.shard_id] = recovered_terms.get(entry.shard_id, 1)
             self.replica_states[entry.shard_id] = ReplicaState.DOWN
+
+        for shard_id, term in recovered_terms.items():
+            if shard_id not in initial_terms:
+                initial_terms[shard_id] = term
+
+        self.shard_terms: dict[str, int] = _DurableShardTerms(
+            initial_terms, on_persist=lambda: self._persist_terms()
+        )
+
+        # Ensure terms are persisted if file did not exist or new shards were added
+        if not self.terms_path.exists() or len(recovered_terms) != len(self.shard_terms):
+            self._persist_terms()
+
+    def _load_terms(self, path: Path) -> dict[str, int]:
+        """Load and strictly validate shard terms metadata from disk.
+
+        Raises ValueError if corrupted, unparseable, or containing invalid terms.
+        """
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            raise ValueError(f"Corrupted or unreadable terms metadata file {path}: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Corrupted terms metadata in {path}: expected JSON object, "
+                f"got {type(data).__name__}"
+            )
+
+        terms: dict[str, int] = {}
+        for shard_id, term_val in data.items():
+            if not isinstance(shard_id, str) or not shard_id:
+                raise ValueError(f"Invalid shard_id in terms metadata: {shard_id!r}")
+            if not isinstance(term_val, int) or isinstance(term_val, bool) or term_val < 1:
+                raise ValueError(
+                    f"Invalid term value for shard {shard_id!r} in terms metadata: {term_val!r}"
+                )
+            terms[shard_id] = term_val
+        return terms
+
+    def _persist_terms(self) -> None:
+        """Durably persist shard terms to disk using atomic file replacement and fsync."""
+        self.terms_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.terms_path.parent / f".tmp.{uuid.uuid4().hex}.terms.json"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(dict(self.shard_terms), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, self.terms_path)
+            _fsync_dir(self.terms_path.parent)
+        except Exception:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+            raise
 
     def is_shard_degraded(self, shard_id: str) -> bool:
         """A shard is degraded if its follower is not in SYNCED state."""
@@ -526,12 +660,16 @@ class CoordinatorService:
         primary_addr = entries[0].primary
         follower_addr = entries[0].follower
 
+        clean_reg = normalize_url(reg.address)
+        clean_pri = normalize_url(primary_addr)
+        clean_fol = normalize_url(follower_addr)
+
         # Check if shard already has both primary and follower
-        if primary_addr and follower_addr:
-            if reg.address != primary_addr and reg.address != follower_addr:
+        if clean_pri and clean_fol:
+            if clean_reg != clean_pri and clean_reg != clean_fol:
                 raise ValueError(f"Shard {shard_id!r} already has primary and follower.")
 
-        if primary_addr and reg.address != primary_addr:
+        if clean_pri and clean_reg != clean_pri:
             # If a primary is already running for this shard and this node is not it,
             # this node must be registered as FOLLOWER to prevent stale primary split-brain.
             role = NodeRole.FOLLOWER
@@ -539,9 +677,9 @@ class CoordinatorService:
             role = reg.requested_role
         else:
             # Check addresses in shard map
-            if reg.address == primary_addr or not primary_addr:
+            if clean_reg == clean_pri or not clean_pri:
                 role = NodeRole.PRIMARY
-            elif reg.address == follower_addr:
+            elif clean_reg == clean_fol:
                 role = NodeRole.FOLLOWER
             else:
                 # Default first registered node to primary, second to follower
@@ -567,7 +705,7 @@ class CoordinatorService:
         map_changed = False
         for entry in current_map.entries:
             if entry.shard_id == shard_id:
-                if role == NodeRole.PRIMARY and entry.primary != reg.address:
+                if role == NodeRole.PRIMARY and normalize_url(entry.primary) != clean_reg:
                     # H3: bump ownership_epoch so routers detect the address change
                     # immediately via epoch staleness, not just after TTL expiry.
                     entry = entry.model_copy(
@@ -577,7 +715,7 @@ class CoordinatorService:
                         }
                     )
                     map_changed = True
-                elif role == NodeRole.FOLLOWER and entry.follower != reg.address:
+                elif role == NodeRole.FOLLOWER and normalize_url(entry.follower) != clean_reg:
                     entry = entry.model_copy(update={"follower": reg.address})
                     map_changed = True
             updated_entries.append(entry)
@@ -625,10 +763,6 @@ class CoordinatorService:
                         lease=None,
                         map_version=current_map.map_version,
                     )
-            clean_reg = reg.address.removeprefix("http://").removeprefix("https://").rstrip("/")
-            clean_pri = (
-                (primary_addr or "").removeprefix("http://").removeprefix("https://").rstrip("/")
-            )
             if existing_lease is None and clean_reg != clean_pri:
                 if now_mono < self._recovery_quarantine_until_monotonic:
                     logger.warning(
@@ -692,12 +826,14 @@ class CoordinatorService:
         """Process heartbeat from a node.
 
         Primary heartbeats renew the primary's lease and report follower state.
+        Fences stale, unregistered, or unauthorized primaries permanently.
         """
         now_mono = time.monotonic()
         now_wall = time.time()
         shard_id = hb.shard_id
         current_term = self.shard_terms.get(shard_id, 1)
 
+        # 1. Term fence: heartbeat term must match durable term exactly
         if hb.term < current_term:
             raise StaleTerm(f"Heartbeat carries stale term {hb.term} < current {current_term}")
         if hb.term > current_term:
@@ -705,22 +841,67 @@ class CoordinatorService:
                 f"Heartbeat carries unknown future term {hb.term} > current {current_term}"
             )
 
-        # Update last seen
-        if hb.node_id in self.nodes:
-            self.nodes[hb.node_id].last_seen_monotonic = now_mono
-            self.nodes[hb.node_id].term = hb.term
-        else:
-            self.nodes[hb.node_id] = RegisteredNode(
-                node_id=hb.node_id,
-                shard_id=shard_id,
-                address="",
-                role=hb.role,
-                term=hb.term,
-                last_seen_monotonic=now_mono,
+        # 2. Registration fence: unknown nodes must never be inserted or granted authority
+        if hb.node_id not in self.nodes:
+            logger.warning(
+                "Heartbeat rejected: unknown/unregistered node %s for shard %s",
+                hb.node_id,
+                shard_id,
             )
+            return None
+
+        registered = self.nodes[hb.node_id]
+
+        # 3. Shard validation
+        if registered.shard_id != shard_id:
+            logger.warning(
+                "Heartbeat rejected: node %s belongs to shard %s, not %s",
+                hb.node_id,
+                registered.shard_id,
+                shard_id,
+            )
+            return None
+
+        # Update last seen and term for the registered node
+        registered.last_seen_monotonic = now_mono
+        registered.term = hb.term
+
+        # Follower heartbeats never receive leases
+        if hb.role == NodeRole.FOLLOWER:
+            return None
 
         if hb.role == NodeRole.PRIMARY:
-            # Check for conflicting active lease or coordinator quarantine
+            # 4. Registered role fence: node must be registered as PRIMARY
+            if registered.role != NodeRole.PRIMARY:
+                logger.warning(
+                    "Heartbeat rejected: node %s registered as %s cannot claim PRIMARY authority",
+                    hb.node_id,
+                    registered.role.value,
+                )
+                return None
+
+            # 5. Authoritative primary address fence
+            shard_entry = next(
+                (e for e in self.map_mgr.shard_map.entries if e.shard_id == shard_id),
+                None,
+            )
+            if shard_entry is None:
+                logger.warning("Heartbeat rejected: unknown shard %s in shard map", shard_id)
+                return None
+
+            clean_node = normalize_url(registered.address)
+            clean_primary = normalize_url(shard_entry.primary)
+            if not clean_node or clean_node != clean_primary:
+                logger.warning(
+                    "Heartbeat rejected: node %s (addr=%s) is not the authorized primary (%s) "
+                    "in shard map",
+                    hb.node_id,
+                    registered.address,
+                    shard_entry.primary,
+                )
+                return None
+
+            # 6. Conflicting active lease fence
             existing_lease = self.leases.get(shard_id)
             if existing_lease is not None and existing_lease.node_id != hb.node_id:
                 safety_cutoff = existing_lease.expires_at_monotonic + self.settings.SAFETY_MARGIN_S
@@ -734,35 +915,6 @@ class CoordinatorService:
                         now_mono,
                     )
                     return None
-            elif existing_lease is None:
-                # Coordinator restart: quarantine check
-                shard_entry = next(
-                    (e for e in self.map_mgr.shard_map.entries if e.shard_id == shard_id),
-                    None,
-                )
-                primary_addr = shard_entry.primary if shard_entry else None
-                node_addr = self.nodes[hb.node_id].address if hb.node_id in self.nodes else ""
-
-                is_incumbent = False
-                if primary_addr and node_addr:
-                    clean_node = (
-                        node_addr.removeprefix("http://").removeprefix("https://").rstrip("/")
-                    )
-                    clean_primary = (
-                        primary_addr.removeprefix("http://").removeprefix("https://").rstrip("/")
-                    )
-                    if clean_node == clean_primary:
-                        is_incumbent = True
-
-                if not is_incumbent and now_mono < self._recovery_quarantine_until_monotonic:
-                    logger.warning(
-                        "Heartbeat: coordinator recovery quarantine active until %.2f (mono=%.2f); "
-                        "cannot grant lease to non-incumbent node %s",
-                        self._recovery_quarantine_until_monotonic,
-                        now_mono,
-                        hb.node_id,
-                    )
-                    return None
 
             # Update follower state as seen by primary
             prev_state = self.replica_states.get(shard_id)
@@ -774,7 +926,7 @@ class CoordinatorService:
                         m["synced_timestamp"] = now_wall
                         break
 
-            # Renew lease
+            # Renew lease for the authorized primary
             expires_wall = now_wall + self.settings.LEASE_DURATION_S
             expires_mono = now_mono + self.settings.LEASE_DURATION_S
             self.leases[shard_id] = ActiveLease(
