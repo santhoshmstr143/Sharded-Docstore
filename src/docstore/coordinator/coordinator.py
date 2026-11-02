@@ -94,6 +94,10 @@ class CoordinatorService:
         self.replica_states: dict[str, ReplicaState] = {}  # shard_id -> ReplicaState
         self.failover_metrics: list[dict[str, Any]] = []
         self.failover_in_progress: set[str] = set()
+        self._started_at_monotonic: float = time.monotonic()
+        self._recovery_quarantine_until_monotonic: float = (
+            self._started_at_monotonic + settings.LEASE_DURATION_S + settings.SAFETY_MARGIN_S
+        )
 
         from docstore.coordinator.migration import MigrationManager
 
@@ -241,9 +245,14 @@ class CoordinatorService:
             if existing_lease:
                 safety_cutoff = existing_lease.expires_at_monotonic + self.settings.SAFETY_MARGIN_S
                 wait_s = max(0.0, safety_cutoff - time.monotonic())
-                if wait_s > 0:
-                    logger.info("Safety wait for old primary lease expiry + M: %.2fs", wait_s)
-                    await asyncio.sleep(wait_s)
+            else:
+                # Coordinator restart: wait for quarantine window to elapse
+                # so any old lease is guaranteed to have expired
+                wait_s = max(0.0, self._recovery_quarantine_until_monotonic - time.monotonic())
+
+            if wait_s > 0:
+                logger.info("Safety wait for old primary lease expiry + M: %.2fs", wait_s)
+                await asyncio.sleep(wait_s)
 
             # Step 5 & 6: Bump term, range epochs, and persist shard map
             new_term = self.bump_shard_failover(
@@ -419,6 +428,11 @@ class CoordinatorService:
 
         for entry in current_map.entries:
             if entry.shard_id == shard_id and entry.range.start <= start and end <= entry.range.end:
+                if found:
+                    raise ValueError(
+                        f"Ambiguous range mapping: multiple entries match [{start}, {end}) "
+                        f"for shard {shard_id!r}"
+                    )
                 found = True
                 new_epoch = entry.ownership_epoch + 1
 
@@ -601,6 +615,24 @@ class CoordinatorService:
                         existing_lease.node_id,
                         safety_cutoff,
                         now_mono,
+                    )
+                    return RegistrationResponse(
+                        node_id=reg.node_id,
+                        shard_id=shard_id,
+                        role=role,
+                        term=term,
+                        ranges=ranges,
+                        lease=None,
+                        map_version=current_map.map_version,
+                    )
+            elif existing_lease is None and reg.address != primary_addr:
+                if now_mono < self._recovery_quarantine_until_monotonic:
+                    logger.warning(
+                        "Registration: coordinator recovery quarantine active until %.2f "
+                        "(mono=%.2f); cannot grant lease to non-incumbent node %s",
+                        self._recovery_quarantine_until_monotonic,
+                        now_mono,
+                        reg.node_id,
                     )
                     return RegistrationResponse(
                         node_id=reg.node_id,

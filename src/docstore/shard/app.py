@@ -43,7 +43,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -226,14 +226,122 @@ def _persist_node_metadata(state: NodeState) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, meta_path)
+    dirfd = os.open(str(data_dir), os.O_RDONLY)
     try:
-        dirfd = os.open(str(data_dir), os.O_RDONLY)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
-    except OSError:
-        pass
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+
+
+def _reconcile_all_ownership_epochs(
+    configured_ranges: Sequence[ShardRangeConfig] | None,
+    meta_ranges: Sequence[dict[str, Any] | ShardRangeConfig] | None,
+    snapshot_epochs: dict[str, Any] | None,
+) -> list[ShardRangeConfig]:
+    """Reconcile ownership epochs across configured, persisted metadata, and snapshot sources.
+
+    Validates that:
+      - All range bounds and epoch numbers are valid.
+      - All non-empty sources agree on the exact same set of range bounds.
+        If range boundaries differ unexpectedly, raises ValueError (fails closed).
+      - Reconciles ownership epochs by taking the maximum across all valid sources,
+        ensuring an older snapshot or startup config can never overwrite a newer persisted epoch.
+    """
+    cfg_map: dict[tuple[int, int], int] = {}
+    if configured_ranges:
+        for r in configured_ranges:
+            if r.start < DOC_ID_MIN or r.end <= r.start or r.ownership_epoch < 0:
+                raise ValueError(f"Invalid configured range bounds or epoch: {r}")
+            cfg_map[(r.start, r.end)] = r.ownership_epoch
+
+    meta_map: dict[tuple[int, int], int] = {}
+    if meta_ranges:
+        for item in meta_ranges:
+            if isinstance(item, ShardRangeConfig):
+                s, e, ep = item.start, item.end, item.ownership_epoch
+            elif isinstance(item, dict):
+                if "start" not in item or "end" not in item or "ownership_epoch" not in item:
+                    raise ValueError(f"Invalid metadata range dict: {item}")
+                try:
+                    s = int(item["start"])
+                    e = int(item["end"])
+                    ep = int(item["ownership_epoch"])
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(f"Non-integer metadata range bounds in {item}") from exc
+            else:
+                raise ValueError(f"Invalid metadata range type: {type(item).__name__}")
+            if s < DOC_ID_MIN or e <= s or ep < 0:
+                raise ValueError(f"Invalid metadata range bounds or epoch: {s}-{e}, epoch={ep}")
+            meta_map[(s, e)] = ep
+
+    snap_map: dict[tuple[int, int], int] = {}
+    if snapshot_epochs is not None:
+        if not isinstance(snapshot_epochs, dict):
+            raise ValueError(
+                f"ownership_epochs must be a dict, got {type(snapshot_epochs).__name__}"
+            )
+        for range_key, epoch in snapshot_epochs.items():
+            if not isinstance(range_key, str):
+                raise ValueError(f"Invalid range key type: {type(range_key).__name__}")
+            parts = range_key.split("-")
+            if len(parts) != 2:
+                raise ValueError(f"Invalid range key format: {range_key}")
+            try:
+                s = int(parts[0])
+                e = int(parts[1])
+            except ValueError as exc:
+                raise ValueError(f"Non-integer range bounds in {range_key}") from exc
+            if s < DOC_ID_MIN or e <= s:
+                raise ValueError(f"Invalid range boundaries: {s}-{e}")
+            if not isinstance(epoch, int) or epoch < 0:
+                raise ValueError(f"Invalid ownership epoch {epoch} for range {range_key}")
+            snap_map[(s, e)] = epoch
+
+    present_sources: list[tuple[str, set[tuple[int, int]]]] = []
+    if cfg_map:
+        present_sources.append(("configured", set(cfg_map.keys())))
+    if meta_map:
+        present_sources.append(("metadata", set(meta_map.keys())))
+    if snap_map:
+        present_sources.append(("snapshot", set(snap_map.keys())))
+
+    if len(present_sources) > 1:
+        base_name, base_keys = present_sources[0]
+        for other_name, other_keys in present_sources[1:]:
+            if base_keys != other_keys:
+                raise ValueError(
+                    f"Incompatible range mapping between {base_name} {sorted(base_keys)} "
+                    f"and {other_name} {sorted(other_keys)}"
+                )
+
+    if not present_sources:
+        return []
+
+    target_keys = present_sources[0][1]
+    result: list[ShardRangeConfig] = []
+    for s, e in sorted(target_keys, key=lambda item: item[0]):
+        epoch = 0
+        if (s, e) in cfg_map:
+            epoch = max(epoch, cfg_map[(s, e)])
+        if (s, e) in meta_map:
+            epoch = max(epoch, meta_map[(s, e)])
+        if (s, e) in snap_map:
+            epoch = max(epoch, snap_map[(s, e)])
+        result.append(ShardRangeConfig(start=s, end=e, ownership_epoch=epoch))
+
+    return result
+
+
+def _reconcile_ownership_epochs(
+    configured_ranges: list[ShardRangeConfig],
+    epoch_map: dict[str, Any] | None,
+) -> list[ShardRangeConfig]:
+    """Reconcile snapshot ownership epochs with configured ranges."""
+    return _reconcile_all_ownership_epochs(
+        configured_ranges=configured_ranges,
+        meta_ranges=None,
+        snapshot_epochs=epoch_map,
+    )
 
 
 def _configure_ranges(state: NodeState) -> None:
@@ -258,20 +366,24 @@ async def _recover(state: NodeState) -> None:
     # 1. Load durable node metadata if present
     meta_path = data_dir / "node_metadata.json"
     is_disk_recovery = meta_path.exists()
+    meta_ranges: list[dict[str, Any]] | None = None
     if meta_path.exists():
         try:
             with open(meta_path, encoding="utf-8") as f:
                 meta = json.load(f)
                 state.term = meta.get("term", state.term)
                 state.committed_seq = meta.get("committed_seq", 0)
-                if "ranges" in meta and not state.ranges:
-                    for r in meta["ranges"]:
-                        state.ranges.append(ShardRangeConfig(**r))
+                if "ranges" in meta:
+                    meta_ranges = meta["ranges"]
         except Exception as exc:
-            logger.warning("Failed to load node metadata from %s: %s", meta_path, exc)
+            logger.error("Failed to load node metadata from %s: %s", meta_path, exc)
+            raise RuntimeError(
+                f"Corrupt or unreadable node metadata at {meta_path}: {exc}"
+            ) from exc
 
     # 2. Load snapshot if present
     snap = snap_mgr.load()
+    snap_epochs: dict[str, Any] | None = None
     if snap:
         for doc_id, doc in snap["documents"].items():
             state.engine._docs[doc_id] = doc
@@ -281,14 +393,14 @@ async def _recover(state: NodeState) -> None:
         state.engine.dedup_import(snap.get("dedup_table", {}))
         state.committed_seq = max(state.committed_seq, snap["last_applied_seq"])
         after_seq = snap["last_applied_seq"]
+        snap_epochs = snap.get("ownership_epochs")
 
-        epoch_map: dict[str, int] = snap.get("ownership_epochs", {})
-        if epoch_map and not state.ranges:
-            for range_key, epoch in epoch_map.items():
-                s, e = range_key.split("-", 1)
-                state.ranges.append(
-                    ShardRangeConfig(start=int(s), end=int(e), ownership_epoch=epoch)
-                )
+    # 3. Reconcile all range sources: startup config, persisted metadata, and snapshot
+    state.ranges = _reconcile_all_ownership_epochs(
+        configured_ranges=state.ranges,
+        meta_ranges=meta_ranges,
+        snapshot_epochs=snap_epochs,
+    )
 
     _configure_ranges(state)
 
@@ -416,7 +528,12 @@ async def _replicate_to_follower(
         )
         if resp.status_code == 200:
             data = resp.json()
+            if data.get("status") == "gap":
+                state.follower_state = ReplicaState.CATCHING_UP
+                logger.warning("Follower replication returned gap; marked follower as CATCHING_UP")
+                return False
             return bool(data.get("status") == "ok")
+        state.follower_state = ReplicaState.DOWN
         logger.warning(
             "Follower replication returned status=%d body=%s", resp.status_code, resp.text
         )
@@ -932,11 +1049,44 @@ async def resync_with_primary(
                 if snap_term > target_term:
                     target_term = snap_term
 
-                ownership_epochs = snap_data.get("ownership_epochs")
-                if not ownership_epochs:
-                    ownership_epochs = {
-                        f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges
-                    }
+                snap_ownership_epochs = snap_data.get("ownership_epochs")
+                try:
+                    reconciled_ranges = _reconcile_ownership_epochs(
+                        state.ranges, snap_ownership_epochs
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Shard %s cannot reconcile via snapshot: range mapping incompatible: "
+                        "%s. Node fails closed.",
+                        state.shard_id,
+                        exc,
+                    )
+                    return False
+
+                # Preserve fencing rules: avoid accepting stale ownership epochs from primary
+                if snap_ownership_epochs:
+                    is_stale_epoch = False
+                    for r in state.ranges:
+                        k = f"{r.start}-{r.end}"
+                        if (
+                            k in snap_ownership_epochs
+                            and snap_ownership_epochs[k] < r.ownership_epoch
+                        ):
+                            logger.error(
+                                "Shard %s cannot reconcile via snapshot: snapshot epoch (%d) < "
+                                "local epoch (%d) for range %s. Rejecting stale snapshot. "
+                                "Node fails closed.",
+                                state.shard_id,
+                                snap_ownership_epochs[k],
+                                r.ownership_epoch,
+                                k,
+                            )
+                            is_stale_epoch = True
+                            break
+                    if is_stale_epoch:
+                        return False
+
+                target_epochs = {f"{r.start}-{r.end}": r.ownership_epoch for r in reconciled_ranges}
                 dedup_table = snap_data.get("dedup_table", {})
 
                 try:
@@ -944,7 +1094,7 @@ async def resync_with_primary(
                         documents=parsed_docs,
                         last_applied_seq=snap_last_applied_seq,
                         term=target_term,
-                        ownership_epochs=ownership_epochs,
+                        ownership_epochs=target_epochs,
                         dedup_table=dedup_table,
                     )
                 except Exception as exc:
@@ -957,6 +1107,7 @@ async def resync_with_primary(
 
                 # 4. Now that snapshot is durably saved on disk, update in-memory state
                 state.term = target_term
+                state.ranges = reconciled_ranges
                 state.engine._docs.clear()
                 state.engine._index.clear()
                 for did, doc in parsed_docs.items():
@@ -983,6 +1134,30 @@ async def resync_with_primary(
 
                 if "term" in div_data and div_data["term"] > state.term:
                     state.term = div_data["term"]
+
+                primary_epochs = div_data.get("ownership_epochs")
+                if primary_epochs:
+                    for r in state.ranges:
+                        k = f"{r.start}-{r.end}"
+                        if k in primary_epochs and primary_epochs[k] < r.ownership_epoch:
+                            logger.error(
+                                "Shard %s cannot reconcile via divergence: primary epoch (%d) < "
+                                "local epoch (%d) for range %s. Rejecting stale primary.",
+                                state.shard_id,
+                                primary_epochs[k],
+                                r.ownership_epoch,
+                                k,
+                            )
+                            return False
+                    try:
+                        state.ranges = _reconcile_ownership_epochs(state.ranges, primary_epochs)
+                    except Exception as exc:
+                        logger.error(
+                            "Shard %s cannot reconcile ownership epochs from primary: %s",
+                            state.shard_id,
+                            exc,
+                        )
+                        return False
                 # Truncate divergent tail after div_seq
                 state.wal.truncate_after(div_seq)
                 # Rebuild in-memory engine and dedup up to div_seq
@@ -1058,14 +1233,26 @@ async def resync_with_primary(
                 "shard_id": state.shard_id,
                 "node_id": state.node_id,
                 "last_applied_seq": state.engine.last_applied_seq,
+                "term": state.term,
+                "committed_seq": state.committed_seq,
+                "ownership_epochs": {f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges},
             }
             comp_bytes = json.dumps(comp_body, separators=(",", ":")).encode("utf-8")
             comp_sig = compute_signature(state.settings.CLUSTER_SECRET, comp_bytes)
-            await client.post(
+            comp_resp = await client.post(
                 complete_url,
                 content=comp_bytes,
                 headers={"Content-Type": "application/json", CLUSTER_SIG_HEADER: comp_sig},
             )
+            if comp_resp.status_code != 200:
+                logger.error(
+                    "Primary rejected rejoin_complete for shard %s on node %s: HTTP %d: %s",
+                    state.shard_id,
+                    state.node_id,
+                    comp_resp.status_code,
+                    comp_resp.text,
+                )
+                return False
 
             logger.info(
                 "Resync complete for shard %s on node %s: caught up to seq %d",
@@ -1608,26 +1795,91 @@ def build_app(
     async def apply_snapshot(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         async with state.write_lock():
+            snap_seq = int(body.get("last_applied_seq", 0))
+            if snap_seq < state.committed_seq:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot apply snapshot with last_applied_seq ({snap_seq}) < "
+                        f"local committed_seq ({state.committed_seq})"
+                    ),
+                )
+            snap_term = int(body.get("term", state.term))
+            if snap_term < state.term:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot apply snapshot with term ({snap_term}) < local term ({state.term})"
+                    ),
+                )
+
+            reconciled_ranges = state.ranges
+            snap_epochs = body.get("ownership_epochs")
+            if snap_epochs is not None:
+                try:
+                    reconciled_ranges = _reconcile_ownership_epochs(state.ranges, snap_epochs)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Incompatible snapshot ownership epochs: {exc}",
+                    ) from exc
+
+                for r in state.ranges:
+                    k = f"{r.start}-{r.end}"
+                    if k in snap_epochs and snap_epochs[k] < r.ownership_epoch:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Snapshot epoch ({snap_epochs[k]}) < local epoch "
+                                f"({r.ownership_epoch}) for range {k}"
+                            ),
+                        )
+
             # C2: all_docs() returns dict[int, dict]; iterating the dict yields keys,
-            # not documents.  Handle both the dict format (current) and a list format
-            # (future-proofing) so the follower resync never crashes.
+            # not documents. Handle both the dict format (current) and a list format.
             docs = body.get("documents", {})
-            state.engine._docs.clear()
-            state.engine._index.clear()
+            parsed_docs: dict[int, dict[str, Any]] = {}
             if isinstance(docs, dict):
                 for doc_id_str, doc in docs.items():
-                    doc_id = int(doc_id_str)
-                    state.engine._docs[doc_id] = doc
-                    state.engine._index[doc_id] = None
-            else:  # list format (future-proofing)
+                    parsed_docs[int(doc_id_str)] = doc
+            else:
                 for doc in docs:
-                    doc_id = doc["doc_id"]
-                    state.engine._docs[doc_id] = doc
-                    state.engine._index[doc_id] = None
-            state.engine.last_applied_seq = body.get("last_applied_seq", 0)
-            state.primary_seq = state.engine.last_applied_seq
-            state.term = body.get("term", state.term)
-            state.engine.dedup_import(body.get("dedup_table", {}))
+                    parsed_docs[int(doc["doc_id"])] = doc
+
+            target_term = max(state.term, snap_term)
+            target_epochs = {f"{r.start}-{r.end}": r.ownership_epoch for r in reconciled_ranges}
+            dedup_table = body.get("dedup_table", {})
+
+            # Durably persist snapshot BEFORE modifying in-memory state or truncating WAL!
+            if state.snapshot_mgr:
+                try:
+                    state.snapshot_mgr.save(
+                        documents=parsed_docs,
+                        last_applied_seq=snap_seq,
+                        term=target_term,
+                        ownership_epochs=target_epochs,
+                        dedup_table=dedup_table,
+                    )
+                except Exception as exc:
+                    logger.error("Failed to durably persist applied snapshot: %s", exc)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to durably persist snapshot: {exc}",
+                    ) from exc
+
+            state.engine._docs.clear()
+            state.engine._index.clear()
+            for doc_id, doc in parsed_docs.items():
+                state.engine._docs[doc_id] = doc
+                state.engine._index[doc_id] = None
+
+            state.engine.last_applied_seq = snap_seq
+            state.primary_seq = snap_seq
+            state.term = target_term
+            state.ranges = reconciled_ranges
+            state.engine.dedup_import(dedup_table)
+            state.committed_seq = max(state.committed_seq, snap_seq)
+            _persist_node_metadata(state)
 
             if state.wal is not None:
                 state.wal.truncate_after(state.engine.last_applied_seq)
@@ -1889,6 +2141,7 @@ def build_app(
             "divergence_seq": candidate_divergence,
             "last_seq": last_seq,
             "term": state.term,
+            "ownership_epochs": {f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges},
             "needs_snapshot": needs_snapshot,
             "first_conflict_seq": first_conflict_seq,
         }
@@ -1897,11 +2150,77 @@ def build_app(
     async def rejoin_complete(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         async with state.write_lock():
+            if state.role != NodeRole.PRIMARY:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Node {state.node_id} is not primary for shard {state.shard_id}",
+                )
+
+            # 1. Term check: follower must be on the primary's term
+            if "term" in body:
+                f_term = int(body["term"])
+                if f_term != state.term:
+                    logger.warning(
+                        "Follower rejoin rejected: term mismatch (%d != primary term %d)",
+                        f_term,
+                        state.term,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Term mismatch: follower term {f_term} != primary term {state.term}"
+                        ),
+                    )
+
+            # 2. Sequence check: follower must have caught up to at least primary's committed_seq
+            follower_seq = body.get("last_applied_seq", state.wal.last_seq if state.wal else 0)
+            if follower_seq < state.committed_seq:
+                logger.warning(
+                    "Follower rejoin rejected: sequence lag (follower_seq=%d < primary "
+                    "committed_seq=%d)",
+                    follower_seq,
+                    state.committed_seq,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Follower has not caught up: seq {follower_seq} < "
+                        f"committed_seq {state.committed_seq}"
+                    ),
+                )
+
+            # 3. Ownership epoch & range mapping validation
+            f_epochs = body.get("ownership_epochs")
+            if f_epochs is not None and isinstance(f_epochs, dict):
+                p_epochs = {f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges}
+                if set(f_epochs.keys()) != set(p_epochs.keys()):
+                    logger.warning(
+                        "Follower rejoin rejected: incompatible range mapping: %s vs %s",
+                        f_epochs,
+                        p_epochs,
+                    )
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Incompatible range mapping between primary and follower",
+                    )
+                for rk, p_ep in p_epochs.items():
+                    f_ep = f_epochs.get(rk)
+                    if f_ep is not None and f_ep < p_ep:
+                        logger.warning(
+                            "Follower rejoin rejected: stale epoch for range %s (%d < %d)",
+                            rk,
+                            f_ep,
+                            p_ep,
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Follower has stale ownership epoch for {rk}: {f_ep} < {p_ep}",
+                        )
+
             follower_url = body.get("follower_url")
             if follower_url:
                 state.follower_url = follower_url
             state.follower_state = ReplicaState.SYNCED
-            follower_seq = body.get("last_applied_seq", state.wal.last_seq if state.wal else 0)
             state.follower_acked_seq = max(state.follower_acked_seq, follower_seq)
             logger.info(
                 "Follower rejoin complete for shard %s: follower_url=%s, state=SYNCED",
@@ -1949,6 +2268,20 @@ def build_app(
         limit = body.get("limit", 1000)
 
         assert state.wal is not None
+        earliest = state.wal.earliest_seq()
+        if earliest is not None and earliest > after_seq + 1:
+            return {
+                "status": "compacted",
+                "needs_snapshot": True,
+                "earliest_seq": earliest,
+                "entries": [],
+                "last_seq": state.wal.last_seq,
+                "error_message": (
+                    f"Requested cursor after_seq={after_seq} is older than earliest "
+                    f"retained seq={earliest}; snapshot required."
+                ),
+            }
+
         matched_entries = []
         for entry in state.wal.replay(after_seq=after_seq):
             doc_id = entry.get("doc_id")

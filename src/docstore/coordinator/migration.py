@@ -232,6 +232,7 @@ class MigrationManager:
             s_seq: int = snap_resp.get("snapshot_seq", 0)
             docs: list[dict[str, Any]] = snap_resp.get("documents", [])
             rec.snapshot_start_seq = s_seq
+            rec.last_caught_up_seq = s_seq
             rec.docs_copied = len(docs)
             if docs:
                 rec.last_copied_doc_id = max(d["doc_id"] for d in docs)
@@ -270,6 +271,11 @@ class MigrationManager:
                         "limit": 500,
                     },
                 )
+                if oplog_resp.get("needs_snapshot") or oplog_resp.get("status") == "compacted":
+                    raise RuntimeError(
+                        f"Migration {rec.migration_id} oplog cursor {current_cursor} was "
+                        "compacted away; new snapshot required."
+                    )
                 entries: list[dict[str, Any]] = oplog_resp.get("entries", [])
                 src_last_seq: int = oplog_resp.get("last_seq", current_cursor)
 
@@ -323,6 +329,14 @@ class MigrationManager:
                         "limit": 1000,
                     },
                 )
+                if (
+                    final_oplog_resp.get("needs_snapshot")
+                    or final_oplog_resp.get("status") == "compacted"
+                ):
+                    raise RuntimeError(
+                        f"Migration {rec.migration_id} final catchup cursor {current_cursor} "
+                        "was compacted away; new snapshot required."
+                    )
                 final_entries = final_oplog_resp.get("entries", [])
                 if final_entries:
                     await _rpc(
@@ -333,8 +347,17 @@ class MigrationManager:
                         },
                     )
                     rec.catchup_ops_replayed += len(final_entries)
-                    rec.last_caught_up_seq = final_h_seq
-                    self.save_record(rec)
+                rec.last_caught_up_seq = final_h_seq
+                self.save_record(rec)
+            else:
+                rec.last_caught_up_seq = max(rec.last_caught_up_seq or 0, current_cursor)
+                self.save_record(rec)
+
+            if final_h_seq > (rec.last_caught_up_seq or 0):
+                raise RuntimeError(
+                    f"Migration {rec.migration_id} catch-up did not converge: "
+                    f"destination at seq {rec.last_caught_up_seq}, source paused at {final_h_seq}."
+                )
 
             # ── 5. VERIFY ────────────────────────────────────────────────────
             rec.state = MigrationState.VERIFY

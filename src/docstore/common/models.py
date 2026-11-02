@@ -362,7 +362,14 @@ class ResponseMeta(BaseModel):
 
 
 class WriteResponse(BaseModel):
-    """Response returned to the client for every write operation."""
+    """Response returned to the client for every write operation.
+
+    Semantics:
+      - COMMITTED: Write was durably replicated and committed; seq is a non-null integer.
+      - REJECTED: Write was rejected before state mutation; seq is None.
+      - OUTCOME_UNKNOWN: Write was appended locally but replication outcome could not be
+        confirmed; client must resolve using request_id or retry safely.
+    """
 
     outcome: WriteOutcome
     request_id: str
@@ -370,6 +377,14 @@ class WriteResponse(BaseModel):
     meta: ResponseMeta | None = None
     error_code: str | None = None
     error_message: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_outcome_semantics(self) -> WriteResponse:
+        if self.outcome == WriteOutcome.COMMITTED and self.seq is None:
+            raise ValueError("COMMITTED writes must provide a valid seq.")
+        if self.outcome == WriteOutcome.REJECTED and self.seq is not None:
+            raise ValueError("REJECTED writes must not provide a seq.")
+        return self
 
 
 class ReadResponse(BaseModel):

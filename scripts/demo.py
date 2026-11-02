@@ -119,16 +119,30 @@ async def run_demo(fast: bool = True) -> None:
         # ─────────────────────────────────────────────────────────────────────
         print_header(1, "Cluster Startup, 3-Shard Topology & Data Loading")
 
+        def make_node_settings(node_name: str) -> Settings:
+            return Settings(
+                CLUSTER_SECRET=SECRET,
+                ADMIN_TOKEN=ADMIN,
+                CLIENT_API_KEY=CLIENT_KEY,
+                DATA_DIR=str(tmp_dir / node_name),
+                HEARTBEAT_INTERVAL_S=0.1,
+                LEASE_DURATION_S=0.5,
+                FAILURE_TIMEOUT_S=0.6,
+                SAFETY_MARGIN_S=0.1,
+                REPLICATION_TIMEOUT_S=0.05,
+                ENABLE_TEST_HOOKS=True,
+            )
+
         # Create Shard 0 nodes
         app_s0_p = build_app(
-            settings,
+            make_node_settings("node0-primary"),
             node_id="node0-primary",
             shard_id="shard0",
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=0, end=_S1, ownership_epoch=1)],
         )
         app_s0_f = build_app(
-            settings,
+            make_node_settings("node0-follower"),
             node_id="node0-follower",
             shard_id="shard0",
             role=NodeRole.FOLLOWER,
@@ -137,14 +151,14 @@ async def run_demo(fast: bool = True) -> None:
 
         # Create Shard 1 nodes
         app_s1_p = build_app(
-            settings,
+            make_node_settings("node1-primary"),
             node_id="node1-primary",
             shard_id="shard1",
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)],
         )
         app_s1_f = build_app(
-            settings,
+            make_node_settings("node1-follower"),
             node_id="node1-follower",
             shard_id="shard1",
             role=NodeRole.FOLLOWER,
@@ -153,14 +167,14 @@ async def run_demo(fast: bool = True) -> None:
 
         # Create Shard 2 nodes
         app_s2_p = build_app(
-            settings,
+            make_node_settings("node2-primary"),
             node_id="node2-primary",
             shard_id="shard2",
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)],
         )
         app_s2_f = build_app(
-            settings,
+            make_node_settings("node2-follower"),
             node_id="node2-follower",
             shard_id="shard2",
             role=NodeRole.FOLLOWER,

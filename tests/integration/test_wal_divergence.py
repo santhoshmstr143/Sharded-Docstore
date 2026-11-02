@@ -15,6 +15,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +26,15 @@ from httpx import ASGITransport, AsyncClient
 from docstore.common.auth import CLUSTER_SIG_HEADER, compute_signature
 from docstore.common.config import Settings
 from docstore.common.models import NodeRole, ReplicaState, WriteOutcome
-from docstore.shard.app import ShardRangeConfig, build_app, resync_with_primary
+from docstore.shard.app import (
+    NodeState,
+    ShardRangeConfig,
+    _recover,
+    build_app,
+    resync_with_primary,
+)
 from docstore.storage.engine import DedupEntry
+from docstore.storage.snapshot import SnapshotManager
 from docstore.storage.wal import compute_entry_identity
 
 pytestmark = pytest.mark.integration
@@ -1399,3 +1407,1014 @@ async def test_wal_truncation_occurs_only_after_durable_snapshot_save(tmp_path: 
             assert ok is True
             assert snapshot_existed_at_truncation is True
             assert snap_file.exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Issue 1: Directory fsync error handling during snapshot resync
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_directory_fsync_failure_during_snapshot_resync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directory fsync failure during snapshot resync:
+    - Save reports failure.
+    - WAL is not truncated.
+    - Follower is not marked SYNCED.
+    - Previous WAL remains sufficient for recovery.
+    """
+    primary_dir = tmp_path / "primary"
+    follower_dir = tmp_path / "follower"
+    p_settings = _make_settings(primary_dir)
+    f_settings = _make_settings(follower_dir)
+
+    primary_app = build_app(
+        p_settings,
+        node_id="primary",
+        shard_id="shard1",
+        role=NodeRole.PRIMARY,
+        follower_url="follower",
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    follower_app = build_app(
+        f_settings,
+        node_id="follower",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.follower_state = ReplicaState.CATCHING_UP
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.last_applied_seq = 2
+        p_state.term = 1
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
+        )
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.committed_seq = 2
+
+            # Simulate directory fsync failure on follower
+            def mock_fsync_dir(d: Path) -> None:
+                raise OSError("Simulated directory fsync failure on snapshot rename")
+
+            monkeypatch.setattr("docstore.storage.snapshot._fsync_dir", mock_fsync_dir)
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+
+            # 1. Resync reports failure
+            assert ok is False
+
+            # 2. WAL is not truncated (both entries remain)
+            wal_entries = list(f_state.wal.replay(after_seq=0))
+            assert len(wal_entries) == 2
+            assert [e["seq"] for e in wal_entries] == [1, 2]
+
+            # 3. Follower is not marked SYNCED on primary
+            assert p_state.follower_state != ReplicaState.SYNCED
+
+            # 4. Engine was not modified
+            assert f_state.engine.last_applied_seq == 2
+
+    # 5. Verify the previous WAL remains sufficient for recovery after failed directory fsync
+    recover_app = build_app(
+        f_settings,
+        node_id="follower-rec",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(recover_app):
+        rec_state = recover_app.state.node
+        assert rec_state.ready is True
+        assert rec_state.engine.last_applied_seq == 2
+        assert rec_state.engine.get(1) == {"v": 1}
+        assert rec_state.engine.get(2) == {"v": 2}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Issue 2: Ownership Epochs Restoration & Range Reconciliation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_snapshot_newer_ownership_epoch_updates_runtime_ranges(tmp_path: Path) -> None:
+    """Snapshot contains newer ownership epoch than follower's existing range:
+    runtime epoch is updated.
+    """
+    primary_dir = tmp_path / "primary"
+    follower_dir = tmp_path / "follower"
+    p_settings = _make_settings(primary_dir)
+    f_settings = _make_settings(follower_dir)
+
+    primary_app = build_app(
+        p_settings,
+        node_id="primary",
+        shard_id="shard1",
+        role=NodeRole.PRIMARY,
+        follower_url="follower",
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=5)],
+    )
+    follower_app = build_app(
+        f_settings,
+        node_id="follower",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.last_applied_seq = 2
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
+        )
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.committed_seq = 1
+            assert f_state.ranges[0].ownership_epoch == 1
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+
+            assert ok is True
+            # Runtime state.ranges must reflect authoritative snapshot epoch (5)
+            assert f_state.ranges[0].ownership_epoch == 5
+
+            # Snapshot on disk must reflect epoch 5
+            snap = f_state.snapshot_mgr.load()
+            assert snap is not None
+            assert snap["ownership_epochs"] == {"0-1000": 5}
+
+            # Node metadata must reflect epoch 5
+            meta_file = follower_dir / "shard1" / "node_metadata.json"
+            assert meta_file.exists()
+            meta = json.loads(meta_file.read_text())
+            assert meta["ranges"][0]["ownership_epoch"] == 5
+
+
+@pytest.mark.asyncio
+async def test_restart_after_snapshot_recovery_correct_epoch_restored(tmp_path: Path) -> None:
+    """Restart after snapshot recovery: correct epoch is restored."""
+    follower_dir = tmp_path / "follower"
+    f_settings = _make_settings(follower_dir)
+
+    # Initial boot: follower gets snapshot with epoch=4
+    app1 = build_app(
+        f_settings,
+        node_id="follower",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app1):
+        s1 = app1.state.node
+        # Durably save snapshot with authoritative epoch=4
+        s1.snapshot_mgr.save(
+            documents={1: {"doc_id": 1, "val": "v1"}},
+            last_applied_seq=1,
+            term=2,
+            ownership_epochs={"0-1000": 4},
+            dedup_table={},
+        )
+        # Reconcile runtime ranges
+        s1.ranges[0].ownership_epoch = 4
+
+    # Restart node: configured with initial epoch=1, but disk has snapshot with epoch=4
+    app2 = build_app(
+        f_settings,
+        node_id="follower",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app2):
+        s2 = app2.state.node
+        assert s2.ready is True
+        # Must restore epoch=4 into runtime ranges despite initial config having 1
+        assert s2.ranges[0].ownership_epoch == 4
+
+
+@pytest.mark.asyncio
+async def test_snapshot_incompatible_range_mapping_fails_closed(tmp_path: Path) -> None:
+    """Snapshot range mapping is incompatible: recovery and resync fail closed."""
+    # Subcase A: resync_with_primary with incompatible ranges
+    primary_dir = tmp_path / "primary"
+    follower_dir = tmp_path / "follower"
+    p_settings = _make_settings(primary_dir)
+    f_settings = _make_settings(follower_dir)
+
+    # Primary owns [0, 500) while Follower is configured for [0, 1000)
+    primary_app = build_app(
+        p_settings,
+        node_id="primary",
+        shard_id="shard1",
+        role=NodeRole.PRIMARY,
+        follower_url="follower",
+        ranges=[ShardRangeConfig(start=0, end=500, ownership_epoch=2)],
+    )
+    follower_app = build_app(
+        f_settings,
+        node_id="follower",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.last_applied_seq = 2
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
+        )
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.committed_seq = 1
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+
+            # Resync must fail closed!
+            assert ok is False
+            # Follower ranges must remain intact
+            assert f_state.ranges[0].start == 0
+            assert f_state.ranges[0].end == 1000
+            assert f_state.ranges[0].ownership_epoch == 1
+
+    # Subcase B: direct recovery with incompatible snapshot range mapping fails closed
+    node_dir = tmp_path / "incompatible_node"
+    node_settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-500": 2},  # snapshot has [0, 500)
+        dedup_table={},
+    )
+
+    node_state = NodeState(node_settings, node_id="test-node", shard_id="shard1")
+    node_state.ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+
+    # _recover must fail closed (raise ValueError)
+    with pytest.raises(ValueError, match=r"Incompatible range mapping"):
+        await _recover(node_state)
+
+
+@pytest.mark.asyncio
+async def test_existing_correct_epoch_is_preserved(tmp_path: Path) -> None:
+    """Existing correct epoch is preserved; stale snapshot epoch is not accepted."""
+    node_dir = tmp_path / "node_preserve"
+    node_settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot on disk has older epoch (2)
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-1000": 2},
+        dedup_table={},
+    )
+
+    # Local configured range / metadata has newer epoch (5)
+    node_state = NodeState(node_settings, node_id="test-node", shard_id="shard1")
+    node_state.ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=5)]
+
+    await _recover(node_state)
+
+    # Existing correct epoch (5) must be preserved!
+    assert node_state.ranges[0].ownership_epoch == 5
+
+
+@pytest.mark.asyncio
+async def test_ownership_epochs_consistent_between_snapshot_runtime_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """Ownership epochs remain consistent between snapshot, runtime state, and node metadata."""
+    primary_dir = tmp_path / "primary"
+    follower_dir = tmp_path / "follower"
+    p_settings = _make_settings(primary_dir)
+    f_settings = _make_settings(follower_dir)
+
+    primary_app = build_app(
+        p_settings,
+        node_id="primary",
+        shard_id="shard1",
+        role=NodeRole.PRIMARY,
+        follower_url="follower",
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=7)],
+    )
+    follower_app = build_app(
+        f_settings,
+        node_id="follower",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.last_applied_seq = 2
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
+        )
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.committed_seq = 1
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+            assert ok is True
+
+            # 1. Runtime state
+            runtime_epoch = f_state.ranges[0].ownership_epoch
+
+            # 2. Persisted snapshot
+            snap = f_state.snapshot_mgr.load()
+            assert snap is not None
+            snap_epoch = snap["ownership_epochs"]["0-1000"]
+
+            # 3. Node metadata
+            meta_file = follower_dir / "shard1" / "node_metadata.json"
+            meta = json.loads(meta_file.read_text())
+            meta_epoch = meta["ranges"][0]["ownership_epoch"]
+
+            # All three must be strictly consistent and equal to 7
+            assert runtime_epoch == 7
+            assert snap_epoch == 7
+            assert meta_epoch == 7
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Ownership-Epoch Recovery Regression Tests (Prompt 1D: Tests A-F)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recovery_epoch_reconciliation_metadata_highest(tmp_path: Path) -> None:
+    """Test A: Persisted metadata epoch 9, configured epoch 1, snapshot epoch 5.
+    Expected runtime epoch = 9.
+    """
+    node_dir = tmp_path / "node_a"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Persisted metadata on disk with epoch 9
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 9}],
+            }
+        )
+    )
+
+    # 2. Persisted snapshot on disk with epoch 5
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-1000": 5},
+        dedup_table={},
+    )
+
+    # 3. Startup configuration supplies epoch 1
+    app = build_app(
+        settings,
+        node_id="node-a",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        assert state.ready is True
+        assert state.ranges[0].ownership_epoch == 9
+
+        # Ensure node_metadata.json preserves epoch 9
+        meta = json.loads(meta_path.read_text())
+        assert meta["ranges"][0]["ownership_epoch"] == 9
+
+
+@pytest.mark.asyncio
+async def test_recovery_epoch_reconciliation_snapshot_highest(tmp_path: Path) -> None:
+    """Test B: Persisted metadata epoch 9, configured epoch 1, snapshot epoch 12.
+    Expected runtime epoch = 12.
+    """
+    node_dir = tmp_path / "node_b"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Persisted metadata with epoch 9
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 9}],
+            }
+        )
+    )
+
+    # 2. Persisted snapshot with epoch 12
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-1000": 12},
+        dedup_table={},
+    )
+
+    # 3. Startup configuration with epoch 1
+    app = build_app(
+        settings,
+        node_id="node-b",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        assert state.ready is True
+        assert state.ranges[0].ownership_epoch == 12
+
+        # Metadata should be updated to epoch 12
+        meta = json.loads(meta_path.read_text())
+        assert meta["ranges"][0]["ownership_epoch"] == 12
+
+
+@pytest.mark.asyncio
+async def test_recovery_epoch_reconciliation_configured_highest(tmp_path: Path) -> None:
+    """Test C: Persisted metadata epoch 9, configured epoch 12, snapshot epoch 5.
+    Expected runtime epoch = 12.
+    """
+    node_dir = tmp_path / "node_c"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Persisted metadata with epoch 9
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 9}],
+            }
+        )
+    )
+
+    # 2. Persisted snapshot with epoch 5
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-1000": 5},
+        dedup_table={},
+    )
+
+    # 3. Startup configuration with epoch 12
+    app = build_app(
+        settings,
+        node_id="node-c",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=12)],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        assert state.ready is True
+        assert state.ranges[0].ownership_epoch == 12
+
+        meta = json.loads(meta_path.read_text())
+        assert meta["ranges"][0]["ownership_epoch"] == 12
+
+
+@pytest.mark.asyncio
+async def test_recovery_incompatible_metadata_range_mapping_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Test D: Incompatible persisted metadata range mapping: recovery must fail closed."""
+    node_dir = tmp_path / "node_d"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persisted metadata has [0, 500)
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 500, "ownership_epoch": 9}],
+            }
+        )
+    )
+
+    # Configured range is [0, 1000)
+    app = build_app(
+        settings,
+        node_id="node-d",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        # Recovery must fail closed; node must not become ready
+        assert state.ready is False
+
+    # Also test direct _recover call raises ValueError
+    node_state = NodeState(settings, node_id="node-d-direct", shard_id="shard1")
+    node_state.ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    with pytest.raises(ValueError, match=r"Incompatible range mapping.*metadata"):
+        await _recover(node_state)
+
+
+@pytest.mark.asyncio
+async def test_recovery_metadata_directory_fsync_failure_not_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test E: Directory fsync failure while persisting reconciled node metadata:
+    Recovery must not report successful readiness.
+    """
+    node_dir = tmp_path / "node_e"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup valid metadata and snapshot
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 9}],
+            }
+        )
+    )
+
+    # Monkeypatch os.fsync to raise OSError when called on directory fd
+    orig_open = os.open
+    dir_fds: set[int] = set()
+
+    def tracking_open(path: str | bytes | int | Path, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = orig_open(str(path), flags, *args, **kwargs)
+        if str(path) == str(data_dir):
+            dir_fds.add(fd)
+        return fd
+
+    orig_fsync = os.fsync
+
+    def failing_fsync(fd: int) -> None:
+        if fd in dir_fds:
+            raise OSError("Simulated metadata directory fsync failure")
+        orig_fsync(fd)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+
+    app = build_app(
+        settings,
+        node_id="node-e",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        # Recovery must fail; node must not report readiness!
+        assert state.ready is False
+
+    # Also test direct _recover call raises OSError
+    node_state = NodeState(settings, node_id="node-e-direct", shard_id="shard1")
+    node_state.ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    with pytest.raises(OSError, match="Simulated metadata directory fsync failure"):
+        await _recover(node_state)
+
+
+@pytest.mark.asyncio
+async def test_recovery_highest_epoch_survives_another_restart(tmp_path: Path) -> None:
+    """Test F: Restart after successful reconciliation:
+    The highest epoch must survive another restart.
+    """
+    node_dir = tmp_path / "node_f"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initial state on disk: metadata has epoch 9, snapshot has epoch 5
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 9}],
+            }
+        )
+    )
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-1000": 5},
+        dedup_table={},
+    )
+
+    # First start: configured with epoch 1 -> reconciles to max(1, 9, 5) = 9
+    app1 = build_app(
+        settings,
+        node_id="node-f",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app1):
+        s1 = app1.state.node
+        assert s1.ready is True
+        assert s1.ranges[0].ownership_epoch == 9
+
+    # Reconciled metadata was persisted with epoch 9.
+    meta1 = json.loads(meta_path.read_text())
+    assert meta1["ranges"][0]["ownership_epoch"] == 9
+
+    # Second start (another restart): again configured with epoch 1
+    app2 = build_app(
+        settings,
+        node_id="node-f",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app2):
+        s2 = app2.state.node
+        assert s2.ready is True
+        # Highest epoch 9 must survive!
+        assert s2.ranges[0].ownership_epoch == 9
+
+
+@pytest.mark.asyncio
+async def test_recovery_epoch_reconciliation_metadata_15_config_2_snapshot_8(
+    tmp_path: Path,
+) -> None:
+    """Test G: Metadata epoch 15, configuration epoch 2, snapshot epoch 8.
+    Expected final epoch: 15.
+    """
+    node_dir = tmp_path / "node_g"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Persisted metadata with epoch 15
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 15}],
+            }
+        )
+    )
+
+    # 2. Persisted snapshot with epoch 8
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-1000": 8},
+        dedup_table={},
+    )
+
+    # 3. Startup configuration supplies epoch 2
+    app = build_app(
+        settings,
+        node_id="node-g",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=2)],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        assert state.ready is True
+        assert state.ranges[0].ownership_epoch == 15
+
+        # Metadata should persist reconciled epoch 15
+        meta = json.loads(meta_path.read_text())
+        assert meta["ranges"][0]["ownership_epoch"] == 15
+
+
+@pytest.mark.asyncio
+async def test_recovery_multiple_ranges_independent_reconciliation(tmp_path: Path) -> None:
+    """Test H: At least two different ranges with different epoch values.
+    Verify independent reconciliation per logical range.
+    """
+    node_dir = tmp_path / "node_h"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Range 1 [0, 500): meta=10, snap=4, config=2 -> final 10
+    # Range 2 [500, 1000): meta=3, snap=12, config=7 -> final 12
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 1,
+                "ranges": [
+                    {"start": 0, "end": 500, "ownership_epoch": 10},
+                    {"start": 500, "end": 1000, "ownership_epoch": 3},
+                ],
+            }
+        )
+    )
+
+    snap_mgr = SnapshotManager(data_dir)
+    snap_mgr.save(
+        documents={1: {"doc_id": 1, "v": 1}, 600: {"doc_id": 600, "v": 600}},
+        last_applied_seq=1,
+        term=1,
+        ownership_epochs={"0-500": 4, "500-1000": 12},
+        dedup_table={},
+    )
+
+    app = build_app(
+        settings,
+        node_id="node-h",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[
+            ShardRangeConfig(start=0, end=500, ownership_epoch=2),
+            ShardRangeConfig(start=500, end=1000, ownership_epoch=7),
+        ],
+    )
+    async with LifespanManager(app):
+        state = app.state.node
+        assert state.ready is True
+        assert len(state.ranges) == 2
+
+        # Verify independent reconciliation
+        r0 = next(r for r in state.ranges if r.start == 0 and r.end == 500)
+        r1 = next(r for r in state.ranges if r.start == 500 and r.end == 1000)
+        assert r0.ownership_epoch == 10
+        assert r1.ownership_epoch == 12
+
+        # Verify durable metadata reflects both independent epochs
+        meta = json.loads(meta_path.read_text())
+        m_r0 = next(r for r in meta["ranges"] if r["start"] == 0 and r["end"] == 500)
+        m_r1 = next(r for r in meta["ranges"] if r["start"] == 500 and r["end"] == 1000)
+        assert m_r0["ownership_epoch"] == 10
+        assert m_r1["ownership_epoch"] == 12
+
+
+@pytest.mark.asyncio
+async def test_recovery_corrupted_metadata_fails_safe_and_not_ready(tmp_path: Path) -> None:
+    """Test I: Corrupted or malformed node_metadata.json.
+    Verify safe failure and that the node cannot become READY.
+    """
+    node_dir = tmp_path / "node_i"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write corrupt (non-JSON) data to node_metadata.json
+    meta_path = data_dir / "node_metadata.json"
+    meta_path.write_bytes(b"INVALID_JSON_CORRUPTED{{{")
+
+    app = build_app(
+        settings,
+        node_id="node-i",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        # Node must not become ready
+        assert state.ready is False
+
+        # /health endpoint must return 503 NODE_NOT_READY
+        client = AsyncClient(transport=ASGITransport(app=app), base_url="http://node")
+        resp = await client.get("/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data.get("error_code") == "NODE_NOT_READY"
+
+    # Direct _recover call raises RuntimeError
+    direct_state = NodeState(settings, node_id="node-i-direct", shard_id="shard1")
+    with pytest.raises(RuntimeError, match=r"Corrupt or unreadable node metadata"):
+        await _recover(direct_state)
+
+
+@pytest.mark.asyncio
+async def test_recovery_metadata_persistence_fsync_atomic_replacement_and_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test J: Successful metadata persistence, including file fsync, atomic replacement,
+    directory fsync, and successful reload.
+    """
+    import builtins
+
+    node_dir = tmp_path / "node_j"
+    settings = _make_settings(node_dir)
+    data_dir = node_dir / "shard1"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    call_sequence: list[str] = []
+    tmp_file_path = data_dir / "node_metadata.json.tmp"
+    meta_file_path = data_dir / "node_metadata.json"
+    active_tmp_fd: int | None = None
+    active_dir_fd: int | None = None
+
+    orig_builtin_open = builtins.open
+
+    def tracking_builtin_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        f = orig_builtin_open(file, *args, **kwargs)
+        if str(file) == str(tmp_file_path):
+            nonlocal active_tmp_fd
+            active_tmp_fd = f.fileno()
+            call_sequence.append("open_tmp")
+        return f
+
+    orig_open = os.open
+
+    def tracking_open(path: str | bytes | int | Path, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = orig_open(str(path), flags, *args, **kwargs)
+        if str(path) == str(data_dir):
+            nonlocal active_dir_fd
+            active_dir_fd = fd
+            call_sequence.append("open_dir")
+        return fd
+
+    orig_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        if active_dir_fd is not None and fd == active_dir_fd:
+            call_sequence.append("fsync_dir")
+        elif active_tmp_fd is not None and fd == active_tmp_fd:
+            call_sequence.append("fsync_file")
+        orig_fsync(fd)
+
+    orig_close = os.close
+
+    def tracking_close(fd: int) -> None:
+        nonlocal active_dir_fd
+        if active_dir_fd is not None and fd == active_dir_fd:
+            active_dir_fd = None
+        orig_close(fd)
+
+    orig_replace = os.replace
+
+    def tracking_replace(src: str | bytes | Path, dst: str | bytes | Path) -> None:
+        if str(src) == str(tmp_file_path) and str(dst) == str(meta_file_path):
+            nonlocal active_tmp_fd
+            active_tmp_fd = None
+            call_sequence.append("atomic_replace")
+        orig_replace(str(src), str(dst))
+
+    monkeypatch.setattr(builtins, "open", tracking_builtin_open)
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "fsync", tracking_fsync)
+    monkeypatch.setattr(os, "close", tracking_close)
+    monkeypatch.setattr(os, "replace", tracking_replace)
+
+    app = build_app(
+        settings,
+        node_id="node-j",
+        shard_id="shard1",
+        role=NodeRole.PRIMARY,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=5)],
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        assert state.ready is True
+
+        # Verify operation sequence:
+        # 1. open_tmp
+        # 2. fsync_file (file fsync before rename)
+        # 3. atomic_replace (atomic replacement after file fsync)
+        # 4. open_dir + fsync_dir (directory fsync after replacement)
+        assert "open_tmp" in call_sequence
+        assert "fsync_file" in call_sequence
+        assert "atomic_replace" in call_sequence
+        assert "open_dir" in call_sequence
+        assert "fsync_dir" in call_sequence
+
+        idx_fsync_file = call_sequence.index("fsync_file")
+        idx_replace = call_sequence.index("atomic_replace")
+        idx_fsync_dir = call_sequence.index("fsync_dir")
+
+        assert idx_fsync_file < idx_replace, "File fsync must happen before atomic replacement"
+        assert idx_replace < idx_fsync_dir, "Directory fsync must happen after atomic replacement"
+
+    # Reload check: verify node_metadata.json on disk can be loaded and matches expected state
+    assert meta_file_path.exists()
+    reloaded_meta = json.loads(meta_file_path.read_text())
+    assert reloaded_meta["ranges"][0]["ownership_epoch"] == 5
+    assert reloaded_meta["ranges"][0]["start"] == 0
+    assert reloaded_meta["ranges"][0]["end"] == 1000
+
+    # Restart another node instance from the persisted metadata to verify complete reload
+    app_reloaded = build_app(
+        settings,
+        node_id="node-j-reloaded",
+        shard_id="shard1",
+        role=NodeRole.FOLLOWER,
+    )
+    async with LifespanManager(app_reloaded):
+        reloaded_state = app_reloaded.state.node
+        assert reloaded_state.ready is True
+        assert len(reloaded_state.ranges) == 1
+        assert reloaded_state.ranges[0].ownership_epoch == 5

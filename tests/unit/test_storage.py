@@ -390,3 +390,38 @@ class TestSnapshot:
         mgr.save(documents={}, last_applied_seq=0, term=1, ownership_epochs={}, dedup_table={})
         tmp = tmp_dir / "snapshot.json.tmp"
         assert not tmp.exists()
+
+    def test_directory_fsync_succeeds_save_succeeds(self, tmp_dir: Path) -> None:
+        """When directory fsync succeeds, SnapshotManager.save succeeds."""
+        mgr = SnapshotManager(tmp_dir)
+        mgr.save(
+            documents={1: {"doc_id": 1, "k": "v"}},
+            last_applied_seq=1,
+            term=1,
+            ownership_epochs={"0-100": 1},
+            dedup_table={},
+        )
+        assert mgr.exists()
+        snap = mgr.load()
+        assert snap is not None
+        assert snap["last_applied_seq"] == 1
+
+    def test_directory_fsync_raises_oserror_save_reports_failure(
+        self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When directory fsync fails with OSError, save must raise OSError (report failure)."""
+        mgr = SnapshotManager(tmp_dir)
+
+        def mock_fsync_dir(directory: Path) -> None:
+            raise OSError("Simulated directory fsync EIO failure")
+
+        monkeypatch.setattr("docstore.storage.snapshot._fsync_dir", mock_fsync_dir)
+
+        with pytest.raises(OSError, match="Simulated directory fsync EIO failure"):
+            mgr.save(
+                documents={1: {"doc_id": 1, "k": "v"}},
+                last_applied_seq=1,
+                term=1,
+                ownership_epochs={"0-100": 1},
+                dedup_table={},
+            )

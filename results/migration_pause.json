@@ -3,24 +3,24 @@
     "docs_migrated": 500,
     "docs_moved": 500,
     "catchup_ops": 0,
-    "pause_duration_ms": 50.53,
-    "total_duration_s": 6.015,
+    "pause_duration_ms": 44.5,
+    "total_duration_s": 5.615,
     "checksum_verified": true
   },
   {
     "docs_migrated": 2000,
     "docs_moved": 2000,
     "catchup_ops": 0,
-    "pause_duration_ms": 70.07,
-    "total_duration_s": 23.789,
+    "pause_duration_ms": 54.99,
+    "total_duration_s": 22.376,
     "checksum_verified": true
   },
   {
     "docs_migrated": 5000,
     "docs_moved": 5000,
     "catchup_ops": 0,
-    "pause_duration_ms": 83.06,
-    "total_duration_s": 59.709,
+    "pause_duration_ms": 65.45,
+    "total_duration_s": 55.944,
     "checksum_verified": true
   }
 ]

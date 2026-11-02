@@ -129,11 +129,8 @@ class SnapshotManager:
 
 
 def _fsync_dir(directory: Path) -> None:
+    dirfd = os.open(str(directory), os.O_RDONLY)
     try:
-        dirfd = os.open(str(directory), os.O_RDONLY)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
-    except OSError:
-        pass
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
