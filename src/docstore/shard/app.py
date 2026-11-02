@@ -912,28 +912,62 @@ async def resync_with_primary(
                     )
                     return False
 
-                # 3. Only after validation passes, mutate local state
-                if "term" in div_data and div_data["term"] > state.term:
-                    state.term = div_data["term"]
-                if snap_term > state.term:
-                    state.term = snap_term
+                # 3. Durably persist snapshot before mutating in-memory engine or truncating WAL
+                data_dir = Path(state.settings.DATA_DIR) / state.shard_id
+                snap_mgr = state.snapshot_mgr or SnapshotManager(data_dir)
+                state.snapshot_mgr = snap_mgr
 
+                parsed_docs: dict[int, dict[str, Any]] = {}
+                raw_docs = snap_data.get("documents", {})
+                if isinstance(raw_docs, dict):
+                    for did_str, d in raw_docs.items():
+                        parsed_docs[int(did_str)] = d
+                else:
+                    for d in raw_docs:
+                        parsed_docs[int(d["doc_id"])] = d
+
+                target_term = state.term
+                if "term" in div_data and div_data["term"] > target_term:
+                    target_term = div_data["term"]
+                if snap_term > target_term:
+                    target_term = snap_term
+
+                ownership_epochs = snap_data.get("ownership_epochs")
+                if not ownership_epochs:
+                    ownership_epochs = {
+                        f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges
+                    }
+                dedup_table = snap_data.get("dedup_table", {})
+
+                try:
+                    snap_mgr.save(
+                        documents=parsed_docs,
+                        last_applied_seq=snap_last_applied_seq,
+                        term=target_term,
+                        ownership_epochs=ownership_epochs,
+                        dedup_table=dedup_table,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Shard %s failed to persist snapshot to disk: %s. Node fails closed.",
+                        state.shard_id,
+                        exc,
+                    )
+                    return False
+
+                # 4. Now that snapshot is durably saved on disk, update in-memory state
+                state.term = target_term
                 state.engine._docs.clear()
                 state.engine._index.clear()
-                docs = snap_data.get("documents", {})
-                if isinstance(docs, dict):
-                    for did_str, d in docs.items():
-                        did = int(did_str)
-                        state.engine._docs[did] = d
-                        state.engine._index[did] = None
-                else:
-                    for d in docs:
-                        did = d["doc_id"]
-                        state.engine._docs[did] = d
-                        state.engine._index[did] = None
+                for did, doc in parsed_docs.items():
+                    state.engine._docs[did] = doc
+                    state.engine._index[did] = None
                 state.engine.last_applied_seq = snap_last_applied_seq
-                state.engine.dedup_import(snap_data.get("dedup_table", {}))
-                state.wal.truncate_after(state.engine.last_applied_seq)
+                state.engine.dedup_import(dedup_table)
+
+                # 5. Durably truncate WAL only AFTER the new snapshot has been persisted
+                if state.wal is not None:
+                    state.wal.truncate_after(state.engine.last_applied_seq)
             else:
                 # Invariant: Rejoining node must never silently overwrite locally committed history!
                 if div_seq < state.committed_seq:

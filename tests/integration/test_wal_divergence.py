@@ -24,8 +24,9 @@ from httpx import ASGITransport, AsyncClient
 
 from docstore.common.auth import CLUSTER_SIG_HEADER, compute_signature
 from docstore.common.config import Settings
-from docstore.common.models import NodeRole, ReplicaState
+from docstore.common.models import NodeRole, ReplicaState, WriteOutcome
 from docstore.shard.app import ShardRangeConfig, build_app, resync_with_primary
+from docstore.storage.engine import DedupEntry
 from docstore.storage.wal import compute_entry_identity
 
 pytestmark = pytest.mark.integration
@@ -1151,3 +1152,250 @@ async def test_failed_snapshot_validation_does_not_notify_primary(tmp_path: Path
             assert ok is False
             assert rejoin_complete_called is False
             assert p_state.follower_state != ReplicaState.SYNCED
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Snapshot Durability & Recovery Order Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_snapshot_recovery_persists_snapshot_and_reconstructs_on_restart(
+    tmp_path: Path,
+) -> None:
+    """Snapshot recovery persists snapshot.json so restart recovers docs, seq, and dedup."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    f_dir = tmp_path / "follower"
+    f_settings = _make_settings(f_dir)
+    follower_app = build_app(
+        f_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        # Primary has snapshot up to seq 4 with multiple docs and dedup entry
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 100}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 200}}
+        )
+        p_state.engine.apply(
+            {"seq": 3, "term": 1, "op": "insert", "doc_id": 3, "payload": {"v": 300}}
+        )
+        p_state.engine.apply(
+            {"seq": 4, "term": 1, "op": "insert", "doc_id": 4, "payload": {"v": 400}}
+        )
+        p_state.engine.last_applied_seq = 4
+        p_state.term = 1
+        p_state.engine.dedup_store(
+            "req-snap-4",
+            DedupEntry(
+                seq=4,
+                outcome=WriteOutcome.COMMITTED,
+                result={"outcome": WriteOutcome.COMMITTED, "seq": 4},
+                term=1,
+            ),
+        )
+        # WAL starts at seq 10 (compacted)
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 1000}
+        )
+        p_state.follower_state = ReplicaState.CATCHING_UP
+
+        snap_file = f_dir / "shard0" / "snapshot.json"
+        assert not snap_file.exists()
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.engine.last_applied_seq = 2
+            f_state.committed_seq = 2
+            f_state.term = 1
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+            assert ok is True
+
+            # 1. Verify snapshot.json was durably saved on disk
+            assert snap_file.exists()
+            assert f_state.engine.last_applied_seq == 4
+            assert f_state.committed_seq == 4
+            assert p_state.follower_state == ReplicaState.SYNCED
+
+    # 2. Restart follower from disk and verify full state recovery
+    restarted_app = build_app(
+        f_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+    async with LifespanManager(restarted_app):
+        r_state = restarted_app.state.node
+        # Documents recovered from snapshot
+        assert r_state.engine.get(1) == {"v": 100}
+        assert r_state.engine.get(2) == {"v": 200}
+        assert r_state.engine.get(3) == {"v": 300}
+        assert r_state.engine.get(4) == {"v": 400}
+        # Sequence numbers preserved
+        assert r_state.engine.last_applied_seq == 4
+        assert r_state.committed_seq == 4
+        # Deduplication state preserved
+        dedup_entry = r_state.engine.dedup_check("req-snap-4")
+        assert dedup_entry is not None
+        assert dedup_entry.outcome == WriteOutcome.COMMITTED
+        assert dedup_entry.seq == 4
+
+
+@pytest.mark.asyncio
+async def test_snapshot_persistence_failure_fails_closed_without_truncation(tmp_path: Path) -> None:
+    """Failure during snapshot save fails closed without truncating WAL or syncing follower."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    f_dir = tmp_path / "follower"
+    f_settings = _make_settings(f_dir)
+    follower_app = build_app(
+        f_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.apply(
+            {"seq": 3, "term": 1, "op": "insert", "doc_id": 3, "payload": {"v": 3}}
+        )
+        p_state.engine.last_applied_seq = 3
+        p_state.term = 1
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
+        )
+        p_state.follower_state = ReplicaState.CATCHING_UP
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.engine.last_applied_seq = 2
+            f_state.committed_seq = 2
+
+            # Inject failure into snapshot_mgr.save
+            def failing_save(*args: Any, **kwargs: Any) -> None:
+                raise OSError("Disk write failed / simulated I/O error")
+
+            assert f_state.snapshot_mgr is not None
+            f_state.snapshot_mgr.save = failing_save  # type: ignore[method-assign]
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+
+            # Must fail closed
+            assert ok is False
+            # WAL must NOT be truncated
+            assert f_state.wal.last_seq == 2
+            # Engine must NOT have applied unpersisted snapshot
+            assert f_state.engine.get(3) is None
+            assert f_state.engine.last_applied_seq == 2
+            # Primary must NOT mark follower as SYNCED
+            assert p_state.follower_state != ReplicaState.SYNCED
+
+
+@pytest.mark.asyncio
+async def test_wal_truncation_occurs_only_after_durable_snapshot_save(tmp_path: Path) -> None:
+    """Verify WAL is truncated strictly after durable snapshot persistence completes."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    f_dir = tmp_path / "follower"
+    f_settings = _make_settings(f_dir)
+    follower_app = build_app(
+        f_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    snap_file = f_dir / "shard0" / "snapshot.json"
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.apply(
+            {"seq": 3, "term": 1, "op": "insert", "doc_id": 3, "payload": {"v": 3}}
+        )
+        p_state.engine.last_applied_seq = 3
+        p_state.term = 1
+        p_state.wal.append(
+            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
+        )
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.committed_seq = 2
+
+            snapshot_existed_at_truncation = False
+            orig_truncate = f_state.wal.truncate_after
+
+            def tracking_truncate(seq: int) -> None:
+                nonlocal snapshot_existed_at_truncation
+                # Check that snapshot.json already exists and is readable when truncate is called
+                if snap_file.exists() and snap_file.stat().st_size > 0:
+                    snapshot_existed_at_truncation = True
+                orig_truncate(seq)
+
+            f_state.wal.truncate_after = tracking_truncate  # type: ignore[method-assign]
+
+            client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+
+            assert ok is True
+            assert snapshot_existed_at_truncation is True
+            assert snap_file.exists()
