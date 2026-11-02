@@ -592,3 +592,562 @@ async def test_rejoin_refuses_to_overwrite_committed_history_fail_closed(tmp_pat
             # WAL tail was NOT truncated
             assert r_state.wal.last_seq == 2
             assert r_state.committed_seq == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Entry Validation Against Actual Content (Issue 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_divergence_entry_validation_correct_fields_and_entry_id(tmp_path: Path) -> None:
+    """Correct entry fields and correct entry_id match normally."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    settings = _make_settings(tmp_path / "node")
+    app = build_app(
+        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        state.wal.append(seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1})
+        rec2 = state.wal.append(
+            seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+        )
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://primary") as client:
+            entries = [
+                {
+                    "seq": 1,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 1,
+                    "request_id": "req-1",
+                    "payload": {"v": 1},
+                    "entry_id": compute_entry_identity(
+                        {
+                            "seq": 1,
+                            "term": 1,
+                            "op": "insert",
+                            "doc_id": 1,
+                            "request_id": "req-1",
+                            "payload": {"v": 1},
+                        }
+                    ),
+                },
+                {
+                    "seq": 2,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 2,
+                    "request_id": "req-2",
+                    "payload": {"v": 2},
+                    "entry_id": rec2["entry_id"],
+                },
+            ]
+            resp = await client.post(
+                "/internal/divergence",
+                json={"shard_id": "shard0", "entries": entries},
+                headers=_sig_headers({"shard_id": "shard0", "entries": entries}),
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["divergence_seq"] == 2
+            assert data["first_conflict_seq"] is None
+
+
+@pytest.mark.asyncio
+async def test_divergence_entry_validation_stale_entry_id_diff_payload(tmp_path: Path) -> None:
+    """Different payload but stale entry_id copied from primary is detected as a conflict."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    settings = _make_settings(tmp_path / "node")
+    app = build_app(
+        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        state.wal.append(seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1})
+        rec2 = state.wal.append(
+            seq=2,
+            term=1,
+            op="insert",
+            doc_id=2,
+            request_id="req-2",
+            payload={"v": "primary_data"},
+        )
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://primary") as client:
+            # Follower sends different payload, but copied primary's entry_id
+            entries = [
+                {
+                    "seq": 1,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 1,
+                    "request_id": "req-1",
+                    "payload": {"v": 1},
+                },
+                {
+                    "seq": 2,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 2,
+                    "request_id": "req-2",
+                    "payload": {"v": "tampered_follower_data"},
+                    "entry_id": rec2["entry_id"],  # copied from primary!
+                },
+            ]
+            resp = await client.post(
+                "/internal/divergence",
+                json={"shard_id": "shard0", "entries": entries},
+                headers=_sig_headers({"shard_id": "shard0", "entries": entries}),
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["divergence_seq"] == 1
+            assert data["first_conflict_seq"] == 2
+
+
+@pytest.mark.asyncio
+async def test_divergence_entry_validation_stale_entry_id_diff_request_id(tmp_path: Path) -> None:
+    """Different request_id but stale entry_id copied from primary is detected as a conflict."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    settings = _make_settings(tmp_path / "node")
+    app = build_app(
+        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        state.wal.append(seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1})
+        rec2 = state.wal.append(
+            seq=2, term=1, op="insert", doc_id=2, request_id="req-primary", payload={"v": 2}
+        )
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://primary") as client:
+            entries = [
+                {
+                    "seq": 1,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 1,
+                    "request_id": "req-1",
+                    "payload": {"v": 1},
+                },
+                {
+                    "seq": 2,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 2,
+                    "request_id": "req-follower-diff",
+                    "payload": {"v": 2},
+                    "entry_id": rec2["entry_id"],  # copied from primary
+                },
+            ]
+            resp = await client.post(
+                "/internal/divergence",
+                json={"shard_id": "shard0", "entries": entries},
+                headers=_sig_headers({"shard_id": "shard0", "entries": entries}),
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["divergence_seq"] == 1
+            assert data["first_conflict_seq"] == 2
+
+
+@pytest.mark.asyncio
+async def test_divergence_entry_validation_incorrect_supplied_entry_id(tmp_path: Path) -> None:
+    """Incorrect/bogus supplied entry_id is detected as a conflict."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    settings = _make_settings(tmp_path / "node")
+    app = build_app(
+        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        state.wal.append(seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1})
+        state.wal.append(seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2})
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://primary") as client:
+            entries = [
+                {
+                    "seq": 1,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 1,
+                    "request_id": "req-1",
+                    "payload": {"v": 1},
+                },
+                {
+                    "seq": 2,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 2,
+                    "request_id": "req-2",
+                    "payload": {"v": 2},
+                    "entry_id": "bogus_corrupted_hash",
+                },
+            ]
+            resp = await client.post(
+                "/internal/divergence",
+                json={"shard_id": "shard0", "entries": entries},
+                headers=_sig_headers({"shard_id": "shard0", "entries": entries}),
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["divergence_seq"] == 1
+            assert data["first_conflict_seq"] == 2
+
+
+@pytest.mark.asyncio
+async def test_divergence_entry_validation_missing_required_fields_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Entry supplying only entry_id or missing required identity fields fails closed."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    settings = _make_settings(tmp_path / "node")
+    app = build_app(
+        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        state.wal.append(seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1})
+        rec2 = state.wal.append(
+            seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+        )
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://primary") as client:
+            # Entry 2 supplies entry_id but lacks op and doc_id
+            entries = [
+                {
+                    "seq": 1,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 1,
+                    "request_id": "req-1",
+                    "payload": {"v": 1},
+                },
+                {
+                    "seq": 2,
+                    "term": 1,
+                    "entry_id": rec2["entry_id"],
+                },
+            ]
+            resp = await client.post(
+                "/internal/divergence",
+                json={"shard_id": "shard0", "entries": entries},
+                headers=_sig_headers({"shard_id": "shard0", "entries": entries}),
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["divergence_seq"] == 1
+            assert data["first_conflict_seq"] == 2
+
+
+@pytest.mark.asyncio
+async def test_divergence_legacy_record_without_entry_id(tmp_path: Path) -> None:
+    """Legacy WAL records without entry_id compute identity from original fields and compare correctly."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    settings = _make_settings(tmp_path / "node")
+    app = build_app(
+        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    async with LifespanManager(app):
+        state = app.state.node
+        state.wal.append(seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1})
+        state.wal.append(seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2})
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://primary") as client:
+            # Neither entry supplies entry_id (legacy client/follower)
+            entries = [
+                {
+                    "seq": 1,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 1,
+                    "request_id": "req-1",
+                    "payload": {"v": 1},
+                },
+                {
+                    "seq": 2,
+                    "term": 1,
+                    "op": "insert",
+                    "doc_id": 2,
+                    "request_id": "req-2",
+                    "payload": {"v": 2},
+                },
+            ]
+            resp = await client.post(
+                "/internal/divergence",
+                json={"shard_id": "shard0", "entries": entries},
+                headers=_sig_headers({"shard_id": "shard0", "entries": entries}),
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["divergence_seq"] == 2
+            assert data["first_conflict_seq"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Snapshot Recovery Committed-History Protection (Issue 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_snapshot_resync_below_local_committed_seq_rejected(tmp_path: Path) -> None:
+    """Snapshot sequence below local committed_seq is rejected and all local state is preserved."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    r_settings = _make_settings(tmp_path / "follower")
+    follower_app = build_app(
+        r_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        # Primary has snapshot at seq 1 and compacted WAL starting at seq 5
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": "p1"}}
+        )
+        p_state.engine.last_applied_seq = 1
+        p_state.term = 1
+        # Primary's WAL only has seq 5
+        p_state.wal.append(
+            seq=5, term=1, op="insert", doc_id=5, request_id="req-5", payload={"v": 5}
+        )
+        p_state.follower_state = ReplicaState.CATCHING_UP
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            # Follower has locally COMMITTED seq 2 (doc 1 and doc 2)
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": "f1"}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": "f2"}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": "f1"}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": "f2"}}
+            )
+            f_state.engine.last_applied_seq = 2
+            f_state.committed_seq = 2
+            f_state.term = 1
+
+            p_transport = ASGITransport(app=primary_app)
+            client = AsyncClient(mounts={"http://primary": p_transport}, timeout=5.0)
+
+            # Follower attempts resync with primary.
+            # Primary WAL earliest_seq is 5 > follower earliest 1 -> needs_snapshot = True.
+            # Primary snapshot last_applied_seq is 1 < follower committed_seq (2).
+            # Follower must REJECT and fail closed.
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+            assert ok is False
+
+            # Verify ALL follower local state is completely preserved:
+            assert f_state.committed_seq == 2
+            assert f_state.engine.last_applied_seq == 2
+            assert f_state.engine.get(1) == {"v": "f1"}
+            assert f_state.engine.get(2) == {"v": "f2"}
+            assert f_state.wal.last_seq == 2
+            assert f_state.term == 1
+            assert p_state.follower_state != ReplicaState.SYNCED
+
+
+@pytest.mark.asyncio
+async def test_snapshot_resync_equal_to_local_committed_seq_safe(tmp_path: Path) -> None:
+    """Snapshot sequence equal to local committed_seq safely replaces state."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    r_settings = _make_settings(tmp_path / "follower")
+    follower_app = build_app(
+        r_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        # Primary has snapshot at seq 2 and WAL compacted starting at seq 5
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.last_applied_seq = 2
+        p_state.term = 1
+        p_state.wal.append(
+            seq=5, term=1, op="insert", doc_id=5, request_id="req-5", payload={"v": 5}
+        )
+        p_state.follower_state = ReplicaState.CATCHING_UP
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.engine.last_applied_seq = 2
+            f_state.committed_seq = 2
+            f_state.term = 1
+
+            p_transport = ASGITransport(app=primary_app)
+            client = AsyncClient(mounts={"http://primary": p_transport}, timeout=5.0)
+
+            # Snapshot last_applied_seq (2) == committed_seq (2): Safe!
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+            assert ok is True
+            assert f_state.engine.last_applied_seq == 2
+            assert f_state.committed_seq == 2
+            assert p_state.follower_state == ReplicaState.SYNCED
+
+
+@pytest.mark.asyncio
+async def test_snapshot_resync_above_local_committed_seq_succeeds(tmp_path: Path) -> None:
+    """Snapshot sequence above local committed_seq succeeds and advances state."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    r_settings = _make_settings(tmp_path / "follower")
+    follower_app = build_app(
+        r_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        # Primary has snapshot at seq 3 and WAL starting at seq 5
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.apply(
+            {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+        )
+        p_state.engine.apply(
+            {"seq": 3, "term": 1, "op": "insert", "doc_id": 3, "payload": {"v": 3}}
+        )
+        p_state.engine.last_applied_seq = 3
+        p_state.term = 1
+        p_state.wal.append(
+            seq=5, term=1, op="insert", doc_id=5, request_id="req-5", payload={"v": 5}
+        )
+        p_state.follower_state = ReplicaState.CATCHING_UP
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.engine.last_applied_seq = 2
+            f_state.committed_seq = 2
+            f_state.term = 1
+
+            p_transport = ASGITransport(app=primary_app)
+            client = AsyncClient(mounts={"http://primary": p_transport}, timeout=5.0)
+
+            # Snapshot last_applied_seq (3) > committed_seq (2): Succeeds!
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+            assert ok is True
+            assert f_state.engine.last_applied_seq == 3
+            assert f_state.committed_seq == 3
+            assert f_state.engine.get(3) == {"v": 3}
+            assert p_state.follower_state == ReplicaState.SYNCED
+
+
+@pytest.mark.asyncio
+async def test_failed_snapshot_validation_does_not_notify_primary(tmp_path: Path) -> None:
+    """Failed snapshot validation must not call /internal/rejoin/complete or mark follower as synced."""
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    p_settings = _make_settings(tmp_path / "primary")
+    primary_app = build_app(
+        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+    )
+
+    r_settings = _make_settings(tmp_path / "follower")
+    follower_app = build_app(
+        r_settings, node_id="follower", shard_id="shard0", role=NodeRole.FOLLOWER, ranges=ranges
+    )
+
+    rejoin_complete_called = False
+
+    async with LifespanManager(primary_app):
+        p_state = primary_app.state.node
+        p_state.engine.apply(
+            {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+        )
+        p_state.engine.last_applied_seq = 1
+        p_state.term = 1
+        p_state.wal.append(
+            seq=5, term=1, op="insert", doc_id=5, request_id="req-5", payload={"v": 5}
+        )
+        p_state.follower_state = ReplicaState.CATCHING_UP
+
+        # Wrap or monitor transport
+        async def tracking_app(scope, receive, send):
+            nonlocal rejoin_complete_called
+            if scope.get("type") == "http" and scope.get("path") == "/internal/rejoin/complete":
+                rejoin_complete_called = True
+            await primary_app(scope, receive, send)
+
+        tracking_transport = ASGITransport(app=tracking_app)
+
+        async with LifespanManager(follower_app):
+            f_state = follower_app.state.node
+            f_state.wal.append(
+                seq=1, term=1, op="insert", doc_id=1, request_id="req-1", payload={"v": 1}
+            )
+            f_state.wal.append(
+                seq=2, term=1, op="insert", doc_id=2, request_id="req-2", payload={"v": 2}
+            )
+            f_state.engine.apply(
+                {"seq": 1, "term": 1, "op": "insert", "doc_id": 1, "payload": {"v": 1}}
+            )
+            f_state.engine.apply(
+                {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
+            )
+            f_state.committed_seq = 2
+
+            client = AsyncClient(mounts={"http://primary": tracking_transport}, timeout=5.0)
+
+            ok = await resync_with_primary(f_state, "primary", http_client=client)
+            assert ok is False
+            assert rejoin_complete_called is False
+            assert p_state.follower_state != ReplicaState.SYNCED

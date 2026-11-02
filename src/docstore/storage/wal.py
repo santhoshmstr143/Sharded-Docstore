@@ -36,6 +36,28 @@ _CRC_FIELD = "crc32"
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+REQUIRED_IDENTITY_FIELDS = ("term", "seq", "op", "doc_id")
+
+
+def has_required_identity_fields(record: dict[str, Any]) -> bool:
+    """Validate whether record has all required fields to deterministically compute identity."""
+    for f in REQUIRED_IDENTITY_FIELDS:
+        if f not in record or record[f] is None:
+            return False
+    op = record["op"]
+    if hasattr(op, "value"):
+        op = op.value
+    if not isinstance(op, str) or not op.strip():
+        return False
+    try:
+        int(record["doc_id"])
+        int(record["seq"])
+        int(record["term"])
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def compute_entry_identity(record: dict[str, Any]) -> str:
     """Compute deterministic SHA-256 identity of a WAL entry.
 
@@ -52,6 +74,11 @@ def compute_entry_identity(record: dict[str, Any]) -> str:
     to guarantee equivalent JSON objects produce identical hashes regardless
     of key ordering.
     """
+    if not has_required_identity_fields(record):
+        raise ValueError(
+            f"Record lacks required identity fields {REQUIRED_IDENTITY_FIELDS}: {record}"
+        )
+
     op_val = record.get("op")
     if op_val is not None and hasattr(op_val, "value"):
         op_str = str(op_val.value)

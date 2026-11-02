@@ -99,7 +99,12 @@ from docstore.query import (
 )
 from docstore.storage.engine import DedupEntry, StorageEngine
 from docstore.storage.snapshot import SnapshotManager
-from docstore.storage.wal import WAL, WALCorruptionError, compute_entry_identity
+from docstore.storage.wal import (
+    WAL,
+    WALCorruptionError,
+    compute_entry_identity,
+    has_required_identity_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -864,20 +869,6 @@ async def resync_with_primary(
         div_seq = div_data.get("divergence_seq", 0)
 
         async with state.write_lock():
-            # Invariant: Rejoining node must never silently overwrite locally committed history!
-            if not needs_snapshot and div_seq < state.committed_seq:
-                logger.error(
-                    "Shard %s cannot reconcile: divergence_seq (%d) < locally committed_seq (%d). "
-                    "Refusing to silently overwrite committed history. Node fails closed.",
-                    state.shard_id,
-                    div_seq,
-                    state.committed_seq,
-                )
-                return False
-
-            if "term" in div_data and div_data["term"] > state.term:
-                state.term = div_data["term"]
-
             if needs_snapshot:
                 # Full snapshot resync
                 snap_url = f"http://{clean_primary}/internal/snapshot"
@@ -886,8 +877,47 @@ async def resync_with_primary(
                 if snap_resp.status_code != 200:
                     logger.warning("Snapshot fetch failed: %d", snap_resp.status_code)
                     return False
+
+                # 1. Fetch snapshot into temporary data first
                 snap_data = snap_resp.json()
-                # Apply snapshot
+                snap_last_applied_seq = int(snap_data.get("last_applied_seq", 0))
+                snap_term = int(snap_data.get("term", 0))
+
+                # 2. Safety validation:
+                # Safety assumption: Under synchronous replication, a write is only
+                # committed after durable replication to both primary and follower.
+                # A legitimate primary possessing authoritative shard state must have
+                # last_applied_seq >= follower's locally committed_seq. If snapshot
+                # last_applied_seq < committed_seq, the primary's snapshot is missing
+                # committed transactions. Rejecting resync prevents rolling back history.
+                if snap_last_applied_seq < state.committed_seq:
+                    logger.error(
+                        "Shard %s cannot reconcile via snapshot: snapshot last_applied_seq (%d) "
+                        "< locally committed_seq (%d). Refusing to silently overwrite committed "
+                        "history. Node fails closed.",
+                        state.shard_id,
+                        snap_last_applied_seq,
+                        state.committed_seq,
+                    )
+                    return False
+
+                # Term fencing: snapshot must not come from a term earlier than local term
+                if snap_term < state.term:
+                    logger.error(
+                        "Shard %s cannot reconcile via snapshot: snapshot term (%d) < "
+                        "local term (%d). Node fails closed.",
+                        state.shard_id,
+                        snap_term,
+                        state.term,
+                    )
+                    return False
+
+                # 3. Only after validation passes, mutate local state
+                if "term" in div_data and div_data["term"] > state.term:
+                    state.term = div_data["term"]
+                if snap_term > state.term:
+                    state.term = snap_term
+
                 state.engine._docs.clear()
                 state.engine._index.clear()
                 docs = snap_data.get("documents", {})
@@ -901,11 +931,24 @@ async def resync_with_primary(
                         did = d["doc_id"]
                         state.engine._docs[did] = d
                         state.engine._index[did] = None
-                state.engine.last_applied_seq = snap_data.get("last_applied_seq", 0)
-                state.term = snap_data.get("term", state.term)
+                state.engine.last_applied_seq = snap_last_applied_seq
                 state.engine.dedup_import(snap_data.get("dedup_table", {}))
                 state.wal.truncate_after(state.engine.last_applied_seq)
             else:
+                # Invariant: Rejoining node must never silently overwrite locally committed history!
+                if div_seq < state.committed_seq:
+                    logger.error(
+                        "Shard %s cannot reconcile: divergence_seq (%d) < locally "
+                        "committed_seq (%d). Refusing to silently overwrite committed "
+                        "history. Node fails closed.",
+                        state.shard_id,
+                        div_seq,
+                        state.committed_seq,
+                    )
+                    return False
+
+                if "term" in div_data and div_data["term"] > state.term:
+                    state.term = div_data["term"]
                 # Truncate divergent tail after div_seq
                 state.wal.truncate_after(div_seq)
                 # Rebuild in-memory engine and dedup up to div_seq
@@ -1721,7 +1764,8 @@ def build_app(
                 for item in sorted_entries:
                     s = int(item.get("seq", 0))
                     if s <= 0:
-                        continue
+                        first_conflict_seq = 1
+                        break
 
                     # Contiguity check: each matching entry must follow the previous matching seq
                     if candidate_divergence == 0:
@@ -1739,35 +1783,68 @@ def build_app(
                         break
 
                     p_entry = primary_by_seq[s]
-                    p_identity = p_entry.get("entry_id") or compute_entry_identity(p_entry)
 
-                    # Determine follower entry identity
-                    f_identity = item.get("entry_id")
-                    if not f_identity and "op" in item and "doc_id" in item:
-                        f_identity = compute_entry_identity(item)
+                    # 1. Primary entry validation (never blindly trust stored entry_id)
+                    if not has_required_identity_fields(p_entry):
+                        logger.error(
+                            "Primary WAL entry at seq=%d lacks required identity fields", s
+                        )
+                        first_conflict_seq = s
+                        break
 
-                    # Term comparison
+                    try:
+                        recomputed_p_identity = compute_entry_identity(p_entry)
+                    except Exception:
+                        first_conflict_seq = s
+                        break
+
+                    stored_p_id = p_entry.get("entry_id")
+                    if stored_p_id is not None and stored_p_id != recomputed_p_identity:
+                        logger.error(
+                            "Primary WAL entry at seq=%d corrupted: stored entry_id != "
+                            "recomputed identity",
+                            s,
+                        )
+                        first_conflict_seq = s
+                        break
+                    p_identity = recomputed_p_identity
+
+                    # 2. Follower entry validation:
+                    # Do not accept an entry that contains only entry_id but lacks
+                    # fields needed to verify it
+                    if not has_required_identity_fields(item):
+                        first_conflict_seq = s
+                        break
+
+                    try:
+                        recomputed_f_identity = compute_entry_identity(item)
+                    except Exception:
+                        first_conflict_seq = s
+                        break
+
+                    # If entry_id is supplied, compare with recomputed identity
+                    supplied_f_id = item.get("entry_id")
+                    if supplied_f_id is not None and supplied_f_id != recomputed_f_identity:
+                        first_conflict_seq = s
+                        break
+                    f_identity = recomputed_f_identity
+
+                    # 3. Term comparison
                     item_term = int(item.get("term", 0))
                     p_term = int(p_entry.get("term", 0))
                     if item_term != p_term:
                         first_conflict_seq = s
                         break
 
-                    # Request ID comparison
-                    if "request_id" in item:
-                        f_req = str(item.get("request_id") or "")
-                        p_req = str(p_entry.get("request_id") or "")
-                        if f_req != p_req:
-                            first_conflict_seq = s
-                            break
+                    # 4. Request ID comparison
+                    f_req = str(item.get("request_id") or "")
+                    p_req = str(p_entry.get("request_id") or "")
+                    if f_req != p_req:
+                        first_conflict_seq = s
+                        break
 
-                    # Complete entry identity comparison
-                    if f_identity is not None:
-                        if f_identity != p_identity:
-                            first_conflict_seq = s
-                            break
-                    else:
-                        # Cannot verify identity; fail closed
+                    # 5. Complete entry identity comparison
+                    if f_identity != p_identity:
                         first_conflict_seq = s
                         break
 
