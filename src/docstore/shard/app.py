@@ -411,6 +411,9 @@ async def _recover(state: NodeState) -> None:
     state.committed_seq = max(state.committed_seq, state.engine.last_applied_seq)
     if not is_disk_recovery and snap is None:
         state.committed_seq = wal.last_seq
+    elif state.allow_standalone:
+        # In standalone mode, all local WAL operations are committed locally.
+        state.committed_seq = max(state.committed_seq, wal.last_seq)
 
     wal_entries = list(wal.replay(after_seq=after_seq))
     for entry in wal_entries:
@@ -464,10 +467,17 @@ async def _recover(state: NodeState) -> None:
                 logger.debug("Startup reconciliation for %s deferred: %s", p_rid, exc)
 
     if is_disk_recovery or snap is not None or wal_entries or wal.last_seq > 0:
-        # A node recovering from disk must NOT restore primary authority.
-        # It must start in a fenced/recovering, non-authoritative follower state.
-        state.role = NodeRole.FOLLOWER
-        state.lease_expires_at = 0.0
+        if not state.allow_standalone:
+            # A node recovering from disk in cluster mode must NOT restore primary authority.
+            # It must start in a fenced/recovering, non-authoritative follower state.
+            state.role = NodeRole.FOLLOWER
+            state.lease_expires_at = 0.0
+        else:
+            # Standalone mode: restore configured authority (PRIMARY) and standalone lease
+            if state.role == NodeRole.PRIMARY and (
+                state.lease_expires_at == 0.0 or state.lease_expires_at is None
+            ):
+                state.lease_expires_at = float("inf")
 
     _persist_node_metadata(state)
 

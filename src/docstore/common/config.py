@@ -68,6 +68,16 @@ class Settings(BaseSettings):
         gt=0,
         description="Replication timeout T (seconds).",
     )
+    MIGRATION_CATCHUP_MAX_DURATION_S: float = Field(
+        default=60.0,
+        gt=0,
+        description="Maximum duration in seconds for pre-pause migration catch-up.",
+    )
+    MIGRATION_FINAL_CATCHUP_MAX_DURATION_S: float = Field(
+        default=30.0,
+        gt=0,
+        description="Maximum duration in seconds for post-pause final migration catch-up.",
+    )
 
     # ── Storage ───────────────────────────────────────────────────────────────
     DATA_DIR: str = Field(

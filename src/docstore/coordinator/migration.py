@@ -8,6 +8,7 @@ PLANNED → SNAPSHOT_COPY → CATCHUP → PAUSE → FINAL_CATCHUP → VERIFY →
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import hashlib
 import json
@@ -260,7 +261,12 @@ class MigrationManager:
             logger.info("Migration %s: starting CATCHUP", rec.migration_id)
 
             current_cursor = s_seq
-            for _ in range(5):  # Catch-up iterations
+            catchup_deadline = time.monotonic() + getattr(
+                coord.settings, "MIGRATION_CATCHUP_MAX_DURATION_S", 60.0
+            )
+            consecutive_no_progress = 0
+
+            while time.monotonic() < catchup_deadline:
                 _check_abort_condition()
                 oplog_resp = await _rpc(
                     f"{src_url}/internal/migration/oplog",
@@ -288,13 +294,37 @@ class MigrationManager:
                         },
                     )
                     rec.catchup_ops_replayed += len(entries)
-                    current_cursor = max(e["seq"] for e in entries)
+                    next_cursor = max(e["seq"] for e in entries)
+                    if next_cursor <= current_cursor:
+                        consecutive_no_progress += 1
+                        if consecutive_no_progress >= 5:
+                            raise RuntimeError(
+                                f"Migration {rec.migration_id} made no forward progress during "
+                                f"catchup (cursor stalled at {current_cursor})"
+                            )
+                    else:
+                        consecutive_no_progress = 0
+                        current_cursor = next_cursor
+                        rec.last_caught_up_seq = current_cursor
+                        self.save_record(rec)
+                else:
+                    # No matching entries in this slice
+                    if src_last_seq <= current_cursor or src_last_seq - current_cursor <= 2:
+                        break
+                    current_cursor = src_last_seq
                     rec.last_caught_up_seq = current_cursor
                     self.save_record(rec)
-
-                # If delta is small or no new entries, proceed to PAUSE
-                if src_last_seq - current_cursor <= 2 or not entries:
                     break
+
+                if src_last_seq - current_cursor <= 2:
+                    break
+
+            if time.monotonic() >= catchup_deadline and (src_last_seq - current_cursor > 2):
+                dur = getattr(coord.settings, "MIGRATION_CATCHUP_MAX_DURATION_S", 60.0)
+                raise RuntimeError(
+                    f"Migration {rec.migration_id} catch-up timed out after {dur}s without "
+                    f"converging (lag={src_last_seq - current_cursor})"
+                )
 
             _check_abort_condition()
 
@@ -319,7 +349,18 @@ class MigrationManager:
                 final_h_seq,
             )
 
-            if final_h_seq > current_cursor:
+            final_dur = getattr(coord.settings, "MIGRATION_FINAL_CATCHUP_MAX_DURATION_S", 30.0)
+            final_deadline = time.monotonic() + final_dur
+            final_no_progress = 0
+
+            while current_cursor < final_h_seq:
+                _check_abort_condition()
+                if time.monotonic() >= final_deadline:
+                    raise RuntimeError(
+                        f"Migration {rec.migration_id} final catchup timed out after {final_dur}s; "
+                        f"cursor={current_cursor}, target={final_h_seq}"
+                    )
+
                 final_oplog_resp = await _rpc(
                     f"{src_url}/internal/migration/oplog",
                     {
@@ -338,6 +379,7 @@ class MigrationManager:
                         "was compacted away; new snapshot required."
                     )
                 final_entries = final_oplog_resp.get("entries", [])
+                src_last_seq = final_oplog_resp.get("last_seq", current_cursor)
                 if final_entries:
                     await _rpc(
                         f"{dest_url}/internal/migration/apply-oplog",
@@ -347,11 +389,41 @@ class MigrationManager:
                         },
                     )
                     rec.catchup_ops_replayed += len(final_entries)
-                rec.last_caught_up_seq = final_h_seq
-                self.save_record(rec)
-            else:
-                rec.last_caught_up_seq = max(rec.last_caught_up_seq or 0, current_cursor)
-                self.save_record(rec)
+                    next_cursor = max(e["seq"] for e in final_entries)
+                    if next_cursor <= current_cursor:
+                        final_no_progress += 1
+                        if final_no_progress >= 5:
+                            raise RuntimeError(
+                                f"Migration {rec.migration_id} final catchup made no forward "
+                                f"progress (cursor stalled at {current_cursor})"
+                            )
+                    else:
+                        final_no_progress = 0
+                        current_cursor = next_cursor
+                        rec.last_caught_up_seq = current_cursor
+                        self.save_record(rec)
+                elif src_last_seq >= final_h_seq:
+                    current_cursor = final_h_seq
+                    rec.last_caught_up_seq = final_h_seq
+                    self.save_record(rec)
+                    break
+                else:
+                    final_no_progress += 1
+                    if final_no_progress >= 5:
+                        raise RuntimeError(
+                            f"Migration {rec.migration_id} final catchup made no progress: "
+                            f"cursor={current_cursor}, target={final_h_seq}, "
+                            f"src_last_seq={src_last_seq}"
+                        )
+                    if time.monotonic() >= final_deadline:
+                        raise RuntimeError(
+                            f"Migration {rec.migration_id} final catchup timed out after "
+                            f"{final_dur}s; cursor={current_cursor}, target={final_h_seq}"
+                        )
+                    await asyncio.sleep(0.01)
+
+            rec.last_caught_up_seq = max(rec.last_caught_up_seq or 0, current_cursor)
+            self.save_record(rec)
 
             if final_h_seq > (rec.last_caught_up_seq or 0):
                 raise RuntimeError(

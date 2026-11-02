@@ -625,7 +625,11 @@ class CoordinatorService:
                         lease=None,
                         map_version=current_map.map_version,
                     )
-            elif existing_lease is None and reg.address != primary_addr:
+            clean_reg = reg.address.removeprefix("http://").removeprefix("https://").rstrip("/")
+            clean_pri = (
+                (primary_addr or "").removeprefix("http://").removeprefix("https://").rstrip("/")
+            )
+            if existing_lease is None and clean_reg != clean_pri:
                 if now_mono < self._recovery_quarantine_until_monotonic:
                     logger.warning(
                         "Registration: coordinator recovery quarantine active until %.2f "
@@ -696,6 +700,10 @@ class CoordinatorService:
 
         if hb.term < current_term:
             raise StaleTerm(f"Heartbeat carries stale term {hb.term} < current {current_term}")
+        if hb.term > current_term:
+            raise StaleTerm(
+                f"Heartbeat carries unknown future term {hb.term} > current {current_term}"
+            )
 
         # Update last seen
         if hb.node_id in self.nodes:
@@ -712,6 +720,50 @@ class CoordinatorService:
             )
 
         if hb.role == NodeRole.PRIMARY:
+            # Check for conflicting active lease or coordinator quarantine
+            existing_lease = self.leases.get(shard_id)
+            if existing_lease is not None and existing_lease.node_id != hb.node_id:
+                safety_cutoff = existing_lease.expires_at_monotonic + self.settings.SAFETY_MARGIN_S
+                if now_mono < safety_cutoff:
+                    logger.warning(
+                        "Heartbeat: conflicting primary %s rejected; "
+                        "active lease held by %s until %.2f (mono=%.2f)",
+                        hb.node_id,
+                        existing_lease.node_id,
+                        safety_cutoff,
+                        now_mono,
+                    )
+                    return None
+            elif existing_lease is None:
+                # Coordinator restart: quarantine check
+                shard_entry = next(
+                    (e for e in self.map_mgr.shard_map.entries if e.shard_id == shard_id),
+                    None,
+                )
+                primary_addr = shard_entry.primary if shard_entry else None
+                node_addr = self.nodes[hb.node_id].address if hb.node_id in self.nodes else ""
+
+                is_incumbent = False
+                if primary_addr and node_addr:
+                    clean_node = (
+                        node_addr.removeprefix("http://").removeprefix("https://").rstrip("/")
+                    )
+                    clean_primary = (
+                        primary_addr.removeprefix("http://").removeprefix("https://").rstrip("/")
+                    )
+                    if clean_node == clean_primary:
+                        is_incumbent = True
+
+                if not is_incumbent and now_mono < self._recovery_quarantine_until_monotonic:
+                    logger.warning(
+                        "Heartbeat: coordinator recovery quarantine active until %.2f (mono=%.2f); "
+                        "cannot grant lease to non-incumbent node %s",
+                        self._recovery_quarantine_until_monotonic,
+                        now_mono,
+                        hb.node_id,
+                    )
+                    return None
+
             # Update follower state as seen by primary
             prev_state = self.replica_states.get(shard_id)
             self.replica_states[shard_id] = hb.follower_state
