@@ -99,7 +99,7 @@ from docstore.query import (
 )
 from docstore.storage.engine import DedupEntry, StorageEngine
 from docstore.storage.snapshot import SnapshotManager
-from docstore.storage.wal import WAL, WALCorruptionError
+from docstore.storage.wal import WAL, WALCorruptionError, compute_entry_identity
 
 logger = logging.getLogger(__name__)
 
@@ -453,9 +453,27 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
     if seq is None:
         return WriteOutcome.OUTCOME_UNKNOWN
 
+    entry_id = None
+    if pending:
+        entry_id = compute_entry_identity(
+            {
+                "term": term,
+                "seq": seq,
+                "op": pending["op"],
+                "doc_id": pending["doc_id"],
+                "request_id": request_id,
+                "payload": pending.get("payload"),
+            }
+        )
+    elif state.wal:
+        for w in state.wal.replay(after_seq=max(0, seq - 1)):
+            if w.get("seq") == seq and w.get("request_id") == request_id:
+                entry_id = w.get("entry_id") or compute_entry_identity(w)
+                break
+
     clean_url = state.follower_url.removeprefix("http://").removeprefix("https://").rstrip("/")
     url = f"http://{clean_url}/internal/check-op"
-    payload = {"term": term, "seq": seq, "request_id": request_id}
+    payload = {"term": term, "seq": seq, "request_id": request_id, "entry_id": entry_id}
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     sig = compute_signature(state.settings.CLUSTER_SECRET, body_bytes)
     headers = {
@@ -483,14 +501,20 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
             wal_last_seq = data.get("wal_last_seq", 0)
             op_term = data.get("op_term")
             op_request_id = data.get("op_request_id")
+            op_entry_id = data.get("op_entry_id")
 
-            # 1. Complete operation identity match: (term, seq, request_id)
-            if (
+            # 1. Complete operation identity match: (term, seq, request_id, entry_id)
+            identity_match = (
                 has_op
                 and op_term == term
                 and op_request_id == request_id
                 and None not in (term, seq, request_id, op_term, op_request_id)
-            ):
+            )
+            if identity_match and entry_id is not None and op_entry_id is not None:
+                if entry_id != op_entry_id:
+                    identity_match = False
+
+            if identity_match:
                 if pending:
                     apply_entry = {
                         "seq": seq,
@@ -807,9 +831,18 @@ async def resync_with_primary(
 
     try:
         assert state.wal is not None
-        # 1. Collect local log entries (seq, term)
+        # 1. Collect local log entries with deterministic identities
         local_entries = [
-            {"seq": e["seq"], "term": e["term"]} for e in state.wal.replay(after_seq=0)
+            {
+                "seq": e["seq"],
+                "term": e["term"],
+                "op": e.get("op"),
+                "doc_id": e.get("doc_id"),
+                "request_id": e.get("request_id", ""),
+                "payload": e.get("payload"),
+                "entry_id": e.get("entry_id") or compute_entry_identity(e),
+            }
+            for e in state.wal.replay(after_seq=0)
         ]
 
         # 2. Query divergence point
@@ -831,6 +864,20 @@ async def resync_with_primary(
         div_seq = div_data.get("divergence_seq", 0)
 
         async with state.write_lock():
+            # Invariant: Rejoining node must never silently overwrite locally committed history!
+            if not needs_snapshot and div_seq < state.committed_seq:
+                logger.error(
+                    "Shard %s cannot reconcile: divergence_seq (%d) < locally committed_seq (%d). "
+                    "Refusing to silently overwrite committed history. Node fails closed.",
+                    state.shard_id,
+                    div_seq,
+                    state.committed_seq,
+                )
+                return False
+
+            if "term" in div_data and div_data["term"] > state.term:
+                state.term = div_data["term"]
+
             if needs_snapshot:
                 # Full snapshot resync
                 snap_url = f"http://{clean_primary}/internal/snapshot"
@@ -876,6 +923,7 @@ async def resync_with_primary(
                                 seq=entry["seq"],
                                 outcome=WriteOutcome.COMMITTED,
                                 result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
+                                term=entry.get("term", state.term),
                             ),
                         )
 
@@ -892,28 +940,35 @@ async def resync_with_primary(
                         CLUSTER_SIG_HEADER: c_sig,
                     },
                 )
-                if c_resp.status_code == 200:
-                    c_data = c_resp.json()
-                    for entry in c_data.get("entries", []):
-                        state.wal.append(
-                            seq=entry["seq"],
-                            term=entry["term"],
-                            op=entry["op"],
-                            doc_id=entry["doc_id"],
-                            request_id=entry.get("request_id", ""),
-                            payload=entry.get("payload"),
+                if c_resp.status_code != 200:
+                    logger.warning(
+                        "Catchup failed with status %d: %s", c_resp.status_code, c_resp.text
+                    )
+                    return False
+
+                c_data = c_resp.json()
+                for entry in c_data.get("entries", []):
+                    state.wal.append(
+                        seq=entry["seq"],
+                        term=entry["term"],
+                        op=entry["op"],
+                        doc_id=entry["doc_id"],
+                        request_id=entry.get("request_id", ""),
+                        payload=entry.get("payload"),
+                    )
+                    if entry.get("term", 0) > state.term:
+                        state.term = entry["term"]
+                    state.engine.apply(entry)
+                    rid = entry.get("request_id")
+                    if rid:
+                        state.engine.dedup_store(
+                            rid,
+                            DedupEntry(
+                                seq=entry["seq"],
+                                outcome=WriteOutcome.COMMITTED,
+                                result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
+                            ),
                         )
-                        state.engine.apply(entry)
-                        rid = entry.get("request_id")
-                        if rid:
-                            state.engine.dedup_store(
-                                rid,
-                                DedupEntry(
-                                    seq=entry["seq"],
-                                    outcome=WriteOutcome.COMMITTED,
-                                    result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
-                                ),
-                            )
 
             state.committed_seq = max(state.committed_seq, state.engine.last_applied_seq)
             _persist_node_metadata(state)
@@ -1412,9 +1467,11 @@ def build_app(
                 "entry_found": False,
             }
 
+        req_entry_id = body.get("entry_id")
         has_op = False
         op_term = None
         op_request_id = None
+        op_entry_id = None
         entry_found = False
 
         # 1. Search WAL for entry at this seq
@@ -1424,8 +1481,10 @@ def build_app(
                     entry_found = True
                     op_term = w.get("term")
                     op_request_id = w.get("request_id")
+                    op_entry_id = w.get("entry_id") or compute_entry_identity(w)
                     if op_term == term and op_request_id == request_id:
-                        has_op = True
+                        if req_entry_id is None or req_entry_id == op_entry_id:
+                            has_op = True
                     break
                 if w.get("seq", 0) > seq:
                     break
@@ -1453,6 +1512,7 @@ def build_app(
             "last_applied_seq": last_applied_seq,
             "op_term": op_term,
             "op_request_id": op_request_id,
+            "op_entry_id": op_entry_id,
             "entry_found": entry_found,
         }
 
@@ -1629,26 +1689,97 @@ def build_app(
 
         entries = body.get("entries", [])
         earliest = state.wal.earliest_seq() or 1
-        local_entries = {e["seq"]: e["term"] for e in state.wal.replay(after_seq=0)}
+        last_seq = state.wal.last_seq
+
+        # Map local primary entries by seq
+        primary_entries = list(state.wal.replay(after_seq=0))
+        primary_by_seq = {int(e["seq"]): e for e in primary_entries}
 
         candidate_divergence = 0
+        first_conflict_seq: int | None = None
         needs_snapshot = False
 
-        for item in entries:
-            s = item.get("seq", 0)
-            t = item.get("term", 0)
-            if s in local_entries and local_entries[s] == t:
-                if s > candidate_divergence:
-                    candidate_divergence = s
+        sorted_entries = sorted(entries, key=lambda x: int(x.get("seq", 0)))
 
-        if entries and candidate_divergence == 0 and entries[0].get("seq", 0) < earliest:
+        # If follower's earliest entry is older than primary's earliest available entry
+        if sorted_entries and int(sorted_entries[0].get("seq", 0)) < earliest:
+            # Primary has pruned/compacted its WAL before earliest_seq; cannot verify from here
             needs_snapshot = True
+        elif not sorted_entries:
+            candidate_divergence = 0
+        else:
+            expected_start = (
+                earliest if (earliest in primary_by_seq and 1 not in primary_by_seq) else 1
+            )
+            if (
+                int(sorted_entries[0].get("seq", 0)) > expected_start
+                and expected_start in primary_by_seq
+            ):
+                first_conflict_seq = int(sorted_entries[0].get("seq", 0))
+
+            if first_conflict_seq is None:
+                for item in sorted_entries:
+                    s = int(item.get("seq", 0))
+                    if s <= 0:
+                        continue
+
+                    # Contiguity check: each matching entry must follow the previous matching seq
+                    if candidate_divergence == 0:
+                        if s != expected_start and expected_start in primary_by_seq:
+                            first_conflict_seq = s
+                            break
+                    else:
+                        if s != candidate_divergence + 1:
+                            # Contiguity broken in follower log
+                            first_conflict_seq = s
+                            break
+
+                    # Primary log reached its end before follower log
+                    if s not in primary_by_seq:
+                        break
+
+                    p_entry = primary_by_seq[s]
+                    p_identity = p_entry.get("entry_id") or compute_entry_identity(p_entry)
+
+                    # Determine follower entry identity
+                    f_identity = item.get("entry_id")
+                    if not f_identity and "op" in item and "doc_id" in item:
+                        f_identity = compute_entry_identity(item)
+
+                    # Term comparison
+                    item_term = int(item.get("term", 0))
+                    p_term = int(p_entry.get("term", 0))
+                    if item_term != p_term:
+                        first_conflict_seq = s
+                        break
+
+                    # Request ID comparison
+                    if "request_id" in item:
+                        f_req = str(item.get("request_id") or "")
+                        p_req = str(p_entry.get("request_id") or "")
+                        if f_req != p_req:
+                            first_conflict_seq = s
+                            break
+
+                    # Complete entry identity comparison
+                    if f_identity is not None:
+                        if f_identity != p_identity:
+                            first_conflict_seq = s
+                            break
+                    else:
+                        # Cannot verify identity; fail closed
+                        first_conflict_seq = s
+                        break
+
+                    candidate_divergence = s
 
         return {
             "status": "ok",
             "divergence_seq": candidate_divergence,
-            "last_seq": state.wal.last_seq,
+            "last_seq": last_seq,
+            "term": state.term,
             "needs_snapshot": needs_snapshot,
+            "first_conflict_seq": first_conflict_seq,
         }
 
     @app.post("/internal/rejoin/complete", dependencies=[Depends(cluster_auth)])

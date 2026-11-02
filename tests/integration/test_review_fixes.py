@@ -1838,7 +1838,7 @@ async def test_crash_window_follower_promoted_before_old_primary_restarts(
                 op="insert",
                 doc_id=10,
                 request_id="req-1",
-                payload={"doc_id": 10, "val": "v1"},
+                payload={"doc_id": 10, "val": "v10"},
             )
             p1_state.engine.apply(
                 {
@@ -1847,7 +1847,7 @@ async def test_crash_window_follower_promoted_before_old_primary_restarts(
                     "op": "insert",
                     "doc_id": 10,
                     "request_id": "req-1",
-                    "payload": {"doc_id": 10, "val": "v1"},
+                    "payload": {"doc_id": 10, "val": "v10"},
                 }
             )
             p1_state.committed_seq = 1

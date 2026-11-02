@@ -18,12 +18,13 @@ Rules:
 from __future__ import annotations
 
 import binascii
+import hashlib
 import json
 import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,42 @@ _CRC_FIELD = "crc32"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def compute_entry_identity(record: dict[str, Any]) -> str:
+    """Compute deterministic SHA-256 identity of a WAL entry.
+
+    The identity covers:
+    - term: int
+    - seq: int
+    - op: str
+    - doc_id: int
+    - request_id: str
+    - payload: canonical JSON dict or None
+
+    Transient / checksum fields (crc32, entry_id) are excluded.
+    Dictionary keys are sorted recursively and compact separators are used
+    to guarantee equivalent JSON objects produce identical hashes regardless
+    of key ordering.
+    """
+    op_val = record.get("op")
+    if op_val is not None and hasattr(op_val, "value"):
+        op_str = str(op_val.value)
+    else:
+        op_str = str(op_val or "")
+
+    canonical_entry = {
+        "doc_id": int(record["doc_id"]),
+        "op": op_str,
+        "payload": record.get("payload"),
+        "request_id": str(record.get("request_id") or ""),
+        "seq": int(record["seq"]),
+        "term": int(record["term"]),
+    }
+    canonical_bytes = json.dumps(canonical_entry, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(canonical_bytes).hexdigest()
 
 
 def _crc32_of(record: dict) -> int:  # type: ignore[type-arg]
@@ -174,6 +211,7 @@ class WAL:
             "request_id": request_id,
             "payload": payload,
         }
+        record["entry_id"] = compute_entry_identity(record)
         record[_CRC_FIELD] = _crc32_of(record)
 
         line = json.dumps(record, separators=(",", ":")) + "\n"
