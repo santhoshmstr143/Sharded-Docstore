@@ -18,6 +18,7 @@ Apply semantics:
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,7 +40,8 @@ class DedupEntry:
     outcome: str
     result: dict[str, Any]
     term: int = 1
-    created_at: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=time.time)
+    fingerprint: str | None = None
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -80,7 +82,7 @@ class StorageEngine:
         doc_id: int = doc["doc_id"]
         if doc_id in self._docs:
             raise DuplicateKey(f"doc_id={doc_id} already exists.")
-        self._docs[doc_id] = dict(doc)
+        self._docs[doc_id] = copy.deepcopy(doc)
         self._index[doc_id] = None
         self._doc_seq[doc_id] = seq
 
@@ -89,7 +91,7 @@ class StorageEngine:
         doc_id: int = doc["doc_id"]
         if doc_id not in self._docs:
             raise NotFound(f"doc_id={doc_id} not found.")
-        self._docs[doc_id] = dict(doc)
+        self._docs[doc_id] = copy.deepcopy(doc)
         self._doc_seq[doc_id] = seq
 
     def delete(self, doc_id: int, *, seq: int) -> None:
@@ -102,7 +104,7 @@ class StorageEngine:
 
     def get(self, doc_id: int) -> dict[str, Any] | None:
         """Return the document or ``None`` if not found."""
-        return dict(self._docs[doc_id]) if doc_id in self._docs else None
+        return copy.deepcopy(self._docs[doc_id]) if doc_id in self._docs else None
 
     # ── Range scan ────────────────────────────────────────────────────────────
 
@@ -156,17 +158,17 @@ class StorageEngine:
         if op == WriteOp.INSERT:
             if migration_mode:
                 # Upsert
-                self._docs[doc_id] = dict(payload or {})
+                self._docs[doc_id] = copy.deepcopy(payload or {})
                 self._index[doc_id] = None
                 self._doc_seq[doc_id] = seq
             else:
                 if doc_id not in self._docs:
-                    self._docs[doc_id] = dict(payload or {})
+                    self._docs[doc_id] = copy.deepcopy(payload or {})
                     self._index[doc_id] = None
                     self._doc_seq[doc_id] = seq
         elif op == WriteOp.UPDATE:
             if doc_id in self._docs:
-                self._docs[doc_id] = dict(payload or {})
+                self._docs[doc_id] = copy.deepcopy(payload or {})
                 self._doc_seq[doc_id] = seq
         elif op == WriteOp.DELETE:
             if doc_id in self._docs:
@@ -185,7 +187,7 @@ class StorageEngine:
         if entry is None:
             return None
         # Evict if TTL exceeded
-        if time.monotonic() - entry.created_at > _DEDUP_TTL_S:
+        if time.time() - entry.created_at > _DEDUP_TTL_S:
             del self._dedup[request_id]
             return None
         return entry
@@ -208,7 +210,7 @@ class StorageEngine:
 
     def _evict_stale_dedup(self) -> None:
         """Proactively remove all dedup entries whose TTL has expired (M2)."""
-        now = time.monotonic()
+        now = time.time()
         stale_keys = [rid for rid, e in self._dedup.items() if now - e.created_at > _DEDUP_TTL_S]
         for rid in stale_keys:
             del self._dedup[rid]
@@ -238,6 +240,7 @@ class StorageEngine:
                 "result": e.result,
                 "term": e.term,
                 "created_at": e.created_at,
+                "fingerprint": e.fingerprint,
             }
             for rid, e in self._dedup.items()
         }
@@ -245,7 +248,7 @@ class StorageEngine:
     def dedup_import(self, data: dict[str, Any]) -> None:
         """Restore the dedup table from a snapshot."""
         self._dedup.clear()
-        now = time.monotonic()
+        now = time.time()
         for rid, v in data.items():
             entry = DedupEntry(
                 seq=v["seq"],
@@ -253,6 +256,7 @@ class StorageEngine:
                 result=v["result"],
                 term=v.get("term", 1),
                 created_at=v.get("created_at", now),
+                fingerprint=v.get("fingerprint"),
             )
             # Skip entries older than TTL
             if now - entry.created_at <= _DEDUP_TTL_S:

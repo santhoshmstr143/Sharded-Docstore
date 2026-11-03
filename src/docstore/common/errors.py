@@ -67,6 +67,13 @@ class LeaseExpired(DocstoreError):
     error_code = "LEASE_EXPIRED"
 
 
+class RequestIdReused(DocstoreError):
+    """The same ``request_id`` was reused for a write with different content."""
+
+    http_status = 409
+    error_code = "REQUEST_ID_REUSED"
+
+
 class DuplicateKey(DocstoreError):
     """Insert attempted with a ``doc_id`` that already exists."""
 

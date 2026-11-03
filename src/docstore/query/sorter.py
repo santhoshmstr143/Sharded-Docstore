@@ -95,7 +95,7 @@ def extract_sort_key(
     if is_number(raw_val):
         return SortValue(
             rank=TypeRank.NUMBER,
-            val=float(raw_val),
+            val=raw_val,
             doc_id=doc_id,
             descending=descending,
         )

@@ -83,7 +83,13 @@ bench:           ## Run performance benchmarks and generate figures
 # ── Docker ───────────────────────────────────────────────────────────────────
 .PHONY: up
 up:              ## Start the full Docker Compose cluster
-	@if [ ! -f .env ]; then cp .env.example .env; fi
+	@if [ ! -f .env ]; then \
+		sed -e "s/^CLUSTER_SECRET=.*/CLUSTER_SECRET=$$(python3 -c 'import secrets;print(secrets.token_hex(32))')/" \
+		    -e "s/^ADMIN_TOKEN=.*/ADMIN_TOKEN=$$(python3 -c 'import secrets;print(secrets.token_hex(32))')/" \
+		    -e "s/^CLIENT_API_KEY=.*/CLIENT_API_KEY=$$(python3 -c 'import secrets;print(secrets.token_hex(16))')/" \
+		    .env.example > .env; \
+		echo 'Generated .env with random secrets'; \
+	fi
 	docker compose -f docker/docker-compose.yml up -d
 
 .PHONY: down

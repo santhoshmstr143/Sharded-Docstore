@@ -166,6 +166,8 @@ class CoordinatorService:
         self.replica_states: dict[str, ReplicaState] = {}  # shard_id -> ReplicaState
         self.failover_metrics: list[dict[str, Any]] = []
         self.failover_in_progress: set[str] = set()
+        # shard_id -> (follower_addr, promote_body): promotions the follower never confirmed
+        self._unconfirmed_promotions: dict[str, tuple[str, dict[str, Any]]] = {}
         self._started_at_monotonic: float = time.monotonic()
         self._recovery_quarantine_until_monotonic: float = (
             self._started_at_monotonic + settings.LEASE_DURATION_S + settings.SAFETY_MARGIN_S
@@ -442,31 +444,24 @@ class CoordinatorService:
                 )
                 owns_promote_client = True
 
-            try:
-                clean_follower = follower_addr.removeprefix("http://").removeprefix("https://")
-                url = f"http://{clean_follower}/internal/promote"
-                req_body = {
-                    "shard_id": shard_id,
-                    "term": new_term,
-                    "ownership_epochs": epochs_dict,
-                    "lease": lease_grant.model_dump(),
-                    "follower_url": primary_addr,
-                }
-                body_bytes = json.dumps(req_body, separators=(",", ":")).encode("utf-8")
-                sig = compute_signature(self.settings.CLUSTER_SECRET, body_bytes)
-                headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
-                resp = await promote_client.post(url, content=body_bytes, headers=headers)
-                if resp.status_code != 200:
-                    logger.error(
-                        "Promotion RPC to %s returned error %d: %s",
-                        follower_addr,
-                        resp.status_code,
-                        resp.text,
-                    )
-                    return False
-            finally:
-                if owns_promote_client:
-                    await promote_client.aclose()
+            req_body = {
+                "shard_id": shard_id,
+                "term": new_term,
+                "ownership_epochs": epochs_dict,
+                "lease": lease_grant.model_dump(),
+                "follower_url": primary_addr,
+            }
+            promoted_ok = await self._send_promote(
+                promote_client, follower_addr, req_body, attempts=3
+            )
+            if owns_promote_client:
+                await promote_client.aclose()
+            if not promoted_ok:
+                # The map already names the follower as primary. Remember the promotion and
+                # keep retrying from the health monitor instead of leaving the shard headless.
+                self._unconfirmed_promotions[shard_id] = (follower_addr, req_body)
+                logger.error("Promotion of %s not confirmed; will keep retrying", follower_addr)
+                return False
 
             # Step 9: Set replica state to DOWN (Degraded mode)
             self.replica_states[shard_id] = ReplicaState.DOWN
@@ -498,18 +493,70 @@ class CoordinatorService:
         finally:
             self.failover_in_progress.discard(shard_id)
 
+    async def _send_promote(
+        self,
+        client: httpx.AsyncClient,
+        follower_addr: str,
+        body: dict[str, Any],
+        *,
+        attempts: int = 1,
+    ) -> bool:
+        """POST /internal/promote (idempotent for the same term) with bounded retries."""
+        clean = follower_addr.removeprefix("http://").removeprefix("https://")
+        raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        sig = compute_signature(self.settings.CLUSTER_SECRET, raw)
+        headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
+        for attempt in range(attempts):
+            try:
+                resp = await client.post(
+                    f"http://{clean}/internal/promote", content=raw, headers=headers
+                )
+                if resp.status_code == 200:
+                    return True
+                logger.error(
+                    "Promotion RPC to %s returned %d: %s",
+                    follower_addr,
+                    resp.status_code,
+                    resp.text,
+                )
+                if resp.status_code == 409:
+                    return False  # stale term: retrying cannot help
+            except Exception as exc:
+                logger.warning("Promotion RPC to %s failed: %s", follower_addr, exc)
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.2 * (attempt + 1))
+        return False
+
+    async def _retry_unconfirmed_promotions(self, http_client: httpx.AsyncClient | None) -> None:
+        for shard_id, (addr, body) in list(self._unconfirmed_promotions.items()):
+            if shard_id in self.failover_in_progress:
+                continue
+            client = http_client or httpx.AsyncClient(
+                timeout=self.settings.REPLICATION_TIMEOUT_S + 2.0
+            )
+            try:
+                ok = await self._send_promote(client, addr, body)
+            finally:
+                if http_client is None:
+                    await client.aclose()
+            if ok:
+                del self._unconfirmed_promotions[shard_id]
+                self.replica_states[shard_id] = ReplicaState.DOWN
+                logger.info("Deferred promotion of %s for shard %s confirmed", addr, shard_id)
+
     async def check_and_trigger_failover(
         self,
         *,
         http_client: httpx.AsyncClient | None = None,
     ) -> list[str]:
         """Examine nodes and trigger promotion if primary has not sent heartbeats within D."""
+        await self._retry_unconfirmed_promotions(http_client)
         now_mono = time.monotonic()
         promoted: list[str] = []
 
         for entry in self.map_mgr.shard_map.entries:
             shard_id = entry.shard_id
-            if shard_id in self.failover_in_progress:
+            if shard_id in self.failover_in_progress or shard_id in self._unconfirmed_promotions:
                 continue
 
             primary_node = None

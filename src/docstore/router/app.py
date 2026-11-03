@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -129,7 +129,19 @@ def build_router_app(
     @app.middleware("http")
     async def _router_middleware(request: Request, call_next: Any) -> Response:
         cl = request.headers.get("content-length")
-        if cl and int(cl) > settings.MAX_BODY_SIZE_BYTES:
+        if "transfer-encoding" in request.headers:
+            return JSONResponse(
+                status_code=411,
+                content={
+                    "error_code": "LENGTH_REQUIRED",
+                    "error_message": "Chunked bodies not accepted; send Content-Length.",
+                },
+            )
+        try:
+            too_big = bool(cl) and int(cl or 0) > settings.MAX_BODY_SIZE_BYTES
+        except ValueError:
+            too_big = True
+        if too_big:
             return JSONResponse(
                 status_code=413,
                 content={
@@ -161,7 +173,7 @@ def build_router_app(
 
     def _verify_client_auth(
         x_api_key: str | None = Header(default=None, alias=CLIENT_KEY_HEADER),
-    ) -> None:
+    ) -> None:  # used as a FastAPI dependency on every client-facing route
         if not x_api_key or not verify_token(x_api_key, settings.CLIENT_API_KEY):
             raise HTTPException(
                 status_code=401,
@@ -323,13 +335,11 @@ def build_router_app(
 
     # ── Public Router API ─────────────────────────────────────────────────────
 
-    @app.post("/doc", status_code=201)
+    @app.post("/doc", status_code=201, dependencies=[Depends(_verify_client_auth)])
     async def insert_doc(
         body: RouterInsertBody,
         request: Request,
-        _auth: None = Header(default=None),
     ) -> JSONResponse:
-        _verify_client_auth(request.headers.get(CLIENT_KEY_HEADER))
         try:
             doc = Document.model_validate(body.document)
         except Exception as exc:
@@ -350,13 +360,12 @@ def build_router_app(
             body_dict=forward_body,
         )
 
-    @app.put("/doc/{doc_id}")
+    @app.put("/doc/{doc_id}", dependencies=[Depends(_verify_client_auth)])
     async def update_doc(
         doc_id: int,
         body: RouterUpdateBody,
         request: Request,
     ) -> JSONResponse:
-        _verify_client_auth(request.headers.get(CLIENT_KEY_HEADER))
         if isinstance(doc_id, bool) or doc_id < DOC_ID_MIN or doc_id > DOC_ID_MAX:
             raise OutOfRange(f"doc_id={doc_id} out of range").to_http_exception()
 
@@ -388,13 +397,12 @@ def build_router_app(
             body_dict=forward_body,
         )
 
-    @app.delete("/doc/{doc_id}")
+    @app.delete("/doc/{doc_id}", dependencies=[Depends(_verify_client_auth)])
     async def delete_doc(
         doc_id: int,
         body: RouterDeleteBody,
         request: Request,
     ) -> JSONResponse:
-        _verify_client_auth(request.headers.get(CLIENT_KEY_HEADER))
         if isinstance(doc_id, bool) or doc_id < DOC_ID_MIN or doc_id > DOC_ID_MAX:
             raise OutOfRange(f"doc_id={doc_id} out of range").to_http_exception()
 
@@ -407,13 +415,12 @@ def build_router_app(
             body_dict=forward_body,
         )
 
-    @app.get("/doc/{doc_id}")
+    @app.get("/doc/{doc_id}", dependencies=[Depends(_verify_client_auth)])
     async def get_doc(
         doc_id: int,
         request: Request,
         read_mode: str = Query(default="primary"),
     ) -> JSONResponse:
-        _verify_client_auth(request.headers.get(CLIENT_KEY_HEADER))
         if isinstance(doc_id, bool) or doc_id < DOC_ID_MIN or doc_id > DOC_ID_MAX:
             raise OutOfRange(f"doc_id={doc_id} out of range").to_http_exception()
 
@@ -426,12 +433,11 @@ def build_router_app(
             target_role=read_mode,
         )
 
-    @app.post("/query")
+    @app.post("/query", dependencies=[Depends(_verify_client_auth)])
     async def query_docs(
         body: QueryFilter,
         request: Request,
     ) -> QueryResponse:
-        _verify_client_auth(request.headers.get(CLIENT_KEY_HEADER))
         try:
             validate_query_filter(body.filter)
         except InvalidQuery as exc:
@@ -453,7 +459,7 @@ def build_router_app(
             "shard_count": len(mgr.shard_map.entries),
         }
 
-    @app.get("/status")
+    @app.get("/status", dependencies=[Depends(_verify_client_auth)])
     async def status(request: Request) -> dict[str, Any]:
         mgr: ShardMapManager = request.app.state.map_mgr
         return {

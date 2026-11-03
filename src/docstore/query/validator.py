@@ -7,6 +7,7 @@ Pure Python — no eval, exec, pickle, or user regex.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from docstore.common.errors import InvalidQuery
@@ -21,6 +22,20 @@ WHITELIST_VALUE_OPS = frozenset({"$eq", "$gt", "$gte", "$lt", "$lte", "$in"})
 WHITELIST_ALL_OPS = WHITELIST_LOGICAL_OPS | WHITELIST_VALUE_OPS
 
 
+def _reject_non_finite(value: Any, depth: int = 0) -> None:
+    """NaN / Infinity are not valid JSON and break routing and comparisons."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise InvalidQuery("Non-finite numbers (NaN/Infinity) are not allowed in filters.")
+    if depth > 20:
+        raise InvalidQuery("Filter value nesting is too deep.")
+    if isinstance(value, dict):
+        for v in value.values():
+            _reject_non_finite(v, depth + 1)
+    elif isinstance(value, list):
+        for v in value:
+            _reject_non_finite(v, depth + 1)
+
+
 def validate_query_filter(filter_dict: Any) -> None:
     """Validate a query filter dict against grammar and security limits.
 
@@ -33,6 +48,7 @@ def validate_query_filter(filter_dict: Any) -> None:
         # Empty filter is valid (matches all documents)
         return
 
+    _reject_non_finite(filter_dict)
     clause_count = 0
 
     def _validate_node(node: Any, current_depth: int) -> None:

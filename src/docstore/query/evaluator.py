@@ -69,9 +69,15 @@ def type_safe_equal(doc_val: Any, target_val: Any) -> bool:
     if target_val is None:
         return False
 
-    # For lists and dicts, compare structural equality if types match exactly
-    if type(doc_val) is type(target_val):
-        return bool(doc_val == target_val)
+    # Lists and dicts: recursive, so [1] never equals [True] and {"x":1} never equals {"x":True}
+    if isinstance(doc_val, list) and isinstance(target_val, list):
+        return len(doc_val) == len(target_val) and all(
+            type_safe_equal(a, b) for a, b in zip(doc_val, target_val, strict=True)
+        )
+    if isinstance(doc_val, dict) and isinstance(target_val, dict):
+        return doc_val.keys() == target_val.keys() and all(
+            type_safe_equal(doc_val[k], target_val[k]) for k in doc_val
+        )
 
     return False
 

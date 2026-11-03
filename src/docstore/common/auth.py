@@ -52,7 +52,9 @@ def verify_signature(secret: str, body: bytes, provided: str) -> bool:
     Uses ``hmac.compare_digest`` for constant-time comparison.
     """
     expected = compute_signature(secret, body)
-    return hmac.compare_digest(expected.lower(), provided.lower())
+    return hmac.compare_digest(
+        expected.lower().encode("utf-8"), provided.lower().encode("utf-8", errors="replace")
+    )
 
 
 def verify_token(expected_token: str, provided_token: str) -> bool:

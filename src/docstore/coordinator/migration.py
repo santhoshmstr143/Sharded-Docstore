@@ -30,6 +30,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Max docs/entries per RPC so request bodies stay well below the 2 MB body limit.
+_BATCH_DOCS = 200
+
+
 class MigrationState(enum.StrEnum):
     PLANNED = "PLANNED"
     SNAPSHOT_COPY = "SNAPSHOT_COPY"
@@ -240,12 +244,12 @@ class MigrationManager:
             self.save_record(rec)
 
             # Ingest into destination via normal replicated path
-            if docs:
+            for i in range(0, len(docs), _BATCH_DOCS):
                 await _rpc(
                     f"{dest_url}/internal/migration/apply-batch",
                     {
                         "migration_id": rec.migration_id,
-                        "documents": docs,
+                        "documents": docs[i : i + _BATCH_DOCS],
                         "source_seq": s_seq,
                     },
                 )
@@ -286,13 +290,14 @@ class MigrationManager:
                 src_last_seq: int = oplog_resp.get("last_seq", current_cursor)
 
                 if entries:
-                    await _rpc(
-                        f"{dest_url}/internal/migration/apply-oplog",
-                        {
-                            "migration_id": rec.migration_id,
-                            "entries": entries,
-                        },
-                    )
+                    for i in range(0, len(entries), _BATCH_DOCS):
+                        await _rpc(
+                            f"{dest_url}/internal/migration/apply-oplog",
+                            {
+                                "migration_id": rec.migration_id,
+                                "entries": entries[i : i + _BATCH_DOCS],
+                            },
+                        )
                     rec.catchup_ops_replayed += len(entries)
                     next_cursor = max(e["seq"] for e in entries)
                     if next_cursor <= current_cursor:
@@ -381,13 +386,14 @@ class MigrationManager:
                 final_entries = final_oplog_resp.get("entries", [])
                 src_last_seq = final_oplog_resp.get("last_seq", current_cursor)
                 if final_entries:
-                    await _rpc(
-                        f"{dest_url}/internal/migration/apply-oplog",
-                        {
-                            "migration_id": rec.migration_id,
-                            "entries": final_entries,
-                        },
-                    )
+                    for i in range(0, len(final_entries), _BATCH_DOCS):
+                        await _rpc(
+                            f"{dest_url}/internal/migration/apply-oplog",
+                            {
+                                "migration_id": rec.migration_id,
+                                "entries": final_entries[i : i + _BATCH_DOCS],
+                            },
+                        )
                     rec.catchup_ops_replayed += len(final_entries)
                     next_cursor = max(e["seq"] for e in final_entries)
                     if next_cursor <= current_cursor:
@@ -456,13 +462,21 @@ class MigrationManager:
                 )
 
             # ── 6. CUTOVER (Point of No Return) ──────────────────────────────
-            new_epoch = coord.bump_range_migration(
-                shard_id=rec.from_shard,
-                start=rec.range_start,
-                end=rec.range_end,
-                new_shard_id=rec.to_shard,
-            )
+            # Persist the intent FIRST: if we crash after the map flips, recovery must roll
+            # forward instead of aborting a migration whose ownership already moved.
             rec.state = MigrationState.CUTOVER
+            self.save_record(rec)
+            try:
+                new_epoch = coord.bump_range_migration(
+                    shard_id=rec.from_shard,
+                    start=rec.range_start,
+                    end=rec.range_end,
+                    new_shard_id=rec.to_shard,
+                )
+            except Exception:
+                rec.state = MigrationState.VERIFY  # map did not flip: still abortable
+                self.save_record(rec)
+                raise
             rec.final_cutover_epoch = new_epoch
             if pause_start is not None:
                 rec.pause_duration_s = time.monotonic() - pause_start
@@ -607,14 +621,26 @@ class MigrationManager:
                         "Migration %s is past cutover; rolling forward to DONE",
                         rec.migration_id,
                     )
+                    covering = [
+                        e
+                        for e in cur_map.entries
+                        if e.shard_id == rec.to_shard
+                        and e.range.start <= rec.range_start
+                        and rec.range_end <= e.range.end
+                    ]
                     epoch = rec.final_cutover_epoch
                     if not epoch:
-                        epoch = coord.bump_range_migration(
-                            shard_id=rec.from_shard,
-                            start=rec.range_start,
-                            end=rec.range_end,
-                            new_shard_id=rec.to_shard,
-                        )
+                        # Intent was logged but no epoch recorded: the flip may or may not
+                        # have happened. Look at the map to find out.
+                        if covering:
+                            epoch = covering[0].ownership_epoch
+                        else:
+                            epoch = coord.bump_range_migration(
+                                shard_id=rec.from_shard,
+                                start=rec.range_start,
+                                end=rec.range_end,
+                                new_shard_id=rec.to_shard,
+                            )
                         rec.final_cutover_epoch = epoch
                     rec.state = MigrationState.CLEANUP
                     self.save_record(rec)

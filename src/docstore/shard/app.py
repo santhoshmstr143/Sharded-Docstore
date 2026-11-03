@@ -39,6 +39,7 @@ Write path (Module 7):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +71,7 @@ from docstore.common.errors import (
     OutOfRange,
     RangePaused,
     ReplicationUnavailable,
+    RequestIdReused,
     StaleTerm,
 )
 from docstore.common.logging import get_logger
@@ -164,6 +166,7 @@ class NodeState:
         self.paused_ranges: list[tuple[int, int]] = []
         self.pending_unresolved_writes: dict[str, dict[str, Any]] = {}
         self.allow_standalone: bool = False
+        self.advertise_addr: str = ""
 
     def owns(self, doc_id: int) -> bool:
         return any(r.start <= doc_id < r.end for r in self.ranges)
@@ -728,6 +731,32 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
     return WriteOutcome.OUTCOME_UNKNOWN
 
 
+def _write_fingerprint(op: WriteOp, doc_id: int, payload: dict[str, Any] | None) -> str:
+    """Stable hash of a write's content, used to detect request_id reuse with different data."""
+    canon = json.dumps(
+        {"op": op.value, "doc_id": doc_id, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _subtract_range(ranges: list[ShardRangeConfig], start: int, end: int) -> list[ShardRangeConfig]:
+    """Remove [start, end) from owned ranges, handling prefix / suffix / interior / whole."""
+    out: list[ShardRangeConfig] = []
+    for r in ranges:
+        if r.end <= start or r.start >= end:
+            out.append(r)
+            continue
+        if r.start < start:
+            out.append(
+                ShardRangeConfig(start=r.start, end=start, ownership_epoch=r.ownership_epoch)
+            )
+        if r.end > end:
+            out.append(ShardRangeConfig(start=end, end=r.end, ownership_epoch=r.ownership_epoch))
+    return out
+
+
 # ── Write Helper ──────────────────────────────────────────────────────────────
 
 
@@ -739,6 +768,7 @@ async def _execute_write(
     payload: dict[str, Any] | None,
 ) -> WriteResponse:
     """Run a write under the per-shard write lock with replication and lease fencing."""
+    fp = _write_fingerprint(op, doc_id, payload)
     async with state.write_lock():
         # 1. Role check: only primary accepts writes
         if state.role != NodeRole.PRIMARY:
@@ -790,6 +820,10 @@ async def _execute_write(
         # 5. Dedup check: return original result for retried request_id
         existing = state.engine.dedup_check(request_id)
         if existing is not None:
+            if existing.fingerprint is not None and existing.fingerprint != fp:
+                raise RequestIdReused(
+                    f"request_id {request_id!r} was already used for a different write."
+                )
             if existing.outcome == WriteOutcome.OUTCOME_UNKNOWN:
                 reconciled = await _reconcile_pending_write(state, request_id)
                 if reconciled == WriteOutcome.COMMITTED:
@@ -880,6 +914,7 @@ async def _execute_write(
                         outcome=WriteOutcome.OUTCOME_UNKNOWN,
                         result={"outcome": WriteOutcome.OUTCOME_UNKNOWN, "seq": seq},
                         term=state.term,
+                        fingerprint=fp,
                     ),
                 )
                 raise OutcomeUnknown(
@@ -911,7 +946,13 @@ async def _execute_write(
         result = {"outcome": WriteOutcome.COMMITTED, "seq": seq}
         state.engine.dedup_store(
             request_id,
-            DedupEntry(seq=seq, outcome=WriteOutcome.COMMITTED, result=result, term=state.term),
+            DedupEntry(
+                seq=seq,
+                outcome=WriteOutcome.COMMITTED,
+                result=result,
+                term=state.term,
+                fingerprint=fp,
+            ),
         )
 
         # Test hook 4: after follower ack before client ack
@@ -1298,6 +1339,7 @@ def build_app(
     coordinator_transport: httpx.AsyncBaseTransport | None = None,
     http_client: httpx.AsyncClient | None = None,
     allow_standalone: bool = False,
+    advertise_addr: str | None = None,
 ) -> FastAPI:
     """Factory: create and return the configured FastAPI shard-node app."""
 
@@ -1315,6 +1357,11 @@ def build_app(
         state.term = term
         state.follower_url = follower_url
         state.follower_state = follower_state
+        state.advertise_addr = (
+            advertise_addr
+            or os.environ.get("NODE_ADDRESS")
+            or f"{node_id}:{os.environ.get('PORT', '8200')}"
+        )
 
         coord_url = coordinator_url or os.environ.get("COORDINATOR_URL")
         state.coordinator_url = coord_url
@@ -1358,12 +1405,41 @@ def build_app(
                 return
             clean_coord = coord_url.removeprefix("http://").removeprefix("https://").rstrip("/")
             url = f"http://{clean_coord}/heartbeat"
+            reg_url = f"http://{clean_coord}/register"
             client_kwargs: dict[str, Any] = {"timeout": settings.HEARTBEAT_INTERVAL_S}
             if coordinator_transport:
                 client_kwargs["transport"] = coordinator_transport
+            registered = False
             async with httpx.AsyncClient(**client_kwargs) as hb_client:
                 while True:
                     await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S)
+                    # A node that failed recovery must NOT look healthy to the coordinator.
+                    if not state.ready:
+                        continue
+
+                    # 1. Register (idempotent) until the coordinator acknowledges us.
+                    if not registered:
+                        try:
+                            reg_body = {
+                                "node_id": state.node_id,
+                                "shard_id": state.shard_id,
+                                "address": state.advertise_addr,
+                                "requested_role": state.role.value,
+                            }
+                            rb = json.dumps(reg_body, separators=(",", ":")).encode("utf-8")
+                            rsig = compute_signature(settings.CLUSTER_SECRET, rb)
+                            rresp = await hb_client.post(
+                                reg_url,
+                                content=rb,
+                                headers={
+                                    "Content-Type": "application/json",
+                                    CLUSTER_SIG_HEADER: rsig,
+                                },
+                            )
+                            registered = rresp.status_code == 200
+                        except Exception as exc:
+                            node_logger.debug("Registration failed (will retry): %s", exc)
+
                     if state.role != NodeRole.PRIMARY:
                         continue
                     try:
@@ -1380,14 +1456,19 @@ def build_app(
                         body_b = json.dumps(hb_data, separators=(",", ":")).encode("utf-8")
                         sig = compute_signature(settings.CLUSTER_SECRET, body_b)
                         headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
+                        # Lease safety: count from when the request was SENT, never from when
+                        # the reply arrived, so we can never outlive the coordinator's lease.
+                        t_send = time.monotonic()
                         resp = await hb_client.post(url, content=body_b, headers=headers)
                         if resp.status_code == 200:
                             data = resp.json()
                             if data and "granted_at" in data and "expires_at" in data:
                                 duration = data["expires_at"] - data["granted_at"]
-                                state.lease_expires_at = time.monotonic() + (
+                                state.lease_expires_at = t_send + (
                                     duration if duration > 0 else settings.LEASE_DURATION_S
                                 )
+                            elif data is None:
+                                registered = False  # coordinator does not know us; re-register
                         elif resp.status_code == 409:
                             node_logger.warning(
                                 "Heartbeat returned 409 STALE_TERM; demoting to follower"
@@ -1397,15 +1478,53 @@ def build_app(
                     except Exception as exc:
                         node_logger.debug("Heartbeat sending failed: %s", exc)
 
+        # Primary-side recovery: when the follower is not SYNCED, ask it to re-sync.
+        async def _follower_recovery() -> None:
+            if not coord_url:
+                return
+            while True:
+                await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S)
+                if (
+                    not state.ready
+                    or state.role != NodeRole.PRIMARY
+                    or not state.follower_url
+                    or state.follower_state == ReplicaState.SYNCED
+                ):
+                    continue
+                try:
+                    clean = state.follower_url.removeprefix("http://").removeprefix("https://")
+                    raw = json.dumps(
+                        {"primary_url": state.advertise_addr}, separators=(",", ":")
+                    ).encode("utf-8")
+                    sig = compute_signature(settings.CLUSTER_SECRET, raw)
+                    client = state.http_client
+                    own = client is None
+                    if client is None:
+                        client = httpx.AsyncClient(timeout=settings.REPLICATION_TIMEOUT_S + 10.0)
+                    try:
+                        await client.post(
+                            f"http://{clean.rstrip('/')}/internal/resync",
+                            content=raw,
+                            headers={"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig},
+                            timeout=settings.REPLICATION_TIMEOUT_S + 10.0,
+                        )
+                    finally:
+                        if own:
+                            await client.aclose()
+                except Exception as exc:
+                    node_logger.debug("Follower resync request failed (will retry): %s", exc)
+
+        recovery_task = asyncio.create_task(_follower_recovery())
         hb_task = asyncio.create_task(_heartbeat_sender())
 
         yield
 
-        hb_task.cancel()
-        try:
-            await hb_task
-        except asyncio.CancelledError:
-            pass
+        for t in (hb_task, recovery_task):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
         if owns_client and state.http_client:
             await state.http_client.aclose()
@@ -1433,7 +1552,19 @@ def build_app(
     @app.middleware("http")
     async def _body_size_limit(request: Request, call_next: Any) -> Response:
         cl = request.headers.get("content-length")
-        if cl and int(cl) > settings.MAX_BODY_SIZE_BYTES:
+        if "transfer-encoding" in request.headers:
+            return JSONResponse(
+                status_code=411,
+                content={
+                    "error_code": "LENGTH_REQUIRED",
+                    "error_message": "Chunked bodies not accepted; send Content-Length.",
+                },
+            )
+        try:
+            too_big = bool(cl) and int(cl or 0) > settings.MAX_BODY_SIZE_BYTES
+        except ValueError:
+            too_big = True
+        if too_big:
             return JSONResponse(
                 status_code=413,
                 content={
@@ -1630,6 +1761,14 @@ def build_app(
     @app.post("/internal/replicate", dependencies=[Depends(cluster_auth)])
     async def replicate(body: ReplicationRequest, request: Request) -> ReplicationResponse:
         state = get_node(request)
+        if state.role == NodeRole.PRIMARY:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_code": "NOT_FOLLOWER",
+                    "error_message": "A primary never accepts replication traffic.",
+                },
+            )
         if body.term < state.term:
             raise StaleTerm(
                 f"Replication term {body.term} < node term {state.term}"
@@ -1683,11 +1822,32 @@ def build_app(
             return ReplicationResponse(status="ok", seq=body.seq, last_seq=body.seq)
 
         if body.seq <= (state.wal.last_seq if state.wal else 0):
-            # Duplicate delivery: already committed
+            # Duplicate delivery: only acknowledge if the stored entry is IDENTICAL.
+            stored = None
+            if state.wal:
+                for w in state.wal.replay(after_seq=max(0, body.seq - 1)):
+                    if w.get("seq") == body.seq:
+                        stored = w
+                    break
+            incoming = {
+                "term": body.term,
+                "seq": body.seq,
+                "op": body.op.value,
+                "doc_id": body.doc_id,
+                "request_id": body.request_id,
+                "payload": body.payload,
+            }
+            if stored is not None and compute_entry_identity(stored) == compute_entry_identity(
+                incoming
+            ):
+                return ReplicationResponse(
+                    status="ok", seq=body.seq, last_seq=state.wal.last_seq if state.wal else 0
+                )
             return ReplicationResponse(
-                status="ok",
+                status="conflict",
                 seq=body.seq,
                 last_seq=state.wal.last_seq if state.wal else 0,
+                error_message="Entry at this seq differs from the stored entry.",
             )
 
         # Gap detected
@@ -1905,6 +2065,9 @@ def build_app(
         if new_term is not None:
             if new_term == state.term + 1:
                 state.term = new_term
+                if state.role == NodeRole.PRIMARY:
+                    state.role = NodeRole.FOLLOWER
+                    state.lease_expires_at = 0.0
             elif new_term > state.term + 1:
                 logger.warning(
                     "Fence rejected: term jump %d -> %d exceeds +1; ignoring.",
@@ -1912,6 +2075,24 @@ def build_app(
                     new_term,
                 )
         return {"status": "ok", "term": state.term}
+
+    @app.post("/internal/resync", dependencies=[Depends(cluster_auth)])
+    async def resync(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Follower: reconcile with the given primary and report back (rejoin/complete)."""
+        state = get_node(request)
+        if state.role != NodeRole.FOLLOWER:
+            raise HTTPException(
+                status_code=409,
+                detail={"error_code": "NOT_FOLLOWER", "error_message": "Node is not a follower."},
+            )
+        primary_url = body.get("primary_url")
+        if not isinstance(primary_url, str) or not primary_url:
+            raise HTTPException(
+                status_code=400,
+                detail={"error_code": "VALIDATION_ERROR", "error_message": "primary_url required"},
+            )
+        ok = await resync_with_primary(state, primary_url)
+        return {"status": "ok" if ok else "failed"}
 
     @app.get("/internal/status", dependencies=[Depends(cluster_auth)])
     async def internal_status(request: Request) -> dict[str, Any]:
@@ -1930,6 +2111,10 @@ def build_app(
         state = get_node(request)
         async with state.write_lock():
             new_term = body.get("term", state.term + 1)
+            if not isinstance(new_term, int) or new_term < state.term:
+                raise StaleTerm(
+                    f"Promotion term {new_term!r} is behind node term {state.term}."
+                ).to_http_exception()
             state.term = new_term
             state.role = NodeRole.PRIMARY
 
@@ -2314,33 +2499,37 @@ def build_app(
 
         assert state.wal is not None
         async with state.write_lock():
-            for doc in docs:
-                doc_id = doc["doc_id"]
-                req_id = f"mig-{mig_id}-{doc_id}"
-                seq = state.wal.next_seq()
-                wal_entry = state.wal.append(
-                    seq=seq,
-                    op=WriteOp.INSERT.value,
-                    doc_id=doc_id,
-                    term=state.term,
-                    request_id=req_id,
-                    payload=doc,
-                )
-                if state.follower_url:
-                    ok = await _replicate_to_follower(
-                        state, seq, WriteOp.INSERT, doc_id, req_id, doc
+            try:
+                for doc in docs:
+                    doc_id = doc["doc_id"]
+                    req_id = f"mig-{mig_id}-{doc_id}"
+                    seq = state.wal.next_seq()
+                    wal_entry = state.wal.append(
+                        seq=seq,
+                        op=WriteOp.INSERT.value,
+                        doc_id=doc_id,
+                        term=state.term,
+                        request_id=req_id,
+                        payload=doc,
                     )
-                    if not ok:
-                        raise HTTPException(
-                            status_code=503,
-                            detail={
-                                "error_code": "REPLICATION_UNAVAILABLE",
-                                "error_message": "Follower replication failed during batch",
-                            },
+                    if state.follower_url:
+                        ok = await _replicate_to_follower(
+                            state, seq, WriteOp.INSERT, doc_id, req_id, doc
                         )
-                    state.follower_acked_seq = max(state.follower_acked_seq, seq)
+                        if not ok:
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error_code": "REPLICATION_UNAVAILABLE",
+                                    "error_message": "Follower replication failed during batch",
+                                },
+                            )
+                        state.follower_acked_seq = max(state.follower_acked_seq, seq)
 
-                state.engine.apply(wal_entry, migration_mode=True)
+                    state.engine.apply(wal_entry, migration_mode=True)
+                    state.committed_seq = max(state.committed_seq, seq)
+            finally:
+                _persist_node_metadata(state)
             return {"status": "ok", "count": len(docs), "last_seq": state.wal.last_seq}
 
     @app.post("/internal/migration/apply-oplog", dependencies=[Depends(cluster_auth)])
@@ -2351,34 +2540,38 @@ def build_app(
 
         assert state.wal is not None
         async with state.write_lock():
-            for entry in entries:
-                doc_id = entry["doc_id"]
-                op = WriteOp(entry["op"])
-                payload = entry.get("payload")
-                req_id = f"catchup-{mig_id}-{doc_id}-{entry['seq']}"
+            try:
+                for entry in entries:
+                    doc_id = entry["doc_id"]
+                    op = WriteOp(entry["op"])
+                    payload = entry.get("payload")
+                    req_id = f"catchup-{mig_id}-{doc_id}-{entry['seq']}"
 
-                seq = state.wal.next_seq()
-                wal_entry = state.wal.append(
-                    seq=seq,
-                    op=op.value,
-                    doc_id=doc_id,
-                    term=state.term,
-                    request_id=req_id,
-                    payload=payload,
-                )
-                if state.follower_url:
-                    ok = await _replicate_to_follower(state, seq, op, doc_id, req_id, payload)
-                    if not ok:
-                        raise HTTPException(
-                            status_code=503,
-                            detail={
-                                "error_code": "REPLICATION_UNAVAILABLE",
-                                "error_message": "Follower replication failed during catchup",
-                            },
-                        )
-                    state.follower_acked_seq = max(state.follower_acked_seq, seq)
+                    seq = state.wal.next_seq()
+                    wal_entry = state.wal.append(
+                        seq=seq,
+                        op=op.value,
+                        doc_id=doc_id,
+                        term=state.term,
+                        request_id=req_id,
+                        payload=payload,
+                    )
+                    if state.follower_url:
+                        ok = await _replicate_to_follower(state, seq, op, doc_id, req_id, payload)
+                        if not ok:
+                            raise HTTPException(
+                                status_code=503,
+                                detail={
+                                    "error_code": "REPLICATION_UNAVAILABLE",
+                                    "error_message": "Follower replication failed during catchup",
+                                },
+                            )
+                        state.follower_acked_seq = max(state.follower_acked_seq, seq)
 
-                state.engine.apply(wal_entry, migration_mode=True)
+                    state.engine.apply(wal_entry, migration_mode=True)
+                    state.committed_seq = max(state.committed_seq, seq)
+            finally:
+                _persist_node_metadata(state)
             return {"status": "ok", "replayed": len(entries), "last_seq": state.wal.last_seq}
 
     @app.post("/internal/migration/pause", dependencies=[Depends(cluster_auth)])
@@ -2447,65 +2640,111 @@ def build_app(
             )
             return {"status": "ok", "ranges": [r.model_dump() for r in state.ranges]}
 
+    async def _purge_range_docs(state: NodeState, start: int, end: int, prefix: str) -> int:
+        """Delete every doc in [start, end) through the WAL, replicated and committed."""
+        assert state.wal is not None
+        docs = state.engine.range_snapshot(start, end)
+        try:
+            for d in docs:
+                doc_id = d["doc_id"]
+                seq = state.wal.next_seq()
+                req_id = f"{prefix}-{doc_id}"
+                entry = state.wal.append(
+                    seq=seq,
+                    op=WriteOp.DELETE.value,
+                    doc_id=doc_id,
+                    term=state.term,
+                    request_id=req_id,
+                    payload=None,
+                )
+                if state.follower_url:
+                    ok = await _replicate_to_follower(
+                        state, seq, WriteOp.DELETE, doc_id, req_id, None
+                    )
+                    if not ok:
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "error_code": "REPLICATION_UNAVAILABLE",
+                                "error_message": "Follower replication failed during purge",
+                            },
+                        )
+                    state.follower_acked_seq = max(state.follower_acked_seq, seq)
+                state.engine.apply(entry, migration_mode=True)
+                state.committed_seq = max(state.committed_seq, seq)
+        finally:
+            _persist_node_metadata(state)
+        return len(docs)
+
+    async def _relay_to_follower(state: NodeState, path: str, body: dict[str, Any]) -> bool:
+        if not state.follower_url:
+            return True
+        client = state.http_client or httpx.AsyncClient(
+            timeout=state.settings.REPLICATION_TIMEOUT_S
+        )
+        try:
+            clean = state.follower_url.removeprefix("http://").removeprefix("https://").rstrip("/")
+            raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            sig = compute_signature(state.settings.CLUSTER_SECRET, raw)
+            resp = await client.post(
+                f"http://{clean}{path}",
+                content=raw,
+                headers={"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig},
+                timeout=state.settings.REPLICATION_TIMEOUT_S,
+            )
+            return resp.status_code == 200
+        except Exception as exc:
+            logger.warning("Relay %s to follower failed: %s", path, exc)
+            return False
+        finally:
+            if state.http_client is None:
+                await client.aclose()
+
     @app.post("/internal/migration/cleanup", dependencies=[Depends(cluster_auth)])
     async def migration_cleanup(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         start = body["start"]
         end = body["end"]
         async with state.write_lock():
-            # 1. Unpause
+            # 1. Stop owning the range (works for prefix / suffix / interior / whole ranges)
+            state.ranges = _subtract_range(state.ranges, start, end)
+            _persist_node_metadata(state)
+            # 2. Delete docs through the WAL so the follower and restarts see it
+            deleted = await _purge_range_docs(state, start, end, "cleanup")
+            # 3. Only now unpause, so no write can slip in while docs are being removed
             state.paused_ranges = [
                 r for r in state.paused_ranges if not (r[0] == start and r[1] == end)
             ]
-            # 2. Split or remove from ranges
-            new_ranges = []
-            for r in state.ranges:
-                if r.start < start and r.end > end:
-                    new_ranges.append(
-                        ShardRangeConfig(
-                            start=r.start, end=start, ownership_epoch=r.ownership_epoch
-                        )
-                    )
-                    new_ranges.append(
-                        ShardRangeConfig(start=end, end=r.end, ownership_epoch=r.ownership_epoch)
-                    )
-                elif r.start >= start and r.end <= end:
-                    continue
-                else:
-                    new_ranges.append(r)
-            state.ranges = new_ranges
-            _persist_node_metadata(state)
-
-            # 3. Delete docs from storage engine
-            docs = state.engine.range_snapshot(start, end)
-            for d in docs:
-                doc_id = d["doc_id"]
-                if state.wal:
-                    seq = state.wal.next_seq()
-                    req_id = f"cleanup-{doc_id}"
-                    state.wal.append(
-                        seq=seq,
-                        op=WriteOp.DELETE.value,
-                        doc_id=doc_id,
-                        term=state.term,
-                        request_id=req_id,
-                        payload=None,
-                    )
-                    if state.follower_url:
-                        await _replicate_to_follower(
-                            state, seq, WriteOp.DELETE, doc_id, req_id, None
-                        )
-                state.engine._docs.pop(doc_id, None)
-                state.engine._index.pop(doc_id, None)
-                state.engine._doc_seq.pop(doc_id, None)
-            logger.info(
-                "Cleaned up range [%d, %d) on source shard %s (%d docs removed)",
-                start,
-                end,
-                state.shard_id,
-                len(docs),
+            # 4. Tell the follower to drop the range as well (docs already replicated)
+            relayed = await _relay_to_follower(
+                state, "/internal/migration/ranges/remove", {"start": start, "end": end}
             )
-            return {"status": "ok", "deleted_docs": len(docs)}
+            if not relayed:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error_code": "REPLICATION_UNAVAILABLE",
+                        "error_message": "Follower did not ack range removal; retry cleanup.",
+                    },
+                )
+            logger.info(
+                "Cleaned up range [%d, %d) on %s (%d docs)", start, end, state.shard_id, deleted
+            )
+            return {"status": "ok", "deleted_docs": deleted}
+
+    @app.post("/internal/migration/ranges/remove", dependencies=[Depends(cluster_auth)])
+    async def migration_ranges_remove(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Follower side of cleanup: drop ownership only (docs arrive via replicated DELETEs)."""
+        state = get_node(request)
+        start = body["start"]
+        end = body["end"]
+        async with state.write_lock():
+            state.ranges = _subtract_range(state.ranges, start, end)
+            state.paused_ranges = [
+                r for r in state.paused_ranges if not (r[0] == start and r[1] == end)
+            ]
+            _persist_node_metadata(state)
+            return {"status": "ok", "ranges": [r.model_dump() for r in state.ranges]}
 
     @app.post("/internal/migration/abort", dependencies=[Depends(cluster_auth)])
     async def migration_abort(body: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -2513,18 +2752,18 @@ def build_app(
         start = body["start"]
         end = body["end"]
         async with state.write_lock():
-            docs = state.engine.range_snapshot(start, end)
-            for d in docs:
-                doc_id = d["doc_id"]
-                state.engine._docs.pop(doc_id, None)
-                state.engine._index.pop(doc_id, None)
-                state.engine._doc_seq.pop(doc_id, None)
-            logger.info(
-                "Aborted migration on destination shard %s; purged %d staged docs",
-                state.shard_id,
-                len(docs),
-            )
-            return {"status": "aborted", "purged_docs": len(docs)}
+            # Only purge staged docs that are NOT in a range this shard owns.
+            if any(r.start < end and start < r.end for r in state.ranges):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "RANGE_OWNED",
+                        "error_message": "Refusing to purge a range this shard owns.",
+                    },
+                )
+            purged = await _purge_range_docs(state, start, end, "abort")
+            logger.info("Aborted migration on %s; purged %d staged docs", state.shard_id, purged)
+            return {"status": "aborted", "purged_docs": purged}
 
     # ── Error handler ─────────────────────────────────────────────────────────
 

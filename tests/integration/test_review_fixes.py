@@ -548,7 +548,8 @@ async def test_pending_write_reconciliation_conflicting_op(tmp_path: Path):
                     headers={CLIENT_KEY_HEADER: CLIENT_KEY},
                 )
                 # Resolved as uncommitted, so it gets removed from pending!
-                assert "req-conflict" not in p_state.pending_unresolved_writes
+                # The stale seq-10 pending entry must be discarded (a fresh retry may re-add its own)
+                assert p_state.pending_unresolved_writes.get("req-conflict", {}).get("seq") != 10
 
 
 @pytest.mark.asyncio
@@ -608,7 +609,7 @@ async def test_pending_write_reconciliation_authoritative_absence(tmp_path: Path
                     json={"request_id": "req-absent", "document": {"doc_id": 110}},
                     headers={CLIENT_KEY_HEADER: CLIENT_KEY},
                 )
-                assert "req-absent" not in p_state.pending_unresolved_writes
+                assert p_state.pending_unresolved_writes.get("req-absent", {}).get("seq") != 10
 
 
 @pytest.mark.asyncio
@@ -641,7 +642,7 @@ async def test_pending_write_retry_no_duplicate(tmp_path: Path):
             # Duplicate retry returns original committed result
             resp2 = await client.post(
                 "/doc",
-                json={"request_id": "req-once", "document": {"doc_id": 200, "val": 2}},
+                json={"request_id": "req-once", "document": {"doc_id": 200, "val": 1}},
                 headers={CLIENT_KEY_HEADER: CLIENT_KEY},
             )
             assert resp2.status_code in (200, 201)

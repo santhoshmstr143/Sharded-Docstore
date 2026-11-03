@@ -244,7 +244,7 @@ async def test_standalone_deduplication_after_restart(tmp_path: Path):
         async with AsyncClient(transport=transport2, base_url="http://standalone") as client:
             r2 = await client.post(
                 "/doc",
-                json={"request_id": "req-dedup-xyz", "document": {"doc_id": 50, "v": 999}},
+                json={"request_id": "req-dedup-xyz", "document": {"doc_id": 50, "v": 1}},
                 headers={CLIENT_KEY_HEADER: TEST_CLIENT},
             )
             assert r2.status_code == 201
@@ -1317,3 +1317,35 @@ async def test_restart_during_catchup_recovery(tmp_path: Path):
         rec2 = coord2.migration_mgr.migrations.get(rec.migration_id)
         assert rec2 is not None
         assert rec2.state == MigrationState.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_request_id_reuse_with_different_payload_is_rejected(tmp_path: Path):
+    """Reusing a request_id for DIFFERENT content must not be silently acknowledged."""
+    settings = _make_settings(tmp_path)
+    ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
+    app = build_app(
+        settings=settings,
+        node_id="p1",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        allow_standalone=True,
+    )
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://s") as client:
+            h = {CLIENT_KEY_HEADER: TEST_CLIENT}
+            r1 = await client.post(
+                "/doc", json={"request_id": "same", "document": {"doc_id": 1}}, headers=h
+            )
+            assert r1.status_code == 201
+            r2 = await client.post(
+                "/doc", json={"request_id": "same", "document": {"doc_id": 2}}, headers=h
+            )
+            assert r2.status_code == 409
+            assert r2.json()["error_code"] == "REQUEST_ID_REUSED"
+            # identical retry is still idempotent
+            r3 = await client.post(
+                "/doc", json={"request_id": "same", "document": {"doc_id": 1}}, headers=h
+            )
+            assert r3.status_code == 201 and r3.json()["seq"] == r1.json()["seq"]
