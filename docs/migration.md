@@ -70,6 +70,8 @@ The atomic commit point of a migration occurs when:
    - The `ownership_epoch` of the migrated range $[R_{start}, R_{end})$.
    - The cluster `map_version`.
 3. If a failure occurs before this atomic update, the migration **aborts safely**, and the Source unpauses the range.
+4. An exception from the map update does **not** prove the map is unchanged (the map file may already have been replaced). The coordinator re-reads the persisted map: if it gives the range to the Destination, the migration **rolls forward**; it aborts only if the map provably still names the Source; if the map cannot be read, the record stays in `CUTOVER` and is never aborted.
+5. `VERIFY` and the map update run while holding the **topology locks** of both shards, so no failover can interleave. Inside the locks the coordinator re-validates that both primaries and both shard terms are unchanged since the migration started; otherwise it aborts before cutover.
 
 ---
 
@@ -77,3 +79,15 @@ The atomic commit point of a migration occurs when:
 
 1. **Routing during `PAUSE`:** When a client issues a write to the migrating range during the brief `PAUSE` phase, the source returns HTTP 503 with error code `RANGE_PAUSED`.
 2. **Router Retry:** The router intercepts `RANGE_PAUSED`, applies bounded exponential backoff, queries the coordinator for a newer `map_version`, and reroutes the request to the new owner once cutover finishes.
+
+---
+
+## 4. Transport, Idempotency & Crash Safety
+
+- **Paginated snapshot copy:** the source serves the range in pages (500 docs, also bounded by bytes) via a `doc_id` cursor. The copy is "fuzzy" (later pages may include writes after the first page), which is safe because catch-up replays **every** source op after the first page's `snapshot_seq`, in order and idempotently, and `VERIFY` checks the final checksums. Copy progress (`last_copied_doc_id`, `docs_copied`) is persisted in the migration record.
+- **Byte-bounded batches:** documents and oplog entries are sent to the destination in batches bounded by both count (200) and serialized size (max body − 64 KB). A single item that can never fit aborts the migration (documents are limited to 1 MB, so this does not happen for valid data).
+- **Idempotent apply:** each copied document / replayed op has a deterministic request id; a retried batch is recognised through the dedup table and is not appended to the WAL again.
+- **WAL retention:** while a migration is copying or catching up, the source pins its WAL after the migration's cursor so periodic compaction cannot remove entries still needed (the pin lapses after 5 minutes of inactivity, e.g. an abandoned migration).
+- **Mandatory follower cutover:** the destination primary **and its follower** must both confirm the new ownership before `CLEANUP`. If the follower is unreachable the record stays in `CUTOVER`; the coordinator's health monitor retries post-cutover migrations every few seconds until they reach `DONE`.
+- **Durable records:** migration records are written atomically (fsync + rename + directory fsync). A record that cannot be parsed makes the coordinator **refuse to start** rather than silently forget an in-flight ownership transfer.
+- **Restart:** after a coordinator restart, migrations past cutover roll forward; migrations before cutover are aborted (source unpaused, staged destination data purged).

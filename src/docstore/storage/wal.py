@@ -18,6 +18,7 @@ Rules:
 from __future__ import annotations
 
 import binascii
+import errno
 import hashlib
 import json
 import logging
@@ -121,6 +122,15 @@ class WALCorruptionError(RuntimeError):
     """
 
 
+class WALFailedError(RuntimeError):
+    """Raised when the WAL hit an I/O failure whose on-disk effect is uncertain.
+
+    After a failed write/flush/fsync the record may or may not be on disk, so the
+    in-memory ``next_seq`` can no longer be trusted. The instance refuses every
+    further append until the node reopens the WAL and re-runs recovery.
+    """
+
+
 class WAL:
     """Append-only Write-Ahead Log.
 
@@ -132,6 +142,7 @@ class WAL:
         self._path = path
         self._fd: BinaryIO | None = None
         self._next_seq: int = 1
+        self._failed: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -139,6 +150,16 @@ class WAL:
         """Open (or create) the WAL file for appending."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = open(self._path, "ab")
+        self._failed = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def failed(self) -> bool:
+        """True once an uncertain I/O failure poisoned this instance."""
+        return self._failed
 
     def close(self) -> None:
         if self._fd is not None:
@@ -156,11 +177,16 @@ class WAL:
 
     # ── Replay ────────────────────────────────────────────────────────────────
 
-    def replay(self, after_seq: int = 0) -> Iterator[dict]:  # type: ignore[type-arg]
+    def replay(self, after_seq: int = 0, *, base_seq: int | None = None) -> Iterator[dict]:  # type: ignore[type-arg]
         """Yield all WAL records with seq > *after_seq* in order.
 
         Handles torn tail (incomplete last line) by truncating it.
-        Raises :class:`WALCorruptionError` on a bad-checksum complete record.
+        Raises :class:`WALCorruptionError` on a bad-checksum complete record, and on
+        any break in sequence continuity (duplicate, decreasing or skipped seq).
+
+        If *base_seq* is given (recovery: the snapshot's last_applied_seq), the
+        retained WAL must also start no later than ``base_seq + 1`` - otherwise
+        operations between the snapshot and the WAL are missing.
         """
         if not self._path.exists():
             return
@@ -190,6 +216,7 @@ class WAL:
             raw = raw[:safe_len]
 
         max_seq = after_seq
+        prev_seq: int | None = None
         for lineno, line in enumerate(raw.splitlines(), start=1):
             line = line.strip()
             if not line:
@@ -207,7 +234,24 @@ class WAL:
                     f"(seq={record.get('seq')}). Node refuses to start."
                 )
 
-            seq = record["seq"]
+            seq = record.get("seq")
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                raise WALCorruptionError(
+                    f"WAL {self._path}: line {lineno} has an invalid seq {seq!r}."
+                )
+            if prev_seq is None:
+                if base_seq is not None and seq > base_seq + 1:
+                    raise WALCorruptionError(
+                        f"WAL {self._path}: first retained seq={seq} leaves a gap after "
+                        f"snapshot seq={base_seq}."
+                    )
+            elif seq != prev_seq + 1:
+                kind = "duplicate/out-of-order" if seq <= prev_seq else "gap in"
+                raise WALCorruptionError(
+                    f"WAL {self._path}: line {lineno}: {kind} sequence "
+                    f"(seq={seq} after seq={prev_seq}). Node refuses to start."
+                )
+            prev_seq = seq
             if seq > after_seq:
                 yield record
                 max_seq = max(max_seq, seq)
@@ -229,6 +273,20 @@ class WAL:
         """Append one record, fsync, and return the stored record dict."""
         if self._fd is None:
             raise RuntimeError("WAL is not open; call open() first.")
+        if self._failed:
+            raise WALFailedError(
+                f"WAL {self._path} is unusable after an earlier I/O failure; "
+                "reopen and recover before appending."
+            )
+        if seq != self._next_seq:
+            # Only an empty WAL may start later than next_seq (its earlier history lives
+            # in a snapshot, as after compaction). Anything else is a duplicate or a gap.
+            empty = os.fstat(self._fd.fileno()).st_size == 0
+            if not (empty and seq > self._next_seq):
+                raise ValueError(
+                    f"WAL {self._path}: append seq={seq} breaks continuity "
+                    f"(expected {self._next_seq})."
+                )
 
         record: dict = {  # type: ignore[type-arg]
             "seq": seq,
@@ -242,9 +300,15 @@ class WAL:
         record[_CRC_FIELD] = _crc32_of(record)
 
         line = json.dumps(record, separators=(",", ":")) + "\n"
-        self._fd.write(line.encode("utf-8"))
-        self._fd.flush()
-        os.fsync(self._fd.fileno())
+        try:
+            self._fd.write(line.encode("utf-8"))
+            self._fd.flush()
+            os.fsync(self._fd.fileno())
+        except BaseException:
+            # The record may or may not have reached the disk: never reuse this seq
+            # from this instance. Recovery (reopen + replay) decides what is durable.
+            self._failed = True
+            raise
 
         self._next_seq = seq + 1
         return record
@@ -259,14 +323,18 @@ class WAL:
         return self._next_seq - 1
 
     def earliest_seq(self) -> int | None:
-        """Return the sequence number of the first record in the WAL, if any."""
+        """Return the sequence number of the first retained record.
+
+        An empty WAL whose history was superseded by a snapshot (``next_seq > 1``)
+        reports ``next_seq``: every earlier seq is only available via snapshot.
+        """
         if not self._path.exists():
-            return None
+            return self._next_seq if self._next_seq > 1 else None
         try:
             with open(self._path, "rb") as f:
                 first_line = f.readline().strip()
                 if not first_line:
-                    return None
+                    return self._next_seq if self._next_seq > 1 else None
                 rec = json.loads(first_line)
                 return int(rec["seq"])
         except Exception:
@@ -304,6 +372,17 @@ class WAL:
         self._next_seq = seq + 1
         logger.info("WAL truncated after seq=%d; next_seq=%d", seq, self._next_seq)
 
+    def reset(self, next_seq: int) -> None:
+        """Discard the whole WAL (fsynced) and continue numbering at *next_seq*.
+
+        Used when a snapshot supersedes the entire local history, so the retained
+        WAL stays contiguous with the snapshot instead of keeping a stale prefix.
+        """
+        if self._path.exists():
+            self._truncate_bytes(0)
+        self._next_seq = next_seq
+        logger.info("WAL reset; next_seq=%d", self._next_seq)
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _truncate_bytes(self, length: int) -> None:
@@ -326,13 +405,29 @@ class WAL:
         self._fd = open(self._path, "ab")
 
 
+# errno values meaning "this platform/filesystem cannot fsync a directory" - the
+# only failures that are safe to ignore. Everything else is a real I/O error.
+_DIR_FSYNC_UNSUPPORTED = {
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
+
+
 def _fsync_dir(directory: Path) -> None:
-    """Fsync the directory entry (for rename/create durability)."""
+    """Fsync the directory entry (for rename/create durability).
+
+    Raises ``OSError`` on genuine failures. Only platforms that cannot fsync a
+    directory at all (Windows, or filesystems returning EINVAL/ENOTSUP) are skipped.
+    """
+    if os.name == "nt":  # directories cannot be opened for fsync on Windows
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    dirfd = os.open(str(directory), flags)
     try:
-        dirfd = os.open(str(directory), os.O_RDONLY)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
-    except OSError:
-        pass  # best-effort on platforms that don't support dir fsync
+        os.fsync(dirfd)
+    except OSError as exc:
+        if exc.errno not in _DIR_FSYNC_UNSUPPORTED:
+            raise
+    finally:
+        os.close(dirfd)

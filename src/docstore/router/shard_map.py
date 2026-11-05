@@ -190,19 +190,32 @@ class ShardMapManager:
             os.fsync(f.fileno())
 
         os.replace(tmp_path, target_path)
-        _fsync_dir(target_path.parent)
-
+        # From here on the new map is visible on disk; keep the in-memory view in sync
+        # with it even if the directory fsync below fails, so the two never disagree.
         self._shard_map = shard_map
         self.path = target_path
+        _fsync_dir(target_path.parent)
 
         if append_history:
-            # L3: only append history when the map content actually changed
+            # L3: only append history when the map content actually changed.
+            # The map file replaced above is the authoritative commit point. The epoch
+            # history is an audit trail written afterwards: failing to append it must
+            # NOT surface as "save failed", because callers would wrongly conclude the
+            # topology change did not happen (e.g. abort a migration whose ownership
+            # already moved). Log loudly instead.
             new_hash = hashlib.sha256(
                 json.dumps(json.loads(shard_map.model_dump_json()), sort_keys=True).encode()
             ).hexdigest()
             if new_hash != self._last_saved_hash:
-                self._append_history_log(shard_map, target_path)
-                self._last_saved_hash = new_hash
+                try:
+                    self._append_history_log(shard_map, target_path)
+                    self._last_saved_hash = new_hash
+                except OSError as exc:
+                    logger.error(
+                        "Shard map v%d COMMITTED but epoch-history append failed: %s",
+                        shard_map.map_version,
+                        exc,
+                    )
 
         logger.info("Saved shard map v%d atomically to %s", shard_map.map_version, target_path)
 

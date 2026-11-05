@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -52,7 +53,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from docstore.common.auth import (
     CLUSTER_SIG_HEADER,
@@ -62,6 +63,7 @@ from docstore.common.auth import (
 from docstore.common.config import Settings
 from docstore.common.errors import (
     DocstoreError,
+    DocTooLarge,
     DuplicateKey,
     InvalidQuery,
     LeaseExpired,
@@ -72,8 +74,10 @@ from docstore.common.errors import (
     RangePaused,
     ReplicationUnavailable,
     RequestIdReused,
+    StaleEpoch,
     StaleTerm,
 )
+from docstore.common.http import BodyLimitMiddleware
 from docstore.common.logging import get_logger
 from docstore.common.models import (
     DOC_ID_MIN,
@@ -91,6 +95,7 @@ from docstore.common.models import (
     WriteOp,
     WriteOutcome,
     WriteResponse,
+    serialized_doc_size,
 )
 from docstore.common.test_hooks import trigger_hook
 from docstore.query import (
@@ -99,6 +104,7 @@ from docstore.query import (
     sort_documents,
     validate_query_filter,
 )
+from docstore.storage.compaction import compact_wal
 from docstore.storage.engine import DedupEntry, StorageEngine
 from docstore.storage.snapshot import SnapshotManager
 from docstore.storage.wal import (
@@ -114,18 +120,36 @@ logger = logging.getLogger(__name__)
 # ── Module-level request body models ──────────────────────────────────────────
 
 
-class InsertBody(BaseModel):
+class _FencedWrite(BaseModel):
+    """Optional fencing tokens attached by the router (ownership_epoch) or client (term).
+
+    The primary rejects a write whose ownership_epoch is older than the epoch it holds
+    for the range (stale routing) or whose term differs from its own (stale leader).
+    """
+
+    ownership_epoch: StrictInt | None = Field(default=None, ge=0)
+    term: StrictInt | None = Field(default=None, ge=0)
+
+
+class InsertBody(_FencedWrite):
     request_id: str = Field(min_length=1, max_length=128)
     document: dict[str, Any] = Field(description="Must contain doc_id.")
 
 
-class UpdateBody(BaseModel):
+class UpdateBody(_FencedWrite):
     request_id: str = Field(min_length=1, max_length=128)
     document: dict[str, Any] = Field(description="Full replacement document.")
 
 
-class DeleteBody(BaseModel):
+class DeleteBody(_FencedWrite):
     request_id: str = Field(min_length=1, max_length=128)
+
+
+class ShardQueryBody(QueryFilter):
+    """Shard-side query: the router may restrict evaluation to the ranges it
+    attributes to this shard, so pagination happens *after* the range restriction."""
+
+    ranges: list[tuple[int, int]] | None = None
 
 
 # ── Node state ────────────────────────────────────────────────────────────────
@@ -137,6 +161,27 @@ class ShardRangeConfig(BaseModel):
     start: int = Field(ge=DOC_ID_MIN)
     end: int = Field(ge=1)
     ownership_epoch: int = Field(ge=0)
+
+
+class PromoteRequest(BaseModel):
+    """Body of /internal/promote, validated strictly (BUG 29)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    shard_id: str | None = None
+    term: StrictInt | None = None
+    ownership_epochs: dict[str, StrictInt] | None = None
+    ranges: list[ShardRangeConfig] | None = None
+    lease: dict[str, Any] | None = None
+    follower_url: str | None = None
+
+
+# Recent WAL entries always kept after compaction (lagging follower / migration catch-up).
+_WAL_RETAIN_ENTRIES = 1_000
+_SNAPSHOT_POLL_S = 1.0
+# A migration that has not touched its WAL hold for this long is considered abandoned
+# (the coordinator aborts pre-cutover migrations on restart); its hold stops pinning.
+_MIGRATION_HOLD_TTL_S = 300.0
 
 
 class NodeState:
@@ -167,6 +212,22 @@ class NodeState:
         self.pending_unresolved_writes: dict[str, dict[str, Any]] = {}
         self.allow_standalone: bool = False
         self.advertise_addr: str = ""
+        # (start, end) -> (oplog cursor seq, last-touched monotonic): WAL entries after the
+        # cursor must survive compaction until the migration's catch-up has read them.
+        self.migration_holds: dict[tuple[int, int], tuple[int, float]] = {}
+
+    def hold_migration(self, start: int, end: int, seq: int, *, reset: bool = False) -> None:
+        prev = self.migration_holds.get((start, end))
+        keep = seq if reset or prev is None else max(prev[0], seq)
+        self.migration_holds[(start, end)] = (keep, time.monotonic())
+
+    def release_migration(self, start: int, end: int) -> None:
+        self.migration_holds.pop((start, end), None)
+
+    def migration_retain_seq(self) -> int | None:
+        now = time.monotonic()
+        live = [seq for seq, t in self.migration_holds.values() if now - t < _MIGRATION_HOLD_TTL_S]
+        return min(live) if live else None
 
     def owns(self, doc_id: int) -> bool:
         return any(r.start <= doc_id < r.end for r in self.ranges)
@@ -210,18 +271,29 @@ class NodeState:
 # ── Recovery ──────────────────────────────────────────────────────────────────
 
 
-def _persist_node_metadata(state: NodeState) -> None:
-    """Durably persist node term, role, and range configurations with fsync."""
+def _persist_node_metadata(
+    state: NodeState,
+    *,
+    term: int | None = None,
+    role: NodeRole | None = None,
+    ranges: Sequence[ShardRangeConfig] | None = None,
+) -> None:
+    """Durably persist node term, role, and range configurations with fsync.
+
+    The keyword overrides let callers persist a *candidate* state before activating
+    it in memory, so a persistence failure never leaves the node acting on authority
+    (term / role / ownership) that is not on disk.
+    """
     data_dir = Path(state.settings.DATA_DIR) / state.shard_id
     data_dir.mkdir(parents=True, exist_ok=True)
     meta_path = data_dir / "node_metadata.json"
     tmp_path = data_dir / "node_metadata.json.tmp"
 
     data = {
-        "term": state.term,
-        "role": state.role.value,
+        "term": state.term if term is None else term,
+        "role": (state.role if role is None else role).value,
         "committed_seq": state.committed_seq,
-        "ranges": [r.model_dump() for r in state.ranges],
+        "ranges": [r.model_dump() for r in (state.ranges if ranges is None else ranges)],
     }
     payload = json.dumps(data, indent=2).encode("utf-8")
     with open(tmp_path, "wb") as f:
@@ -370,6 +442,7 @@ async def _recover(state: NodeState) -> None:
     meta_path = data_dir / "node_metadata.json"
     is_disk_recovery = meta_path.exists()
     meta_ranges: list[dict[str, Any]] | None = None
+    meta_has_ranges = False
     if meta_path.exists():
         try:
             with open(meta_path, encoding="utf-8") as f:
@@ -378,6 +451,7 @@ async def _recover(state: NodeState) -> None:
                 state.committed_seq = meta.get("committed_seq", 0)
                 if "ranges" in meta:
                     meta_ranges = meta["ranges"]
+                    meta_has_ranges = True
         except Exception as exc:
             logger.error("Failed to load node metadata from %s: %s", meta_path, exc)
             raise RuntimeError(
@@ -399,13 +473,23 @@ async def _recover(state: NodeState) -> None:
         snap_epochs = snap.get("ownership_epochs")
 
     # 3. Reconcile all range sources: startup config, persisted metadata, and snapshot
-    state.ranges = _reconcile_all_ownership_epochs(
-        configured_ranges=state.ranges,
-        meta_ranges=meta_ranges,
-        snapshot_epochs=snap_epochs,
-    )
-
-    _configure_ranges(state)
+    if meta_has_ranges and not meta_ranges:
+        # Persisted metadata says this node *explicitly* owns nothing (every range was
+        # migrated away). That is not "missing configuration": never fall back to the
+        # environment default range, which would reclaim another shard's keys.
+        if state.ranges:
+            raise ValueError(
+                "Incompatible range mapping between configured "
+                f"{sorted((r.start, r.end) for r in state.ranges)} and metadata []"
+            )
+        state.ranges = []
+    else:
+        state.ranges = _reconcile_all_ownership_epochs(
+            configured_ranges=state.ranges,
+            meta_ranges=meta_ranges,
+            snapshot_epochs=snap_epochs,
+        )
+        _configure_ranges(state)
 
     wal = WAL(data_dir / "shard.wal")
     wal.open()
@@ -418,7 +502,8 @@ async def _recover(state: NodeState) -> None:
         # In standalone mode, all local WAL operations are committed locally.
         state.committed_seq = max(state.committed_seq, wal.last_seq)
 
-    wal_entries = list(wal.replay(after_seq=after_seq))
+    # base_seq: the retained WAL must continue the snapshot without a gap.
+    wal_entries = list(wal.replay(after_seq=after_seq, base_seq=after_seq))
     for entry in wal_entries:
         entry_term = entry.get("term", 1)
         if entry_term > state.term:
@@ -491,6 +576,179 @@ async def _recover(state: NodeState) -> None:
         state.engine.last_applied_seq,
         state.engine.doc_count(),
     )
+
+
+def _rebuild_engine_from_disk(state: NodeState) -> None:
+    """Rebuild in-memory docs + dedup from the local snapshot (if any) and the WAL.
+
+    The WAL may have been compacted, so it alone is not the full history: start from
+    the snapshot and replay only the entries after it.
+    """
+    assert state.wal is not None
+    state.engine._docs.clear()
+    state.engine._index.clear()
+    state.engine._doc_seq.clear()
+    state.engine._dedup.clear()
+    state.engine.last_applied_seq = 0
+    base = 0
+    snap = state.snapshot_mgr.load() if state.snapshot_mgr is not None else None
+    if snap:
+        for did, doc in snap["documents"].items():
+            state.engine._docs[did] = doc
+            state.engine._index[did] = None
+        base = int(snap["last_applied_seq"])
+        state.engine.last_applied_seq = base
+        state.engine.dedup_import(snap.get("dedup_table", {}))
+    for entry in state.wal.replay(after_seq=base):
+        state.engine.apply(entry)
+        rid = entry.get("request_id")
+        if rid:
+            state.engine.dedup_store(
+                rid,
+                DedupEntry(
+                    seq=entry["seq"],
+                    outcome=WriteOutcome.COMMITTED,
+                    result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
+                    term=entry.get("term", state.term),
+                ),
+            )
+
+
+def _require_same_shard(state: NodeState, shard_id: Any) -> None:
+    """Reject an internal RPC addressed to a different shard (BUG 8)."""
+    if shard_id is not None and shard_id != state.shard_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "WRONG_SHARD",
+                "error_message": (
+                    f"Request for shard {shard_id!r} reached node of shard {state.shard_id!r}."
+                ),
+            },
+        )
+
+
+async def snapshot_and_compact(state: NodeState) -> int:
+    """Take a durable, verified snapshot and compact the WAL safely (BUG 12).
+
+    Safety rules:
+      * snapshot only state already applied (committed) in memory;
+      * verify the snapshot reads back before deleting any WAL entry;
+      * never compact during a migration write-pause, past committed_seq, or past what
+        the follower has acknowledged (compact_wal's retention cap forces a snapshot
+        resync for a follower that is hopelessly behind);
+      * always retain the most recent ``_WAL_RETAIN_ENTRIES`` entries.
+
+    Returns the number of WAL entries removed.
+    """
+    async with state.write_lock():
+        wal = state.wal
+        mgr = state.snapshot_mgr
+        if wal is None or mgr is None or wal.failed:
+            return 0
+        snap_seq = state.engine.last_applied_seq
+        doc_count = state.engine.doc_count()
+        mgr.save(
+            documents=state.engine.all_docs(),
+            last_applied_seq=snap_seq,
+            term=state.term,
+            ownership_epochs={f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges},
+            dedup_table=state.engine.dedup_export(),
+        )
+        loaded = mgr.load()
+        if (
+            not loaded
+            or int(loaded.get("last_applied_seq", -1)) != snap_seq
+            or len(loaded.get("documents", {})) != doc_count
+        ):
+            raise RuntimeError("Snapshot verification failed; WAL left uncompacted.")
+
+        if state.paused_ranges:
+            return 0  # a migration is inside its write-pause / final catch-up window
+
+        safe_seq = min(snap_seq, max(state.committed_seq, 0)) - _WAL_RETAIN_ENTRIES
+        hold = state.migration_retain_seq()
+        if hold is not None:
+            safe_seq = min(safe_seq, hold)  # an active migration still needs these entries
+        if safe_seq <= 0:
+            return 0
+        if state.role == NodeRole.PRIMARY and state.follower_url:
+            follower_acked = state.follower_acked_seq
+        else:
+            follower_acked = safe_seq
+
+        wal.close()
+        try:
+            removed = compact_wal(
+                wal.path,
+                snapshot_seq=safe_seq,
+                follower_acked_seq=follower_acked,
+            )
+        finally:
+            wal.open()  # re-open on the (possibly replaced) file; next_seq is unchanged
+        return removed
+
+
+def lease_duration_from_grant(lease: dict[str, Any] | None, local_max_s: float) -> float:
+    """Lease length the shard may assume from a coordinator grant (final report #8).
+
+    ``expires_at - granted_at`` comes from the coordinator's wall clock. It is only
+    trusted as an upper bound and is always capped by the locally configured lease
+    duration, so a coordinator clock jump (or a misconfigured, longer coordinator
+    lease) can never make this node believe it holds authority for longer than L.
+    The result is then added to the node's *own* monotonic clock by the caller.
+    """
+    duration = 0.0
+    if isinstance(lease, dict):
+        try:
+            duration = float(lease.get("expires_at", 0)) - float(lease.get("granted_at", 0))
+        except (TypeError, ValueError):
+            duration = 0.0
+    if duration <= 0:
+        return local_max_s
+    return min(duration, local_max_s)
+
+
+def _parse_snapshot_docs(raw_docs: Any) -> dict[int, dict[str, Any]]:
+    """Normalise snapshot documents (``{doc_id: doc}`` or ``[doc, ...]``) to int keys.
+
+    Single implementation shared by every snapshot-install path (final report #1).
+    """
+    parsed: dict[int, dict[str, Any]] = {}
+    if isinstance(raw_docs, dict):
+        for did, doc in raw_docs.items():
+            parsed[int(did)] = doc
+    elif isinstance(raw_docs, list):
+        for doc in raw_docs:
+            parsed[int(doc["doc_id"])] = doc
+    elif raw_docs is not None:
+        raise ValueError(f"Unsupported snapshot documents type: {type(raw_docs).__name__}")
+    return parsed
+
+
+async def _apply_registration(state: NodeState, data: dict[str, Any], t_send: float) -> None:
+    """Act on the coordinator's registration decision (BUG 1).
+
+    * Assigned FOLLOWER while acting as primary -> step down (persisted first).
+    * Assigned PRIMARY with a lease -> adopt the lease, counted from send time.
+    A node that recovered from disk registers as follower; the coordinator then
+    promotes the current follower instead, and this node rejoins via resync.
+    """
+    role = data.get("role")
+    if role == NodeRole.FOLLOWER.value and state.role == NodeRole.PRIMARY:
+        async with state.write_lock():
+            _persist_node_metadata(state, role=NodeRole.FOLLOWER)
+            state.role = NodeRole.FOLLOWER
+            state.lease_expires_at = 0.0
+        logger.warning(
+            "Node %s: coordinator registered it as FOLLOWER; stepped down", state.node_id
+        )
+    elif role == NodeRole.PRIMARY.value and state.role == NodeRole.PRIMARY:
+        lease = data.get("lease")
+        if isinstance(lease, dict) and "granted_at" in lease and "expires_at" in lease:
+            state.lease_expires_at = t_send + lease_duration_from_grant(
+                lease, state.settings.LEASE_DURATION_S
+            )
 
 
 # ── Replication Helper ────────────────────────────────────────────────────────
@@ -608,7 +866,13 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
 
     clean_url = state.follower_url.removeprefix("http://").removeprefix("https://").rstrip("/")
     url = f"http://{clean_url}/internal/check-op"
-    payload = {"term": term, "seq": seq, "request_id": request_id, "entry_id": entry_id}
+    payload = {
+        "shard_id": state.shard_id,
+        "term": term,
+        "seq": seq,
+        "request_id": request_id,
+        "entry_id": entry_id,
+    }
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     sig = compute_signature(state.settings.CLUSTER_SECRET, body_bytes)
     headers = {
@@ -731,6 +995,37 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
     return WriteOutcome.OUTCOME_UNKNOWN
 
 
+async def _require_no_pending_writes(state: NodeState, what: str) -> None:
+    """Reconcile unresolved writes before appending more log entries (caller holds the lock).
+
+    Appending/applying a new entry while an earlier WAL entry is still unresolved
+    (appended but not applied) would advance the engine past it, so a later
+    "COMMITTED" reconciliation of that entry could never be applied.
+    """
+    for rid in list(state.pending_unresolved_writes.keys()):
+        await _reconcile_pending_write(state, rid)
+    if state.pending_unresolved_writes:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "REPLICATION_UNAVAILABLE",
+                "error_message": f"Unresolved pending writes exist; cannot {what}.",
+            },
+        )
+
+
+def _store_committed(state: NodeState, request_id: str, seq: int) -> None:
+    state.engine.dedup_store(
+        request_id,
+        DedupEntry(
+            seq=seq,
+            outcome=WriteOutcome.COMMITTED,
+            result={"outcome": WriteOutcome.COMMITTED, "seq": seq},
+            term=state.term,
+        ),
+    )
+
+
 def _write_fingerprint(op: WriteOp, doc_id: int, payload: dict[str, Any] | None) -> str:
     """Stable hash of a write's content, used to detect request_id reuse with different data."""
     canon = json.dumps(
@@ -766,6 +1061,9 @@ async def _execute_write(
     op: WriteOp,
     doc_id: int,
     payload: dict[str, Any] | None,
+    *,
+    ownership_epoch: int | None = None,
+    term: int | None = None,
 ) -> WriteResponse:
     """Run a write under the per-shard write lock with replication and lease fencing."""
     fp = _write_fingerprint(op, doc_id, payload)
@@ -789,6 +1087,15 @@ async def _execute_write(
             raise OutOfRange(
                 f"doc_id={doc_id} is outside all ranges owned by shard {state.shard_id}."
             )
+
+        # 3b. Fencing tokens: reject writes routed with stale ownership / term info.
+        if ownership_epoch is not None and ownership_epoch < state.epoch_for(doc_id):
+            raise StaleEpoch(
+                f"Write carries ownership_epoch {ownership_epoch} < current "
+                f"{state.epoch_for(doc_id)} for doc_id={doc_id}."
+            )
+        if term is not None and term != state.term:
+            raise StaleTerm(f"Write carries term {term}; primary is at term {state.term}.")
 
         # 4. Check & reconcile pending unresolved writes before proceeding
         if state.pending_unresolved_writes:
@@ -1020,7 +1327,10 @@ async def resync_with_primary(
 
         # 2. Query divergence point
         div_url = f"http://{clean_primary}/internal/divergence"
-        body_dict = {"shard_id": state.shard_id, "entries": local_entries}
+        # base_seq: history below the first retained WAL entry lives only in the local
+        # snapshot (compaction / snapshot install). It is committed history.
+        base_seq = (local_entries[0]["seq"] - 1) if local_entries else state.wal.last_seq
+        body_dict = {"shard_id": state.shard_id, "entries": local_entries, "base_seq": base_seq}
         body_bytes = json.dumps(body_dict, separators=(",", ":")).encode("utf-8")
         sig = compute_signature(state.settings.CLUSTER_SECRET, body_bytes)
         headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
@@ -1085,14 +1395,7 @@ async def resync_with_primary(
                 snap_mgr = state.snapshot_mgr or SnapshotManager(data_dir)
                 state.snapshot_mgr = snap_mgr
 
-                parsed_docs: dict[int, dict[str, Any]] = {}
-                raw_docs = snap_data.get("documents", {})
-                if isinstance(raw_docs, dict):
-                    for did_str, d in raw_docs.items():
-                        parsed_docs[int(did_str)] = d
-                else:
-                    for d in raw_docs:
-                        parsed_docs[int(d["doc_id"])] = d
+                parsed_docs = _parse_snapshot_docs(snap_data.get("documents", {}))
 
                 target_term = state.term
                 if "term" in div_data and div_data["term"] > target_term:
@@ -1167,9 +1470,11 @@ async def resync_with_primary(
                 state.engine.last_applied_seq = snap_last_applied_seq
                 state.engine.dedup_import(dedup_table)
 
-                # 5. Durably truncate WAL only AFTER the new snapshot has been persisted
+                # 5. Only AFTER the new snapshot is durable, drop the whole local WAL: the
+                #    snapshot supersedes it, and keeping an old prefix would leave a
+                #    sequence gap (or divergent history) in front of the next entries.
                 if state.wal is not None:
-                    state.wal.truncate_after(state.engine.last_applied_seq)
+                    state.wal.reset(state.engine.last_applied_seq + 1)
             else:
                 # Invariant: Rejoining node must never silently overwrite locally committed history!
                 if div_seq < state.committed_seq:
@@ -1211,24 +1516,8 @@ async def resync_with_primary(
                         return False
                 # Truncate divergent tail after div_seq
                 state.wal.truncate_after(div_seq)
-                # Rebuild in-memory engine and dedup up to div_seq
-                state.engine._docs.clear()
-                state.engine._index.clear()
-                state.engine._dedup.clear()
-                state.engine.last_applied_seq = 0
-                for entry in state.wal.replay(after_seq=0):
-                    state.engine.apply(entry)
-                    rid = entry.get("request_id")
-                    if rid:
-                        state.engine.dedup_store(
-                            rid,
-                            DedupEntry(
-                                seq=entry["seq"],
-                                outcome=WriteOutcome.COMMITTED,
-                                result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
-                                term=entry.get("term", state.term),
-                            ),
-                        )
+                # Rebuild in-memory engine and dedup up to div_seq (snapshot + WAL)
+                _rebuild_engine_from_disk(state)
 
                 # Catchup missing entries with seq > div_seq
                 catchup_url = f"http://{clean_primary}/internal/catchup"
@@ -1428,6 +1717,7 @@ def build_app(
                             }
                             rb = json.dumps(reg_body, separators=(",", ":")).encode("utf-8")
                             rsig = compute_signature(settings.CLUSTER_SECRET, rb)
+                            t_reg = time.monotonic()
                             rresp = await hb_client.post(
                                 reg_url,
                                 content=rb,
@@ -1437,6 +1727,8 @@ def build_app(
                                 },
                             )
                             registered = rresp.status_code == 200
+                            if registered:
+                                await _apply_registration(state, rresp.json(), t_reg)
                         except Exception as exc:
                             node_logger.debug("Registration failed (will retry): %s", exc)
 
@@ -1463,18 +1755,30 @@ def build_app(
                         if resp.status_code == 200:
                             data = resp.json()
                             if data and "granted_at" in data and "expires_at" in data:
-                                duration = data["expires_at"] - data["granted_at"]
-                                state.lease_expires_at = t_send + (
-                                    duration if duration > 0 else settings.LEASE_DURATION_S
+                                state.lease_expires_at = t_send + lease_duration_from_grant(
+                                    data, settings.LEASE_DURATION_S
                                 )
                             elif data is None:
                                 registered = False  # coordinator does not know us; re-register
                         elif resp.status_code == 409:
-                            node_logger.warning(
-                                "Heartbeat returned 409 STALE_TERM; demoting to follower"
-                            )
-                            state.role = NodeRole.FOLLOWER
-                            state.lease_expires_at = 0.0
+                            # Step down only on an explicit stale-term fence (final report #12);
+                            # any other 409 is an unrelated rejection and must not demote us.
+                            try:
+                                err_code = resp.json().get("error_code")
+                            except Exception:
+                                err_code = None
+                            if err_code == "STALE_TERM":
+                                node_logger.warning(
+                                    "Heartbeat returned 409 STALE_TERM; demoting to follower"
+                                )
+                                state.lease_expires_at = 0.0  # stop serving immediately
+                                async with state.write_lock():
+                                    _persist_node_metadata(state, role=NodeRole.FOLLOWER)
+                                    state.role = NodeRole.FOLLOWER
+                            else:
+                                node_logger.warning(
+                                    "Heartbeat rejected with 409 %s; not demoting", err_code
+                                )
                     except Exception as exc:
                         node_logger.debug("Heartbeat sending failed: %s", exc)
 
@@ -1514,12 +1818,43 @@ def build_app(
                 except Exception as exc:
                     node_logger.debug("Follower resync request failed (will retry): %s", exc)
 
+        # Periodic snapshot + safe WAL compaction (BUG 12)
+        async def _snapshot_loop() -> None:
+            every_n = settings.SNAPSHOT_EVERY_N_OPS
+            every_s = settings.SNAPSHOT_EVERY_S
+            if every_n <= 0 and every_s <= 0:
+                return
+            last_seq = state.engine.last_applied_seq
+            last_t = time.monotonic()
+            while True:
+                await asyncio.sleep(_SNAPSHOT_POLL_S)
+                if not state.ready:
+                    continue
+                ops = state.engine.last_applied_seq - last_seq
+                if ops <= 0:
+                    last_seq = min(last_seq, state.engine.last_applied_seq)
+                    continue
+                due_ops = every_n > 0 and ops >= every_n
+                due_time = every_s > 0 and time.monotonic() - last_t >= every_s
+                if not (due_ops or due_time):
+                    continue
+                try:
+                    removed = await snapshot_and_compact(state)
+                    last_seq = state.engine.last_applied_seq
+                    last_t = time.monotonic()
+                    node_logger.info(
+                        "Periodic snapshot at seq %d; compacted %d WAL entries", last_seq, removed
+                    )
+                except Exception as exc:
+                    node_logger.error("Periodic snapshot/compaction failed: %s", exc)
+
         recovery_task = asyncio.create_task(_follower_recovery())
         hb_task = asyncio.create_task(_heartbeat_sender())
+        snap_task = asyncio.create_task(_snapshot_loop())
 
         yield
 
-        for t in (hb_task, recovery_task):
+        for t in (hb_task, recovery_task, snap_task):
             t.cancel()
             try:
                 await t
@@ -1546,6 +1881,7 @@ def build_app(
             state.wal.close()
 
     app = FastAPI(title=f"Shard Node — {shard_id}", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.MAX_BODY_SIZE_BYTES)
 
     # ── Middleware ────────────────────────────────────────────────────────────
 
@@ -1577,6 +1913,13 @@ def build_app(
 
     cluster_auth = make_cluster_auth_dependency(lambda: settings.CLUSTER_SECRET)
 
+    def _check_doc_size(doc: dict[str, Any]) -> None:
+        size = serialized_doc_size(doc)
+        if size > settings.MAX_DOC_SIZE_BYTES:
+            raise DocTooLarge(
+                f"Document is {size} bytes; limit is {settings.MAX_DOC_SIZE_BYTES} bytes."
+            )
+
     def get_node(request: Request) -> NodeState:
         state: NodeState = request.app.state.node
         if not state.ready:
@@ -1607,7 +1950,16 @@ def build_app(
         doc_dict = doc.model_dump()
         doc_id = doc_dict["doc_id"]
         try:
-            return await _execute_write(state, body.request_id, WriteOp.INSERT, doc_id, doc_dict)
+            _check_doc_size(doc_dict)
+            return await _execute_write(
+                state,
+                body.request_id,
+                WriteOp.INSERT,
+                doc_id,
+                doc_dict,
+                ownership_epoch=body.ownership_epoch,
+                term=body.term,
+            )
         except DocstoreError as exc:
             raise exc.to_http_exception() from exc
 
@@ -1638,7 +1990,16 @@ def build_app(
 
         doc_dict = doc.model_dump()
         try:
-            return await _execute_write(state, body.request_id, WriteOp.UPDATE, doc_id, doc_dict)
+            _check_doc_size(doc_dict)
+            return await _execute_write(
+                state,
+                body.request_id,
+                WriteOp.UPDATE,
+                doc_id,
+                doc_dict,
+                ownership_epoch=body.ownership_epoch,
+                term=body.term,
+            )
         except DocstoreError as exc:
             raise exc.to_http_exception() from exc
 
@@ -1651,7 +2012,15 @@ def build_app(
             ).to_http_exception()
 
         try:
-            return await _execute_write(state, body.request_id, WriteOp.DELETE, doc_id, None)
+            return await _execute_write(
+                state,
+                body.request_id,
+                WriteOp.DELETE,
+                doc_id,
+                None,
+                ownership_epoch=body.ownership_epoch,
+                term=body.term,
+            )
         except DocstoreError as exc:
             raise exc.to_http_exception() from exc
 
@@ -1674,7 +2043,7 @@ def build_app(
         )
 
     @app.post("/query")
-    async def query_docs(body: QueryFilter, request: Request) -> QueryResponse:
+    async def query_docs(body: ShardQueryBody, request: Request) -> QueryResponse:
         state = get_node(request)
         try:
             validate_query_filter(body.filter)
@@ -1684,32 +2053,48 @@ def build_app(
         if state.role == NodeRole.PRIMARY and not state.is_lease_valid():
             raise LeaseExpired("Primary lease has expired.").to_http_exception()
 
+        # Effective ranges: owned ranges, optionally restricted to the ranges the router
+        # attributes to this shard. Restricting BEFORE sort/skip/limit keeps pagination
+        # correct when one shard owns several disjoint ranges.
+        effective: list[tuple[int, int]] = [(r.start, r.end) for r in state.ranges]
+        if body.ranges is not None:
+            restricted: list[tuple[int, int]] = []
+            for o_s, o_e in effective:
+                for q_s, q_e in body.ranges:
+                    lo, hi = max(o_s, q_s), min(o_e, q_e)
+                    if lo < hi:
+                        restricted.append((lo, hi))
+            effective = sorted(restricted)
+
+        def _in_effective(did: int) -> bool:
+            return any(lo <= did < hi for lo, hi in effective)
+
         # Collect candidate documents according to shard-key constraints & ownership
         constraint = detect_shard_key_constraint(body.filter)
         candidates: list[dict[str, Any]] = []
 
         if constraint.kind == "exact":
             assert constraint.doc_id is not None
-            if state.owns(constraint.doc_id):
+            if _in_effective(constraint.doc_id):
                 doc = state.engine.get(constraint.doc_id)
                 if doc is not None:
                     candidates.append(doc)
         elif constraint.kind == "in":
             for doc_id in constraint.doc_ids or []:
-                if state.owns(doc_id):
+                if _in_effective(doc_id):
                     doc = state.engine.get(doc_id)
                     if doc is not None:
                         candidates.append(doc)
         elif constraint.kind == "range":
             assert constraint.range_start is not None and constraint.range_end is not None
-            for r in state.ranges:
-                s = max(constraint.range_start, r.start)
-                e = min(constraint.range_end, r.end)
+            for lo, hi in effective:
+                s = max(constraint.range_start, lo)
+                e = min(constraint.range_end, hi)
                 if s < e:
                     candidates.extend(state.engine.range_scan(s, e))
         else:
-            for r in state.ranges:
-                candidates.extend(state.engine.range_scan(r.start, r.end))
+            for lo, hi in effective:
+                candidates.extend(state.engine.range_scan(lo, hi))
 
         matched = [doc for doc in candidates if evaluate_filter(doc, body.filter)]
         sorted_docs = sort_documents(matched, sort_field=body.sort_field, sort_dir=body.sort_dir)
@@ -1761,6 +2146,7 @@ def build_app(
     @app.post("/internal/replicate", dependencies=[Depends(cluster_auth)])
     async def replicate(body: ReplicationRequest, request: Request) -> ReplicationResponse:
         state = get_node(request)
+        _require_same_shard(state, body.shard_id)
         if state.role == NodeRole.PRIMARY:
             raise HTTPException(
                 status_code=409,
@@ -1861,6 +2247,7 @@ def build_app(
     @app.post("/internal/catchup", dependencies=[Depends(cluster_auth)])
     async def catchup(body: CatchupRequest, request: Request) -> CatchupResponse:
         state = get_node(request)
+        _require_same_shard(state, body.shard_id)
         assert state.wal is not None
 
         earliest = state.wal.earliest_seq()
@@ -1881,6 +2268,7 @@ def build_app(
     @app.post("/internal/check-op", dependencies=[Depends(cluster_auth)])
     async def check_op(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
+        _require_same_shard(state, body.get("shard_id"))
         seq = body.get("seq")
         term = body.get("term")
         request_id = body.get("request_id")
@@ -1964,6 +2352,7 @@ def build_app(
     @app.post("/internal/snapshot/apply", dependencies=[Depends(cluster_auth)])
     async def apply_snapshot(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
+        _require_same_shard(state, body.get("shard_id"))
         async with state.write_lock():
             snap_seq = int(body.get("last_applied_seq", 0))
             if snap_seq < state.committed_seq:
@@ -2005,16 +2394,13 @@ def build_app(
                             ),
                         )
 
-            # C2: all_docs() returns dict[int, dict]; iterating the dict yields keys,
-            # not documents. Handle both the dict format (current) and a list format.
-            docs = body.get("documents", {})
-            parsed_docs: dict[int, dict[str, Any]] = {}
-            if isinstance(docs, dict):
-                for doc_id_str, doc in docs.items():
-                    parsed_docs[int(doc_id_str)] = doc
-            else:
-                for doc in docs:
-                    parsed_docs[int(doc["doc_id"])] = doc
+            # C2: all_docs() returns dict[int, dict]; accept dict or list format.
+            try:
+                parsed_docs = _parse_snapshot_docs(body.get("documents", {}))
+            except (ValueError, TypeError, KeyError) as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Malformed snapshot documents: {exc}"
+                ) from exc
 
             target_term = max(state.term, snap_term)
             target_epochs = {f"{r.start}-{r.end}": r.ownership_epoch for r in reconciled_ranges}
@@ -2051,14 +2437,16 @@ def build_app(
             state.committed_seq = max(state.committed_seq, snap_seq)
             _persist_node_metadata(state)
 
+            # The snapshot supersedes all local history: restart the WAL right after it.
             if state.wal is not None:
-                state.wal.truncate_after(state.engine.last_applied_seq)
+                state.wal.reset(state.engine.last_applied_seq + 1)
 
             return {"status": "ok", "applied_seq": state.engine.last_applied_seq}
 
     @app.post("/internal/fence", dependencies=[Depends(cluster_auth)])
     async def fence(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
+        _require_same_shard(state, body.get("shard_id"))
         new_term = body.get("term")
         # M6: Only accept exactly current_term+1 to prevent a misbehaving peer
         # from jumping the term to max-int and permanently blocking replication.
@@ -2107,40 +2495,75 @@ def build_app(
         }
 
     @app.post("/internal/promote", dependencies=[Depends(cluster_auth)])
-    async def promote(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    async def promote(body: PromoteRequest, request: Request) -> dict[str, Any]:
         state = get_node(request)
+        _require_same_shard(state, body.shard_id)
+
+        def _reject(code: str, msg: str) -> HTTPException:
+            return HTTPException(status_code=409, detail={"error_code": code, "error_message": msg})
+
         async with state.write_lock():
-            new_term = body.get("term", state.term + 1)
-            if not isinstance(new_term, int) or new_term < state.term:
+            # 1. Validate the request completely before touching any state.
+            new_term = body.term if body.term is not None else state.term + 1
+            if new_term < 1 or new_term < state.term:
                 raise StaleTerm(
                     f"Promotion term {new_term!r} is behind node term {state.term}."
                 ).to_http_exception()
-            state.term = new_term
-            state.role = NodeRole.PRIMARY
 
-            epochs = body.get("ownership_epochs", {})
-            for r in state.ranges:
-                key = f"{r.start}-{r.end}"
-                if key in epochs:
-                    r.ownership_epoch = epochs[key]
-                else:
-                    r.ownership_epoch += 1
-
-            lease = body.get("lease")
-            if lease:
-                duration = lease.get("expires_at", 0) - lease.get("granted_at", 0)
-                state.lease_expires_at = time.monotonic() + (
-                    duration if duration > 0 else state.settings.LEASE_DURATION_S
+            current = {(r.start, r.end): r.ownership_epoch for r in state.ranges}
+            if body.ranges is not None:
+                # Coordinator sends the authoritative ranges for this shard from the map.
+                candidate = sorted(
+                    (r.model_copy() for r in body.ranges), key=lambda r: (r.start, r.end)
                 )
+                for prev, nxt in itertools.pairwise(candidate):
+                    if nxt.start < prev.end:
+                        raise _reject("INVALID_RANGES", "Promotion ranges overlap.")
+                for r in candidate:
+                    if r.end <= r.start:
+                        raise _reject("INVALID_RANGES", f"Empty range [{r.start}, {r.end}).")
+                    old = current.get((r.start, r.end))
+                    if old is not None and r.ownership_epoch < old:
+                        raise _reject(
+                            "STALE_EPOCH",
+                            f"Promotion epoch {r.ownership_epoch} < local {old} "
+                            f"for [{r.start}, {r.end}).",
+                        )
+            elif body.ownership_epochs is not None:
+                keys = {f"{a}-{b}" for a, b in current}
+                if set(body.ownership_epochs) != keys:
+                    raise _reject(
+                        "RANGE_MISMATCH",
+                        f"Promotion epochs for {sorted(body.ownership_epochs)} do not match "
+                        f"owned ranges {sorted(keys)}.",
+                    )
+                candidate = []
+                for (a, b), old in sorted(current.items()):
+                    ep = body.ownership_epochs[f"{a}-{b}"]
+                    if ep < old:
+                        raise _reject(
+                            "STALE_EPOCH", f"Promotion epoch {ep} < local {old} for [{a}, {b})."
+                        )
+                    candidate.append(ShardRangeConfig(start=a, end=b, ownership_epoch=ep))
             else:
-                state.lease_expires_at = time.monotonic() + state.settings.LEASE_DURATION_S
+                candidate = [
+                    ShardRangeConfig(start=a, end=b, ownership_epoch=old + 1)
+                    for (a, b), old in sorted(current.items())
+                ]
 
-            state.follower_url = body.get("follower_url") or state.follower_url
-            state.follower_state = (
-                ReplicaState.DOWN
-            )  # Degraded mode until rejoining follower is SYNCED
+            # Idempotent retry of an already-applied promotion: refresh lease only.
+            if state.role == NodeRole.PRIMARY and new_term == state.term:
+                if [(r.start, r.end, r.ownership_epoch) for r in candidate] != [
+                    (r.start, r.end, r.ownership_epoch) for r in state.ranges
+                ]:
+                    _persist_node_metadata(state, ranges=candidate)
+                    state.ranges = candidate
+                state.lease_expires_at = time.monotonic() + _lease_duration(body.lease)
+                return _promote_result(state)
 
-            # Reconcile any pending unresolved writes with follower if reachable
+            # 2. Prepare the log: reconcile pending writes, settle the committed prefix.
+            if body.follower_url:
+                state.follower_url = body.follower_url
             if state.pending_unresolved_writes and state.follower_url:
                 for p_rid in list(state.pending_unresolved_writes.keys()):
                     try:
@@ -2148,7 +2571,6 @@ def build_app(
                     except Exception as exc:
                         logger.debug("Promotion reconciliation for %s deferred: %s", p_rid, exc)
 
-            # Establish correct recovery point using durable commitment metadata and engine state
             data_dir = Path(state.settings.DATA_DIR) / state.shard_id
             meta_path = data_dir / "node_metadata.json"
             if meta_path.exists():
@@ -2190,7 +2612,16 @@ def build_app(
                                 ),
                             )
 
-            _persist_node_metadata(state)
+            # 3. Persist the candidate authority FIRST. If this fails the node keeps its
+            #    old term / role / ranges and the coordinator sees the error (fail closed).
+            _persist_node_metadata(state, term=new_term, role=NodeRole.PRIMARY, ranges=candidate)
+
+            # 4. Only now activate it. Role goes last so nothing serves as primary early.
+            state.term = new_term
+            state.ranges = candidate
+            state.follower_state = ReplicaState.DOWN  # degraded until follower is SYNCED
+            state.lease_expires_at = time.monotonic() + _lease_duration(body.lease)
+            state.role = NodeRole.PRIMARY
 
             logger.info(
                 "Promoted node %s to PRIMARY for shard %s in term %d (degraded mode)",
@@ -2198,17 +2629,24 @@ def build_app(
                 state.shard_id,
                 state.term,
             )
-            return {
-                "status": "ok",
-                "node_id": state.node_id,
-                "role": "primary",
-                "term": state.term,
-                "last_applied_seq": state.engine.last_applied_seq,
-            }
+            return _promote_result(state)
+
+    def _lease_duration(lease: dict[str, Any] | None) -> float:
+        return lease_duration_from_grant(lease, float(settings.LEASE_DURATION_S))
+
+    def _promote_result(state: NodeState) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "node_id": state.node_id,
+            "role": "primary",
+            "term": state.term,
+            "last_applied_seq": state.engine.last_applied_seq,
+        }
 
     @app.post("/internal/divergence", dependencies=[Depends(cluster_auth)])
     async def get_divergence_point(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
+        _require_same_shard(state, body.get("shard_id"))
         assert state.wal is not None
 
         entries = body.get("entries", [])
@@ -2225,17 +2663,35 @@ def build_app(
 
         sorted_entries = sorted(entries, key=lambda x: int(x.get("seq", 0)))
 
+        # base_seq: the follower's history at or below this seq lives only in its
+        # snapshot (WAL compacted / snapshot installed). That prefix is committed history,
+        # so matching starts right after it.
+        try:
+            base_seq = (
+                int(sorted_entries[0].get("seq", 0)) - 1
+                if sorted_entries
+                else int(body.get("base_seq", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            base_seq = 0
+        base_seq = max(0, base_seq)
+
+        if base_seq > 0 and (base_seq > last_seq or base_seq + 1 < earliest):
+            # We cannot continue the follower's log from its base: full snapshot needed.
+            needs_snapshot = True
         # If follower's earliest entry is older than primary's earliest available entry
-        if sorted_entries and int(sorted_entries[0].get("seq", 0)) < earliest:
+        elif sorted_entries and int(sorted_entries[0].get("seq", 0)) < earliest:
             # Primary has pruned/compacted its WAL before earliest_seq; cannot verify from here
             needs_snapshot = True
         elif not sorted_entries:
-            candidate_divergence = 0
+            candidate_divergence = base_seq
         else:
             expected_start = (
                 earliest if (earliest in primary_by_seq and 1 not in primary_by_seq) else 1
             )
-            if (
+            if base_seq > 0:
+                candidate_divergence = base_seq  # contiguity continues from the base
+            elif (
                 int(sorted_entries[0].get("seq", 0)) > expected_start
                 and expected_start in primary_by_seq
             ):
@@ -2344,6 +2800,7 @@ def build_app(
     @app.post("/internal/rejoin/complete", dependencies=[Depends(cluster_auth)])
     async def rejoin_complete(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
+        _require_same_shard(state, body.get("shard_id"))
         async with state.write_lock():
             if state.role != NodeRole.PRIMARY:
                 raise HTTPException(
@@ -2447,11 +2904,40 @@ def build_app(
                     },
                 )
             s_seq = state.engine.last_applied_seq
-            docs = state.engine.range_snapshot(start, end)
+            # Pin the WAL after the copy's start seq until catch-up has consumed it.
+            state.hold_migration(start, end, s_seq, reset=body.get("after_doc_id") is None)
+            limit = body.get("limit")
+            if limit is None:
+                # Legacy single-shot copy of the whole range.
+                docs = state.engine.range_snapshot(start, end)
+                return {
+                    "status": "ok",
+                    "snapshot_seq": s_seq,
+                    "documents": docs,
+                    "next_after_doc_id": docs[-1]["doc_id"] if docs else None,
+                    "done": True,
+                }
+            # Cursor-paginated copy, bounded by count and serialized bytes.
+            after_doc_id = body.get("after_doc_id")
+            max_bytes = int(body.get("max_bytes") or settings.MAX_BODY_SIZE_BYTES // 2)
+            fetched = state.engine.range_page(
+                start, end, after_doc_id=after_doc_id, limit=max(1, int(limit))
+            )
+            page: list[dict[str, Any]] = []
+            size = 0
+            for d in fetched:
+                d_size = serialized_doc_size(d)
+                if page and size + d_size > max_bytes:
+                    break
+                page.append(d)
+                size += d_size
+            done = len(page) == len(fetched) and len(fetched) < max(1, int(limit))
             return {
                 "status": "ok",
                 "snapshot_seq": s_seq,
-                "documents": docs,
+                "documents": page,
+                "next_after_doc_id": page[-1]["doc_id"] if page else after_doc_id,
+                "done": done,
             }
 
     @app.post("/internal/migration/oplog", dependencies=[Depends(cluster_auth)])
@@ -2463,6 +2949,7 @@ def build_app(
         limit = body.get("limit", 1000)
 
         assert state.wal is not None
+        state.hold_migration(start, end, after_seq)  # cursor advanced: release older entries
         earliest = state.wal.earliest_seq()
         if earliest is not None and earliest > after_seq + 1:
             return {
@@ -2496,13 +2983,19 @@ def build_app(
         state = get_node(request)
         docs = body.get("documents", [])
         mig_id = body.get("migration_id", "mig")
+        skipped = 0
 
         assert state.wal is not None
         async with state.write_lock():
+            await _require_no_pending_writes(state, "apply migration batch")
             try:
                 for doc in docs:
                     doc_id = doc["doc_id"]
                     req_id = f"mig-{mig_id}-{doc_id}"
+                    prior = state.engine.dedup_check(req_id)
+                    if prior is not None and prior.outcome == WriteOutcome.COMMITTED:
+                        skipped += 1  # retried batch: already durably applied
+                        continue
                     seq = state.wal.next_seq()
                     wal_entry = state.wal.append(
                         seq=seq,
@@ -2528,24 +3021,36 @@ def build_app(
 
                     state.engine.apply(wal_entry, migration_mode=True)
                     state.committed_seq = max(state.committed_seq, seq)
+                    _store_committed(state, req_id, seq)
             finally:
                 _persist_node_metadata(state)
-            return {"status": "ok", "count": len(docs), "last_seq": state.wal.last_seq}
+            return {
+                "status": "ok",
+                "count": len(docs),
+                "skipped": skipped,
+                "last_seq": state.wal.last_seq,
+            }
 
     @app.post("/internal/migration/apply-oplog", dependencies=[Depends(cluster_auth)])
     async def migration_apply_oplog(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         entries = body.get("entries", [])
         mig_id = body.get("migration_id", "mig")
+        skipped = 0
 
         assert state.wal is not None
         async with state.write_lock():
+            await _require_no_pending_writes(state, "apply migration oplog")
             try:
                 for entry in entries:
                     doc_id = entry["doc_id"]
                     op = WriteOp(entry["op"])
                     payload = entry.get("payload")
                     req_id = f"catchup-{mig_id}-{doc_id}-{entry['seq']}"
+                    prior = state.engine.dedup_check(req_id)
+                    if prior is not None and prior.outcome == WriteOutcome.COMMITTED:
+                        skipped += 1  # this source op was already replayed
+                        continue
 
                     seq = state.wal.next_seq()
                     wal_entry = state.wal.append(
@@ -2570,9 +3075,15 @@ def build_app(
 
                     state.engine.apply(wal_entry, migration_mode=True)
                     state.committed_seq = max(state.committed_seq, seq)
+                    _store_committed(state, req_id, seq)
             finally:
                 _persist_node_metadata(state)
-            return {"status": "ok", "replayed": len(entries), "last_seq": state.wal.last_seq}
+            return {
+                "status": "ok",
+                "replayed": len(entries) - skipped,
+                "skipped": skipped,
+                "last_seq": state.wal.last_seq,
+            }
 
     @app.post("/internal/migration/pause", dependencies=[Depends(cluster_auth)])
     async def migration_pause(body: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -2601,6 +3112,7 @@ def build_app(
             state.paused_ranges = [
                 r for r in state.paused_ranges if not (r[0] == start and r[1] == end)
             ]
+            state.release_migration(start, end)  # migration aborted
             logger.info("Unpaused range [%d, %d) on shard %s", start, end, state.shard_id)
             return {"status": "ok"}
 
@@ -2623,13 +3135,16 @@ def build_app(
         end = body["end"]
         epoch = body["ownership_epoch"]
         async with state.write_lock():
-            existing = next((r for r in state.ranges if r.start == start and r.end == end), None)
+            candidate = [r.model_copy() for r in state.ranges]
+            existing = next((r for r in candidate if r.start == start and r.end == end), None)
             if existing:
-                existing.ownership_epoch = epoch
+                existing.ownership_epoch = max(existing.ownership_epoch, epoch)
             else:
-                state.ranges.append(ShardRangeConfig(start=start, end=end, ownership_epoch=epoch))
-                state.ranges.sort(key=lambda r: r.start)
-            _persist_node_metadata(state)
+                candidate.append(ShardRangeConfig(start=start, end=end, ownership_epoch=epoch))
+                candidate.sort(key=lambda r: r.start)
+            # Durable first, then visible: a failed persist must not change ownership.
+            _persist_node_metadata(state, ranges=candidate)
+            state.ranges = candidate
             logger.info(
                 "Cutover range [%d, %d) epoch %d to shard %s (node %s)",
                 start,
@@ -2643,6 +3158,7 @@ def build_app(
     async def _purge_range_docs(state: NodeState, start: int, end: int, prefix: str) -> int:
         """Delete every doc in [start, end) through the WAL, replicated and committed."""
         assert state.wal is not None
+        await _require_no_pending_writes(state, "purge range")
         docs = state.engine.range_snapshot(start, end)
         try:
             for d in docs:
@@ -2707,14 +3223,16 @@ def build_app(
         end = body["end"]
         async with state.write_lock():
             # 1. Stop owning the range (works for prefix / suffix / interior / whole ranges)
-            state.ranges = _subtract_range(state.ranges, start, end)
-            _persist_node_metadata(state)
+            candidate = _subtract_range(state.ranges, start, end)
+            _persist_node_metadata(state, ranges=candidate)
+            state.ranges = candidate
             # 2. Delete docs through the WAL so the follower and restarts see it
             deleted = await _purge_range_docs(state, start, end, "cleanup")
             # 3. Only now unpause, so no write can slip in while docs are being removed
             state.paused_ranges = [
                 r for r in state.paused_ranges if not (r[0] == start and r[1] == end)
             ]
+            state.release_migration(start, end)
             # 4. Tell the follower to drop the range as well (docs already replicated)
             relayed = await _relay_to_follower(
                 state, "/internal/migration/ranges/remove", {"start": start, "end": end}
@@ -2739,11 +3257,12 @@ def build_app(
         start = body["start"]
         end = body["end"]
         async with state.write_lock():
-            state.ranges = _subtract_range(state.ranges, start, end)
+            candidate = _subtract_range(state.ranges, start, end)
+            _persist_node_metadata(state, ranges=candidate)
+            state.ranges = candidate
             state.paused_ranges = [
                 r for r in state.paused_ranges if not (r[0] == start and r[1] == end)
             ]
-            _persist_node_metadata(state)
             return {"status": "ok", "ranges": [r.model_dump() for r in state.ranges]}
 
     @app.post("/internal/migration/abort", dependencies=[Depends(cluster_auth)])

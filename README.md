@@ -47,6 +47,7 @@ A distributed, range-partitioned JSON document store built in Python 3.11 with `
    - Owns the authoritative cluster shard map with versioning (`map_version` and per-range `ownership_epoch`).
    - Issues time-bounded leases to primaries via periodic node heartbeats ($H$).
    - Enforces a safety cutoff ($L + M$) preventing a newly promoted primary from accepting writes while a former primary's lease could still be active.
+   - Records every failover as a durable intent before changing the map, so a coordinator crash mid-failover is finished (or safely discarded) on restart; failover and migration cutover are serialised per shard.
    - Monitors node health and marks shards **degraded** when their follower is not in the `SYNCED` state.
    - Protected admin API for cluster status and range migrations (`X-Admin-Token`).
 
@@ -55,11 +56,13 @@ A distributed, range-partitioned JSON document store built in Python 3.11 with `
    - Caches the shard map; routes CRUD operations directly to the owning primary.
    - Supports `read_mode=follower` with automatic fallback to primary if the follower is down or laggy.
    - Executes parallel scatter-gather queries (`POST /query`) across all shards with local limit queries, tie-breaking, global pagination, and de-duplication.
-   - Bounded retries on routing staleness (`OUT_OF_RANGE`, `STALE_EPOCH`, `NOT_PRIMARY`, `REPLICATION_UNAVAILABLE`).
+   - Bounded retries on routing staleness (`OUT_OF_RANGE`, `STALE_EPOCH`, `NOT_PRIMARY`, `LEASE_EXPIRED`, `REPLICATION_UNAVAILABLE`), always reusing the client's `request_id`.
+   - Attaches the routing entry's `ownership_epoch` to every write as a fencing token; enforces the 1 MB document and 2 MB body limits (also for bodies sent without `Content-Length`).
 
 3. **Shard Nodes (`docstore.shard`):**
    - **Primary Node:** Accepts write traffic, holds a per-shard write lock, validates range ownership, leases, and follower status. Under normal distributed deployment, replication is strictly **fail-closed**: if no follower is configured or the follower is not in `SYNCED` state, writes are rejected with HTTP 503 `REPLICATION_UNAVAILABLE` before WAL append. When a follower is configured, the primary assigns a sequence number, appends to its WAL, fsyncs, synchronously replicates to the follower (which also fsyncs), commits locally, and updates memory and dedup table. Standalone single-node writes require explicit opt-in via `STANDALONE_MODE=true` or `--standalone`.
    - **Follower Node:** Durably appends replicated oplog entries to its WAL, fsyncs, asynchronously updates memory, detects sequence gaps, supports oplog catch-up (`/internal/catchup`) and snapshot resync (`/internal/snapshot`), and serves reads tagged with `replication_lag`.
+   - **Durability housekeeping:** every node takes periodic snapshots (every 1 000 ops or 60 s) and then compacts its WAL safely (verified snapshot first; never past committed / follower-acked / active-migration positions). WAL sequence continuity is verified on every replay.
    - Inter-node communications are authenticated using HMAC-SHA256 cluster signatures (`X-Cluster-Signature`).
 
 ### Timing Constraints Invariant
@@ -174,7 +177,7 @@ python -m docstore.router
 
 ## Testing & Quality Gates
 
-The test suite contains **253 automated tests** covering unit storage, safe query filtering, shard routing, coordinator leases, fail-closed replication durability, failover fencing, and live range migration.
+The test suite contains **392 automated tests** covering unit storage, safe query filtering, shard routing, coordinator leases, fail-closed replication durability, failover fencing, and live range migration (391 pass and 1 Docker smoke test is skipped when no live cluster is running).
 
 ### Running Fast Tests (Unit + Integration)
 
@@ -213,6 +216,9 @@ Or directly with `pytest`:
 
 # 8. Live range migration & checksum verification (Module 9 & M6 Gate)
 .venv/bin/pytest tests/fault/test_migration.py -v
+
+# 9. Regression tests for audited correctness and durability bugs
+.venv/bin/pytest tests/integration/test_bugs.py -v
 ```
 
 ### Full Test Suite with Coverage Report
@@ -403,6 +409,8 @@ curl -X POST http://127.0.0.1:8000/query \
 
 Supported filter operators: `$eq`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$and`, `$or`.
 
+`total` in the response is the number of matching documents across the whole cluster (not the page size).
+
 ### 5. Inspect Coordinator Status (`GET /admin/status`)
 
 Inspect lease states, replica states, terms, failover metrics, and shard health:
@@ -417,17 +425,17 @@ curl -X GET http://127.0.0.1:8100/admin/status \
 ## Failover, Fencing & Degraded Mode (Module 8 / M5)
 
 ### Promotion Procedure
-1. **Detection:** Coordinator detects primary failure if no heartbeat is received within timeout $D$ (default 5.0 s).
+1. **Detection:** Coordinator detects primary failure if no heartbeat is received within timeout $D$ (default 5.0 s), or when a shard has no registered primary — e.g. the primary restarted and came back as a follower.
 2. **Follower Verification:** Coordinator checks that the follower is alive and queries its highest durable sequence number.
 3. **Safety Wait:** Coordinator waits for the failed primary's lease to expire plus a safety margin $M$ ($L + M$) before allowing promotion.
-4. **Term & Epoch Bump:** Shard `term` is incremented, and `ownership_epoch` for all ranges of that shard is bumped. The updated shard map and epoch history are saved durably to disk.
-5. **Promotion:** Follower is promoted to PRIMARY via `POST /internal/promote`, persisting the new term to disk.
+4. **Term & Epoch Bump:** A durable failover intent is written first; then the shard `term` is incremented and `ownership_epoch` for all ranges of that shard is bumped. The updated shard map and epoch history are saved durably to disk.
+5. **Promotion:** Follower is promoted to PRIMARY via `POST /internal/promote` with the map's authoritative ranges; it persists the new term, role and ranges **before** accepting writes. Unconfirmed promotions are retried, including after a coordinator restart.
 6. **Degraded Mode:** The newly promoted primary serves reads immediately (once granted a lease), but rejects writes with `503 REPLICATION_UNAVAILABLE` until a follower is `SYNCED`.
 
 ### Old Primary Rejoin & Divergence Truncation
 - A returning failed primary never resumes as primary from past state.
 - When it restarts or contacts the coordinator, it is forced to role `FOLLOWER`.
-- It contacts the new primary via `POST /internal/divergence` to find the highest `(term, seq)` where both logs agree.
+- It contacts the new primary via `POST /internal/divergence` to find the highest seq where both logs hold the identical entry (full entry identity, not just `term`).
 - Any uncommitted tail beyond the divergence point is truncated from its WAL, and memory index + dedup tables are rebuilt.
 - It catches up remaining ops via `/internal/catchup` (or falls back to snapshot resync), marks itself `SYNCED`, and notifies the primary.
 - The shard leaves degraded mode and normal synchronous replication resumes.
@@ -460,16 +468,17 @@ PLANNED ──► SNAPSHOT_COPY ──► CATCHUP ──► PAUSE ──► FINA
    └──────────────────────────► ABORTED ◄────────────────────────────────┘          └── (Point of No Return)
 ```
 
-- **SNAPSHOT_COPY:** Takes a point-in-time range snapshot at source sequence number $S$ under the source's write lock. Streamed to the destination primary via `/internal/migration/apply-batch`. Source keeps accepting live traffic.
+- **SNAPSHOT_COPY:** Copies the range in cursor-paginated pages (500 docs, also bounded by bytes), starting at source sequence number $S$. Streamed to the destination primary via `/internal/migration/apply-batch` in batches bounded by count and serialized size; retried batches are not re-applied. Source keeps accepting live traffic, and pins its WAL after $S$ until catch-up has read it.
 - **Normal Replicated Write Path:** Destination ingests migrating records through its normal write-path and replicates them synchronously to its follower.
 - **Invisibility Invariant:** Migrating documents on the destination remain invisible to client reads (`GET /doc/{id}`) and queries (`POST /query`) until cutover occurs.
 - **CATCHUP:** Source streams WAL oplog entries with $\text{seq} > S$ overlapping $[start, end)$. Replayed idempotently (insert $\to$ upsert, delete $\to$ no-op if missing) on destination. Repeated until replication lag is minimized.
 - **PAUSE:** Coordinator temporarily pauses writes for the specific key range only (`RANGE_PAUSED`). Reads and queries continue to be served by the source shard.
 - **FINAL_CATCHUP:** Destination catches up with all remaining ops through paused sequence number $H$.
 - **VERIFY:** Coordinator verifies that source and destination have identical document counts and matching deterministic **SHA-256 canonical JSON** checksums (documents sorted by `doc_id`, keys sorted).
-- **CUTOVER (Commit Point):** Coordinator atomically persists the updated shard map with a bumped `ownership_epoch`. This disk write is the **point of no return**:
+- **CUTOVER (Commit Point):** Coordinator atomically persists the updated shard map with a bumped `ownership_epoch`. `VERIFY` and this write run under both shards' topology locks, after re-checking that neither primary nor term changed. This disk write is the **point of no return**:
   - *Before Cutover:* Any error or failover aborts the migration, safely unpauses the source, and discards destination state.
-  - *After Cutover:* The migration must roll forward. Destination activates ownership; routers refresh.
+  - *After Cutover:* The migration must roll forward. If the map write reports an error, the coordinator re-reads the persisted map and rolls forward whenever the range already moved.
+  - Destination primary **and follower** must both confirm the new ownership; until they do, the migration stays in `CUTOVER` and is retried automatically.
 - **CLEANUP:** Source deletes old copies and drops the range only after cutover is durable.
 
 ### 2. Transparent Cutover & Router Retries
@@ -530,6 +539,9 @@ curl -X GET http://127.0.0.1:8100/admin/migrate/{migration_id} \
 - **Fail-Closed Synchronous Replication & Degraded Mode:** Writes require durable 2-node synchronous quorum (primary and follower WAL fsync). A primary without a configured follower or with an unavailable follower strictly rejects writes with `503 REPLICATION_UNAVAILABLE` before WAL append. Standalone development mode requires explicit opt-in (`STANDALONE_MODE=true` or `allow_standalone=True`) and is clearly separated from replicated production guarantees.
 - **Clock Assumptions:** Elapsed monotonic clock time is used locally for leases; cross-machine clock synchronization is not required.
 - **Single-Writer Shard Model:** One write at a time per shard lock provides serialized writes within each individual shard; cross-shard multi-document transactions are not coordinated.
+- **Coordinator restart with a dead primary:** if the coordinator restarts while a primary is down and its follower had registered with the previous coordinator instance, no automatic failover happens (followers do not re-register). Use `POST /admin/failover/{shard_id}`.
+- **Interrupted migration copies restart from scratch:** copy progress is persisted, but a coordinator restart aborts any migration that has not reached cutover.
+- **Upgrading old data directories:** nodes now verify WAL sequence continuity on startup. `data/` directories written by older builds may contain a WAL gap left by the old snapshot-install path and will refuse to start — delete them (`rm -rf data/`, or remove the Docker volumes) after upgrading. `make clean` does not touch node data.
 
 ---
 

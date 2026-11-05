@@ -30,13 +30,14 @@ Where:
 - $M = 0.1\,\text{s}$: Safety margin added after lease expiration before promoting a follower
 
 ### 2.2 Storage Engine & WAL Framing
-Every storage mutation is written sequentially to a segmented Write-Ahead Log:
+Every storage mutation is appended to the Write-Ahead Log as one newline-terminated JSON record:
 ```
-┌──────────────┬──────────────┬──────────────┬───────────────────────────────┐
-│ Magic (4B)   │ Length (4B)  │ CRC32 (4B)   │ Payload JSON (N Bytes)        │
-└──────────────┴──────────────┴──────────────┴───────────────────────────────┘
+{"seq": 42, "term": 2, "op": "update", "doc_id": 100, "request_id": "...",
+ "payload": {...}, "entry_id": "<sha256 identity>", "crc32": 123456789}\n
 ```
-- **Torn Tail Truncation:** If a process crashes during an fsync, the restart recovery process detects uncompleted trailing frames and truncates back to the last valid CRC32 boundary.
+- **Torn Tail Truncation:** If a process crashes mid-write, recovery detects the incomplete final line and truncates back to the last complete record. A complete record with a bad CRC32 makes the node refuse to start.
+- **Sequence Continuity:** Replay fails closed on duplicate, decreasing or skipped sequence numbers, or a gap between the snapshot and the WAL. After an uncertain fsync failure the WAL refuses further appends until it is reopened and recovered, so a sequence number is never reused.
+- **Snapshots & Compaction:** Periodic snapshots (every 1 000 ops or 60 s) are verified and followed by safe WAL compaction that never removes entries still needed by the follower, uncommitted state, or an active migration.
 - **Idempotency:** Request IDs are cached in a persisted deduplication index mapping `request_id` $\to$ `(seq, outcome, timestamp)`.
 
 ---
@@ -141,7 +142,7 @@ With zero failed operations across all benchmark runs ($\text{error\_rate} = 0.0
 1. **Two-Replica Availability During Primary Outage:**  
    Because synchronous replication requires at least two nodes to acknowledge a write, a shard with one remaining node cannot accept writes. The promoted primary serves reads immediately, but writes are rejected with `503 REPLICATION_UNAVAILABLE` until the old primary rejoins and catches up.
 2. **Centralized Coordinator:**  
-   The Coordinator is currently a single logical node. While durable state is persisted to disk, a failure of the coordinator pauses lease renewals and range migrations until restarted.
+   The Coordinator is currently a single logical node. While durable state is persisted to disk (shard map, terms, failover intents, migration records), a failure of the coordinator pauses lease renewals and range migrations until restarted. In-flight failovers and post-cutover migrations are finished after restart; if the coordinator restarts while a primary is down and its follower had already registered, failover must be triggered manually (`POST /admin/failover/{shard_id}`).
 3. **Monotonic Local Time Assumption:**  
    Leases rely on the monotonic passage of time (`time.monotonic()`) within each machine rather than wall-clock synchronization (NTP). This protects against leap seconds and NTP skew, but relies on predictable CPU scheduling.
 4. **Single-Document Atomicity (No Multi-Document Distributed Transactions):**  
@@ -153,7 +154,7 @@ With zero failed operations across all benchmark runs ($\text{error\_rate} = 0.0
 
 ## 5. Verification Checklist & Gate Certification
 
-- [x] All 253 unit, integration, security, and fault tests passing (252 passed + 1 skipped without Docker; 253 passed with live cluster).
+- [x] All 392 unit, integration, security, and fault tests passing (391 passed + 1 skipped without Docker; 392 passed with live cluster).
 - [x] Static type analysis clean with `mypy --strict`.
 - [x] Zero high/medium security issues detected via `bandit` and `pip-audit`.
 - [x] End-to-end interactive demo (`make demo`) verified.

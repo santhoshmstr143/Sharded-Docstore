@@ -133,6 +133,13 @@ class Document(BaseModel):
         return dict(self.model_extra) if self.model_extra else {}
 
 
+def serialized_doc_size(doc: dict[str, Any]) -> int:
+    """Size in bytes of a document as stored (compact JSON, UTF-8)."""
+    import json
+
+    return len(json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
 class WriteRequest(BaseModel):
     """Payload for a client write sent to the router / shard node."""
 

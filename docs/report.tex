@@ -76,11 +76,8 @@ Each shard consists of an active Primary and a passive Follower:
 \section{Storage Engine \& WAL Protocol}
 
 \subsection{WAL Record Structure}
-Every mutating operation (insert, update, delete) generates a fixed-header WAL frame:
-\begin{align}
-\text{Frame} = [\text{Magic}(4\text{B}) \parallel \text{Length}(4\text{B}) \parallel \text{CRC32}(4\text{B}) \parallel \text{Payload}(N\text{B})]
-\end{align}
-During startup recovery, the WAL scans all records sequentially. If a system crash produces an incomplete trailing write (a torn tail), the recovery procedure detects the invalid CRC32 or truncated header, atomically truncates the corrupt tail at the last valid record boundary, and restores the memory index without manual intervention.
+Every mutating operation (insert, update, delete) is appended as one newline-terminated JSON record carrying $(\text{seq}, \text{term}, \text{op}, \texttt{doc\_id}, \texttt{request\_id}, \text{payload})$, a SHA-256 entry identity, and a CRC32 of the canonical record.
+During startup recovery, the WAL scans all records sequentially. An incomplete trailing line (a torn tail) is truncated at the last complete record; a complete record with a bad CRC32 makes the node refuse to start. Sequence numbers must be strictly consecutive and must continue the latest snapshot without a gap, and after an uncertain fsync failure the WAL refuses further appends until it is recovered, so no sequence number is ever reused. Periodic verified snapshots are followed by safe WAL compaction that never removes entries still needed by the follower, uncommitted state, or an active migration.
 
 \subsection{Idempotent Deduplication}
 To prevent duplicate execution during network retries, the storage engine persists a deduplication table mapping $\texttt{request\_id} \to (\text{seq}, \text{outcome}, \text{timestamp})$. Retried requests reuse the identical cached response without re-executing mutations.
@@ -101,7 +98,7 @@ When a primary fails and the follower is promoted, the shard enters \textbf{Degr
 When a failed primary recovers:
 \begin{enumerate}
     \item It demotes itself to \texttt{FOLLOWER}.
-    \item It requests the new primary's log to determine the highest common $(\text{term}, \text{seq})$ point of divergence.
+    \item It requests the new primary's log to determine the highest contiguous sequence number at which both logs hold the identical entry (compared on full entry identity, not only $(\text{term}, \text{seq})$).
     \item It truncates any uncommitted tail beyond divergence, rebuilds memory state, applies missing oplog entries, marks itself \texttt{SYNCED}, and notifies the coordinator.
     \item Synchronous writes immediately resume.
 \end{enumerate}
@@ -186,7 +183,7 @@ Table~\ref{tab:migration} evaluates live range migration across dataset sizes. W
 
 \section{System Limitations}
 \begin{enumerate}
-    \item \textbf{Single Coordinator:} The coordinator node represents a single point of failure. If the coordinator crashes, existing leases expire and writes halt until it restarts.
+    \item \textbf{Single Coordinator:} The coordinator node represents a single point of failure. If the coordinator crashes, existing leases expire and writes halt until it restarts. Failovers are recorded as durable intents and are finished after a restart.
     \item \textbf{Two-Replica Degraded Mode:} In a two-replica configuration, writes are unavailable after primary failure until the old primary rejoins and catches up. Synchronous replication is deliberately not relaxed to prevent data loss.
     \item \textbf{Monotonic Local Clocks:} Leases rely on elapsed monotonic clock duration. System clock skew does not cause split-brain, but abnormal CPU throttling could delay heartbeat renewals.
 \end{enumerate}

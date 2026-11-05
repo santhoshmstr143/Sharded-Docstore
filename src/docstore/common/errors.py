@@ -119,6 +119,13 @@ class BodyTooLarge(DocstoreError):
     error_code = "BODY_TOO_LARGE"
 
 
+class DocTooLarge(DocstoreError):
+    """A single document's serialized size exceeds MAX_DOC_SIZE_BYTES."""
+
+    http_status = 413
+    error_code = "DOC_TOO_LARGE"
+
+
 class ValidationError(DocstoreError):
     """Pydantic input validation failure (wrong types, missing fields, etc.)."""
 

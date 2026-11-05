@@ -35,12 +35,13 @@ Sharded-Docstore is a distributed, horizontally partitioned document store inspi
 
 ### 1.1 Router (Stateless Gateway)
 - **Role:** Terminates client requests, authenticates `X-Api-Key`, caches the cluster shard map, routes single-document operations directly to the owning shard primary, and coordinates scatter-gather queries across all shards.
-- **Concurrency & Resiliency:** Enforces a maximum concurrent request concurrency limit (`MAX_CONCURRENT_REQUESTS = 1000`) and handles shard map cache invalidation on stale epoch/term signals (`STALE_EPOCH`, `STALE_TERM`, `NOT_PRIMARY`).
+- **Concurrency & Resiliency:** Enforces a maximum concurrent request concurrency limit (`MAX_CONCURRENT_REQUESTS = 1000`) and handles shard map cache invalidation on stale routing signals (`OUT_OF_RANGE`, `STALE_EPOCH`, `NOT_PRIMARY`, `LEASE_EXPIRED`), retrying once with the same `request_id`. Every forwarded write carries the routing entry's `ownership_epoch` as a fencing token. Request bodies are capped at 2 MB even when no `Content-Length` is sent; documents at 1 MB.
 
 ### 1.2 Coordinator (Cluster Topology & Leases)
 - **Role:** Authoritative owner of the persistent cluster shard map, node registrations, and primary leader leases.
 - **Lease Manager:** Grants time-bounded leases (`L = 3.0s`) to shard primaries based on periodic heartbeats (`H = 1.0s`), verified using monotonic local clocks.
 - **Fencing Authority:** Bumps `map_version` on topology changes, increments per-range `ownership_epoch` on repartitioning or failover, and increments per-shard `term` on leader changes.
+- **Crash-safe topology changes:** failovers are recorded as durable intents before the map changes; a per-shard topology lock serialises failover with migration cutover; migrations stuck past cutover are retried by the health monitor.
 
 ### 1.3 Shard Node (Primary & Follower Replicas)
 - **Primary Replica:** Owns read and write operations for assigned key ranges. Enforces lease validity, locks writes per shard, appends to its local WAL, replicates to the follower synchronously, applies to memory upon follower fsync ACK, and tracks follower replication lag.
@@ -117,9 +118,9 @@ Client         Router               Primary                     Follower
 ```
 
 - **Shard-Key Routing Optimization:** Queries with an exact match on `doc_id` (`{"doc_id": {"$eq": 100}}` or `{"doc_id": 100}`) bypass scatter-gather and target only the owning shard.
-- **Fan-Out:** Non-key filter queries fan out in parallel to all active shards.
-- **Push-Down Limits:** Each shard applies local filtering, sorting, and extracts up to `skip + limit` candidate documents.
-- **Router Merge:** Router merges candidate streams using a total order comparator, breaks ties deterministically using `doc_id`, applies global `skip` and `limit`, and returns the final paginated dataset.
+- **Fan-Out:** Non-key filter queries fan out in parallel to all active shards — **one request per shard**, even if the shard owns several disjoint ranges. The request lists the ranges the router's map attributes to that shard; the shard restricts candidates to them before sorting and paginating.
+- **Push-Down Limits:** Each shard applies local filtering, sorting, and extracts up to `skip + limit` candidate documents, and reports its exact match count for those ranges.
+- **Router Merge:** Router merges candidate streams using a total order comparator, breaks ties deterministically using `doc_id`, applies global `skip` and `limit`, and returns the final paginated dataset. `total` is the sum of the shard counts (ranges in the map are disjoint, so nothing is double-counted); `meta` aggregates the shards' metadata.
 
 ---
 
@@ -147,7 +148,7 @@ Primary leases prevent split-brain reads without consensus overhead on every rea
   - $D = 5.0s$ (Failure detection timeout)
   - $M = 0.5s$ (Safety margin)
   - $T = 1.0s$ (Replication timeout)
-- **Monotonic Elapsed-Time Tracking:** Primary and Coordinator compute lease duration using monotonic clocks (`time.monotonic()`), eliminating susceptibility to wall-clock NTP jumps.
+- **Monotonic Elapsed-Time Tracking:** Primary and Coordinator compute lease duration using monotonic clocks (`time.monotonic()`), eliminating susceptibility to wall-clock NTP jumps. The lease length a node derives from a coordinator grant is capped at its own configured $L$, so a coordinator wall-clock jump cannot extend it.
 - **Lease Expiry Rule:** If a primary's remaining lease is less than $T + M = 1.5s$, it halts writes or waits for lease renewal before proceeding.
 
 ### 3.3 Fencing Primitives
@@ -155,6 +156,7 @@ Primary leases prevent split-brain reads without consensus overhead on every rea
 Two distinct fencing primitives protect consistency:
 1. `ownership_epoch`: Scoped per **key range**. Incremented on failover for all ranges owned by the failed shard, or during migration for the specific transferred range. Stale epoch writes are rejected with 409 `STALE_EPOCH`.
 2. `term`: Scoped per **shard**. Incremented strictly on primary change. Follower rejects replication RPCs carrying an older term with `stale_term`.
+3. **Shard identity:** every internal RPC carrying a `shard_id` is rejected with `409 WRONG_SHARD` if it reaches a node of a different shard.
 
 ---
 
@@ -185,18 +187,22 @@ Each shard node maintains an isolated, durable storage engine:
 ```
 
 ### 4.1 Write-Ahead Log (WAL)
-- Format: JSON-lines with length prefix and CRC32 checksum.
-- Every entry encodes: `seq`, `term`, `op`, `doc_id`, `request_id`, `payload`, and `crc32`.
+- Format: newline-terminated JSON lines; each record carries a CRC32 of its canonical JSON.
+- Every entry encodes: `seq`, `term`, `op`, `doc_id`, `request_id`, `payload`, `entry_id` (SHA-256 identity), and `crc32`.
 - Append followed by `os.fsync(fd.fileno())` before returning acknowledgment.
-- Corrupted tail entries (e.g. from power loss during write) are detected via CRC32 mismatch and safely truncated on recovery.
+- A torn tail (incomplete final line) is truncated on recovery; a complete record with a bad CRC32 makes the node refuse to start.
+- Sequence numbers must be strictly consecutive: replay fails closed on duplicates, gaps or a gap between the snapshot and the first retained entry, and `append` rejects any seq other than the next one.
+- After an uncertain write/flush/fsync failure the WAL instance refuses further appends until it is reopened and recovered, so a seq is never reused.
 
 ### 4.2 In-Memory Index & Snapshotting
 - Primary storage index uses `sortedcontainers.SortedDict` keyed on `doc_id` for $O(\log N)$ point lookups and range scans.
-- Snapshots are written periodically (every 1000 operations or 60 seconds) to disk atomically via temp file rename.
+- Snapshots are written periodically (every 1000 operations or 60 seconds, `SNAPSHOT_EVERY_N_OPS` / `SNAPSHOT_EVERY_S`) and on shutdown, atomically via temp file rename + fsync.
 - Snapshot encapsulates: documents, applied sequence number, shard term, range epochs, and the idempotency dedup cache.
+- **Safe WAL compaction** follows each periodic snapshot: the snapshot is read back and verified first; nothing is compacted during a migration write-pause, past `committed_seq`, past what the follower has acknowledged (unless it is more than 50 000 entries behind, in which case it resyncs from a snapshot), or past an active migration's cursor; the most recent 1 000 entries are always kept.
+- Installing a snapshot from the primary resets the local WAL to continue right after it.
 
 ### 4.3 Idempotency Dedup Window
 - Prevents double execution on network retries.
 - Bounded to the last 100,000 requests or 10 minutes (whichever is hit first).
-- Implemented as an `OrderedDict` with FIFO eviction on capacity overflow.
+- Implemented as an insertion-ordered `dict` with FIFO eviction on capacity overflow.
 - Rebuilt from WAL and snapshot state on restart.

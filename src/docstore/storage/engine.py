@@ -116,8 +116,27 @@ class StorageEngine:
         """Return all documents with doc_id in ``[start, end)``, ordered by doc_id."""
         result = []
         for doc_id in self._index.irange(start, end - 1):
-            result.append(dict(self._docs[doc_id]))
+            result.append(copy.deepcopy(self._docs[doc_id]))
         return result
+
+    def range_page(
+        self,
+        start: int,
+        end: int,
+        *,
+        after_doc_id: int | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Deep-copied docs in ``[start, end)`` with doc_id > *after_doc_id*, at most *limit*."""
+        lo = start if after_doc_id is None else max(start, after_doc_id + 1)
+        out: list[dict[str, Any]] = []
+        if lo >= end:
+            return out
+        for doc_id in self._index.irange(lo, end - 1):
+            out.append(copy.deepcopy(self._docs[doc_id]))
+            if len(out) >= limit:
+                break
+        return out
 
     # ── Point-in-time snapshot of a range (for migration) ─────────────────────
 
@@ -127,7 +146,7 @@ class StorageEngine:
         Caller must hold the write lock while calling this method so the
         copy is consistent.
         """
-        return [dict(self._docs[doc_id]) for doc_id in self._index.irange(start, end - 1)]
+        return [copy.deepcopy(self._docs[doc_id]) for doc_id in self._index.irange(start, end - 1)]
 
     # ── Idempotent apply (WAL replay) ─────────────────────────────────────────
 
@@ -150,6 +169,13 @@ class StorageEngine:
         if seq <= self._last_applied_seq:
             # Already applied — idempotent no-op.
             return
+        if self._last_applied_seq > 0 and seq != self._last_applied_seq + 1:
+            # The guard above is a high-water mark: applying N+2 before N+1 would make
+            # N+1 look "already applied" forever and silently lose it. Refuse instead.
+            raise ValueError(
+                f"Out-of-order apply: seq={seq} but last_applied_seq={self._last_applied_seq}; "
+                f"seq {self._last_applied_seq + 1} has not been applied."
+            )
 
         op = entry["op"]
         doc_id: int = entry["doc_id"]
@@ -276,8 +302,8 @@ class StorageEngine:
         return len(self._docs)
 
     def all_docs(self) -> dict[int, dict[str, Any]]:
-        """Return a shallow copy of the full document store (for snapshots)."""
-        return dict(self._docs)
+        """Return a deep copy of the full document store (for snapshots)."""
+        return copy.deepcopy(self._docs)
 
     def validate_doc_id_in_range(self, doc_id: int, start: int, end: int) -> bool:
         """Return True if doc_id is in the half-open range [start, end)."""

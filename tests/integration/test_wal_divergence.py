@@ -1390,16 +1390,18 @@ async def test_wal_truncation_occurs_only_after_durable_snapshot_save(tmp_path: 
             f_state.committed_seq = 2
 
             snapshot_existed_at_truncation = False
-            orig_truncate = f_state.wal.truncate_after
+            # A snapshot install discards the local WAL via reset() (the snapshot supersedes
+            # it); the discard must still happen only after the snapshot is durable.
+            orig_reset = f_state.wal.reset
 
-            def tracking_truncate(seq: int) -> None:
+            def tracking_reset(next_seq: int) -> None:
                 nonlocal snapshot_existed_at_truncation
-                # Check that snapshot.json already exists and is readable when truncate is called
+                # Check that snapshot.json already exists and is readable when the WAL is reset
                 if snap_file.exists() and snap_file.stat().st_size > 0:
                     snapshot_existed_at_truncation = True
-                orig_truncate(seq)
+                orig_reset(next_seq)
 
-            f_state.wal.truncate_after = tracking_truncate  # type: ignore[method-assign]
+            f_state.wal.reset = tracking_reset  # type: ignore[method-assign]
 
             client = AsyncClient(mounts={"http://primary": ASGITransport(app=primary_app)})
             ok = await resync_with_primary(f_state, "primary", http_client=client)

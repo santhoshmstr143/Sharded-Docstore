@@ -99,7 +99,7 @@ $$(term, seq)$$
 - Within any given `term`, `seq` is strictly monotonic and gap-free.
 - When an old primary rejoins after a failover:
   1. It compares its local log against the new primary.
-  2. It finds the **divergence point**: the highest `seq` where both logs have the identical `term`.
+  2. It finds the **divergence point**: the highest contiguous `seq` where both logs hold the identical entry — compared on full identity (term, seq, op, doc_id, request_id, payload), not on `term` alone.
   3. It **truncates any uncommitted tail** beyond this divergence point.
   4. It catches up missing entries from the new primary's log.
 

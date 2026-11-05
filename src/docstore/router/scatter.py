@@ -4,9 +4,12 @@ Router scatter-gather query execution — Module 5.3.
 Responsibilities:
 - Inspect filter for doc_id constraints (exact, $in, range, all)
 - Route to minimal required shards (1 shard for exact doc_id; overlapping shards for range/$in)
+- Query each shard ONCE (even if it owns several disjoint ranges), passing the ranges
+  the map attributes to it so the shard restricts *before* sorting and paginating
 - Query shards concurrently with local skip=0 and local limit = skip + limit
 - Enforce partial-failure policy: whole query fails if any required shard fails or times out
-- Filter out documents outside the responding shard's range
+- Filter out documents outside the ranges attributed to the responding shard
+- Report the exact cluster-wide match count and aggregated response metadata
 - Merge sorted streams using the total order comparator and doc_id tie-breaker
 - Deduplicate by doc_id and apply global skip and limit
 """
@@ -29,6 +32,7 @@ from docstore.common.models import (
     QUERY_LIMIT_MAX,
     QueryFilter,
     QueryResponse,
+    ResponseMeta,
     ShardMapEntry,
 )
 from docstore.query.evaluator import is_number
@@ -120,15 +124,49 @@ def resolve_target_shards(
     return [(entry, filter_dict) for entry in map_mgr.shard_map.entries]
 
 
+class _ShardTarget:
+    """One shard to query: its addresses, every range the map gives it, and its filter."""
+
+    def __init__(self, entry: ShardMapEntry, filter_dict: dict[str, Any]) -> None:
+        self.entry = entry
+        self.filter = filter_dict
+        self.ranges: list[tuple[int, int]] = [(entry.range.start, entry.range.end)]
+
+    def owns(self, did: int) -> bool:
+        return any(s <= did < e for s, e in self.ranges)
+
+
+def group_targets_by_shard(
+    targets: list[tuple[ShardMapEntry, dict[str, Any]]],
+) -> list[_ShardTarget]:
+    """Collapse map entries of the same shard into a single query target."""
+    grouped: dict[str, _ShardTarget] = {}
+    for entry, f in targets:
+        t = grouped.get(entry.shard_id)
+        if t is None:
+            grouped[entry.shard_id] = _ShardTarget(entry, f)
+        else:
+            t.ranges.append((entry.range.start, entry.range.end))
+    for t in grouped.values():
+        t.ranges.sort()
+    return list(grouped.values())
+
+
 async def _query_single_shard(
     client: httpx.AsyncClient,
-    entry: ShardMapEntry,
+    target_info: _ShardTarget,
     payload: dict[str, Any],
     cluster_secret: str,
     timeout_s: float,
     needed_candidates: int,
-) -> list[dict[str, Any]]:
-    """Send query to a single shard with internal chunking up to needed_candidates."""
+) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
+    """Query one shard (restricted to its attributed ranges) up to needed_candidates.
+
+    Returns (candidate docs in shard sort order, shard-wide match total, shard meta).
+    """
+    entry = target_info.entry
+    payload = dict(payload)
+    payload["ranges"] = [list(r) for r in target_info.ranges]
     target = entry.primary
     if payload.get("read_mode") == "follower" and entry.follower:
         target = entry.follower
@@ -138,6 +176,8 @@ async def _query_single_shard(
 
     collected_docs: list[dict[str, Any]] = []
     current_skip = 0
+    shard_total: int | None = None
+    shard_meta: dict[str, Any] | None = None
 
     while len(collected_docs) < needed_candidates:
         chunk_limit = min(needed_candidates - len(collected_docs), QUERY_LIMIT_MAX)
@@ -186,23 +226,27 @@ async def _query_single_shard(
             )
 
         data = resp.json()
+        if shard_total is None:
+            raw_total = data.get("total")
+            shard_total = raw_total if isinstance(raw_total, int) else 0
+            meta = data.get("meta")
+            shard_meta = meta if isinstance(meta, dict) else None
         docs = data.get("documents", [])
         if not docs:
             break
 
-        # Filter out any document outside the responding shard's range
+        # Filter out any document outside the ranges the map attributes to this shard
         for doc in docs:
             if isinstance(doc, dict) and "doc_id" in doc and is_number(doc["doc_id"]):
                 did = int(doc["doc_id"])
-                if entry.range.start <= did < entry.range.end:
+                if target_info.owns(did):
                     collected_docs.append(doc)
                 else:
                     logger.warning(
-                        "Dropping out-of-range document %d returned by shard %s [%d, %d)",
+                        "Dropping out-of-range document %d returned by shard %s %s",
                         did,
                         entry.shard_id,
-                        entry.range.start,
-                        entry.range.end,
+                        target_info.ranges,
                     )
 
         current_skip += len(docs)
@@ -210,7 +254,33 @@ async def _query_single_shard(
             # Shard has returned all matching documents
             break
 
-    return collected_docs
+    return collected_docs, shard_total or 0, shard_meta
+
+
+def _aggregate_meta(metas: list[dict[str, Any] | None]) -> ResponseMeta | None:
+    """Cluster-level metadata: one shard -> its meta; several -> a conservative summary
+    (highest term/epoch seen, lowest applied_seq, worst replication lag)."""
+    parsed: list[ResponseMeta] = []
+    for m in metas:
+        if m is None:
+            continue
+        try:
+            parsed.append(ResponseMeta.model_validate(m))
+        except Exception as exc:
+            logger.debug("Ignoring malformed shard meta %r: %s", m, exc)
+    if not parsed:
+        return None
+    if len(parsed) == 1:
+        return parsed[0]
+    served = {m.served_by for m in parsed}
+    lags = [m.replication_lag for m in parsed if m.replication_lag is not None]
+    return ResponseMeta(
+        served_by=served.pop() if len(served) == 1 else "mixed",
+        term=max(m.term for m in parsed),
+        ownership_epoch=max(m.ownership_epoch for m in parsed),
+        applied_seq=min(m.applied_seq for m in parsed),
+        replication_lag=max(lags) if lags else None,
+    )
 
 
 async def execute_scatter_query(
@@ -232,14 +302,14 @@ async def execute_scatter_query(
     failed_shard_desc: str = "unknown"
 
     for attempt in range(2):
-        targets = resolve_target_shards(map_mgr, query.filter)
+        targets = group_targets_by_shard(resolve_target_shards(map_mgr, query.filter))
         if not targets:
             return QueryResponse(documents=[], total=0)
 
         tasks = []
-        for entry, target_filter in targets:
+        for tgt in targets:
             shard_payload = {
-                "filter": target_filter,
+                "filter": tgt.filter,
                 "sort_field": query.sort_field,
                 "sort_dir": query.sort_dir,
                 "read_mode": query.read_mode.value,
@@ -247,7 +317,7 @@ async def execute_scatter_query(
             tasks.append(
                 _query_single_shard(
                     http_client,
-                    entry,
+                    tgt,
                     shard_payload,
                     settings.CLUSTER_SECRET,
                     timeout_s,
@@ -259,14 +329,21 @@ async def execute_scatter_query(
 
         failed_entry: ShardMapEntry | None = None
         shard_lists: list[list[dict[str, Any]]] = []
+        total = 0
+        metas: list[dict[str, Any] | None] = []
 
-        for (entry, _), res in zip(targets, results, strict=False):
+        for tgt, res in zip(targets, results, strict=False):
+            entry = tgt.entry
             if isinstance(res, BaseException):
                 failed_entry = entry
                 last_error = res if isinstance(res, Exception) else RuntimeError(str(res))
                 failed_shard_desc = f"{entry.shard_id} ({entry.primary})"
                 break
-            shard_lists.append(res)
+            docs, shard_total, shard_meta = res
+            shard_lists.append(docs)
+            # Each shard counted only its attributed (map-disjoint) ranges: exact sum.
+            total += shard_total
+            metas.append(shard_meta)
 
         if failed_entry is not None:
             if attempt == 0:
@@ -306,7 +383,11 @@ async def execute_scatter_query(
 
         # Global pagination: apply skip then limit
         paginated = deduped[query.skip : query.skip + query.limit]
-        return QueryResponse(documents=paginated, total=len(paginated))
+        return QueryResponse(
+            documents=paginated,
+            total=max(total, len(deduped)),
+            meta=_aggregate_meta(metas),
+        )
 
     raise HTTPException(
         status_code=503,

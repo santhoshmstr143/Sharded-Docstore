@@ -62,12 +62,21 @@ def build_coordinator_app(
 
         # H5 / Module 8: Background health monitor — checks for timed-out nodes and auto-failovers.
         async def _health_monitor() -> None:
+            ticks = 0
             while True:
                 await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S)
+                ticks += 1
                 try:
                     await svc.check_and_trigger_failover()
                 except Exception as exc:
                     logger.warning("Health monitor failover check error: %s", exc)
+                # Drive migrations stuck past cutover (e.g. destination follower was
+                # down) to completion, without waiting for a coordinator restart.
+                if ticks % 5 == 0:
+                    try:
+                        await svc.migration_mgr.retry_post_cutover(svc)
+                    except Exception as exc:
+                        logger.warning("Post-cutover migration retry error: %s", exc)
 
         monitor_task = asyncio.create_task(_health_monitor())
 

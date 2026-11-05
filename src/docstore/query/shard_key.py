@@ -31,7 +31,13 @@ class ShardKeyConstraint:
 
 
 def _finite(x: Any) -> bool:
-    return is_number(x) and math.isfinite(x)
+    """True for usable numeric bounds. Python ints are always finite (and may be far
+    too large for ``math.isfinite``, which converts to float and overflows)."""
+    if not is_number(x):
+        return False
+    if isinstance(x, int):
+        return True
+    return math.isfinite(x)
 
 
 def detect_shard_key_constraint(filter_dict: dict[str, Any]) -> ShardKeyConstraint:

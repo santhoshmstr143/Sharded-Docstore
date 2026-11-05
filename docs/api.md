@@ -55,11 +55,14 @@ Errors return JSON and **never expose stack traces**:
 | `NOT_FOUND` | 404 | Document with specified `doc_id` does not exist |
 | `OUT_OF_RANGE` | 400 | `doc_id` outside the key range owned by this shard |
 | `INVALID_QUERY` | 400 | Query filter exceeds depth, size, or violates grammar |
-| `BODY_TOO_LARGE` | 413 | Request body exceeds 2 MB or document exceeds 1 MB |
+| `BODY_TOO_LARGE` | 413 | Request body exceeds 2 MB (enforced even when no `Content-Length` is sent) |
+| `DOC_TOO_LARGE` | 413 | A single document's serialized JSON exceeds 1 MB |
+| `LENGTH_REQUIRED` | 411 | Chunked (`Transfer-Encoding`) request bodies are not accepted |
 | `VALIDATION_ERROR` | 422 | Pydantic payload schema validation failure |
 | `DUPLICATE_KEY` | 409 | Document with specified `doc_id` already exists |
-| `STALE_EPOCH` | 409 | Request ownership epoch does not match node's current epoch |
-| `STALE_TERM` | 409 | Request term is behind node's current term |
+| `STALE_EPOCH` | 409 | Write was routed with an `ownership_epoch` older than the shard's epoch for that range |
+| `STALE_TERM` | 409 | Request `term` differs from the node's current term (stale leader or stale client) |
+| `WRONG_SHARD` | 409 | Internal RPC carried a `shard_id` that does not match the receiving node |
 | `NOT_PRIMARY` | 409 | Write or primary read routed to non-primary replica |
 | `LEASE_EXPIRED` | 409 | Primary lease expired; cannot serve writes or fresh reads |
 | `OUTCOME_UNKNOWN` | 202 | Write appended to primary WAL, but follower ACK not received in time |
@@ -68,6 +71,18 @@ Errors return JSON and **never expose stack traces**:
 | `SHARD_UNAVAILABLE` | 503 | Target shard primary is down or unreachable |
 | `SERVER_BUSY` | 503 | Router reached maximum concurrent request capacity |
 | `ROUTING_FAILED` | 500 | Router exceeded retry limit during map recovery |
+
+#### Router retries and write fencing
+
+- The router reloads its shard map and retries **once** on `OUT_OF_RANGE`, `STALE_EPOCH`,
+  `NOT_PRIMARY` and `LEASE_EXPIRED` (the last after a 100 ms pause, giving the coordinator
+  time to renew the lease or fail over). `RANGE_PAUSED` is retried with bounded backoff.
+- Every retry reuses the **same `request_id`**, so a write that already committed is
+  answered from the shard's dedup table instead of executing twice.
+- Every forwarded write carries the `ownership_epoch` of the map entry it was routed by.
+  The primary rejects it with `STALE_EPOCH` if it holds a newer epoch for that range.
+  Clients may additionally pin a shard `term` in write bodies; the primary rejects it with
+  `STALE_TERM` if its own term differs.
 
 ---
 
@@ -222,6 +237,14 @@ Executes MongoDB-inspired filter queries with scatter-gather parallel execution 
   }
   ```
 - **Response (200 OK):**
+  - `total` is the number of documents matching the filter **across the whole cluster**,
+    not the size of the returned page.
+  - The router sends **one request per shard**, even when a shard owns several disjoint
+    ranges, and passes the ranges it attributes to that shard so the shard restricts
+    candidates before sorting and paginating.
+  - `meta` is the shard's own metadata for single-shard queries. For multi-shard queries it
+    is a conservative summary: highest `term` / `ownership_epoch`, lowest `applied_seq`,
+    worst `replication_lag`; `served_by` is `"mixed"` if shards answered in different roles.
   ```json
   {
     "documents": [
@@ -319,6 +342,51 @@ Follower requests missing entries after restart or network blip.
 
 - `GET /internal/snapshot`: Exports full point-in-time state of the primary (documents, term, epoch, applied seq, dedup table).
 - `POST /internal/snapshot/apply`: Follower applies snapshot atomically when WAL compaction prevents incremental catchup.
+  The snapshot is persisted first; only then is the local WAL **reset** to continue at
+  `last_applied_seq + 1`, so the retained WAL never has a gap in front of new entries.
+
+All internal RPCs that carry a `shard_id` (replicate, catchup, check-op, divergence,
+rejoin/complete, snapshot/apply, fence, promote) reject a mismatching one with
+`409 WRONG_SHARD`.
+
+### 4.4 Promote Follower (`POST /internal/promote`)
+
+Sent by the coordinator during failover. Body is strictly validated:
+
+```json
+{
+  "shard_id": "shard0",
+  "term": 2,
+  "ownership_epochs": { "0-3074457345618258602": 2 },
+  "ranges": [ { "start": 0, "end": 3074457345618258602, "ownership_epoch": 2 } ],
+  "lease": { "granted_at": 1700000000.0, "expires_at": 1700000003.0, "...": "..." },
+  "follower_url": "127.0.0.1:8200"
+}
+```
+
+- `term` lower than the node's term → `409 STALE_TERM`.
+- `ranges` (sent by the coordinator, authoritative from the shard map) replace the node's
+  ranges; an epoch lower than the node's own for the same range → `409 STALE_EPOCH`.
+  Without `ranges`, `ownership_epochs` must name exactly the node's ranges
+  (`409 RANGE_MISMATCH` otherwise).
+- The new term, role and ranges are **persisted before** the node starts acting as
+  primary; a persistence failure returns 500 and leaves the node a follower.
+- Repeating a promotion that already took effect (same term) only refreshes the lease.
+- The lease length is `expires_at − granted_at`, capped at the node's own `LEASE_DURATION_S`.
+
+### 4.5 Migration RPCs (`/internal/migration/*`)
+
+- `POST /internal/migration/snapshot` — `{"start", "end", "after_doc_id", "limit", "max_bytes"}`.
+  Cursor-paginated range copy; returns `documents`, `snapshot_seq`, `next_after_doc_id`, `done`.
+  Omitting `limit` returns the whole range in one response (legacy). Serving a page pins
+  the source WAL after `snapshot_seq` so compaction cannot remove entries the migration's
+  catch-up still needs (the hold expires after 5 minutes without activity).
+- `POST /internal/migration/apply-batch`, `/apply-oplog` — idempotent: a retried batch
+  is detected by its deterministic per-document request id and is not re-appended
+  (`skipped` in the response). Rejected with 503 while the destination has unresolved
+  pending writes.
+- `POST /internal/migration/cutover`, `/cleanup`, `/ranges/remove` — range ownership
+  changes are persisted to `node_metadata.json` **before** they take effect.
 
 ---
 

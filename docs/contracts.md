@@ -50,8 +50,14 @@
   - `term` — per **shard**; bumped on every primary change; carried in every WAL record
     and replication message.
 - Nodes persist their current `term` and per-range epochs durably (fsync) so a restart
-  cannot forget them.
-- Writes carrying a stale `ownership_epoch` or `term` are **rejected**.
+  cannot forget them. A node that owns **no** ranges (all migrated away) persists that
+  explicitly; it never falls back to a default range on restart.
+- Writes carrying a stale `ownership_epoch` or `term` are **rejected**. The router attaches
+  the `ownership_epoch` of the map entry it routed by to every write.
+- **WAL continuity:** sequence numbers in the WAL are strictly consecutive. Recovery fails
+  closed on a duplicate, decreasing or skipped seq, or if the retained WAL does not continue
+  the snapshot. After an uncertain write/fsync failure the WAL refuses further appends until
+  the node reopens it and recovers, so a seq can never be reused.
 
 ---
 
@@ -149,7 +155,11 @@ Synchronous replication is **never** relaxed (no single-node acknowledgements).
   Never return `COMMITTED` after lease expiry.
 - Coordinator waits for the old lease to expire **plus M** before the new primary may write.
 - A restarted node must register and obtain a fresh lease; it never resumes as primary
-  from its old state.
+  from its old state. A node that recovers from disk registers as a follower; if it was the
+  primary in the shard map, the coordinator promotes the current follower instead.
+- Lease length taken from a coordinator grant is `expires_at − granted_at` **capped at the
+  node's own `L`**, and is added to the node's own monotonic clock.
+- A primary steps down on a heartbeat reply only when it is `409 STALE_TERM`.
 - Clock assumption: **monotonic clocks for elapsed time only**; single-host Docker Compose;
   no cross-machine clock comparison.
 
@@ -167,7 +177,11 @@ Synchronous replication is **never** relaxed (no single-node acknowledgements).
 | Max filter depth | 5 |
 | Max filter clauses | 50 |
 | Max `$in` size | 1 000 |
-| Snapshot interval | every 1 000 ops or 60 s |
+| Snapshot interval | every 1 000 ops or 60 s (`SNAPSHOT_EVERY_N_OPS`, `SNAPSHOT_EVERY_S`) |
+| WAL entries always retained after compaction | 1 000 |
+| WAL retention cap for a lagging follower | 50 000 entries (beyond it: snapshot resync) |
+| Migration snapshot page | 500 documents (also bounded by bytes) |
+| Migration RPC batch | ≤ 200 items and ≤ max body size − 64 KB |
 | Dedup table max entries | 100 000 |
 | Dedup TTL | 10 minutes |
 | Max concurrent router requests | 1 000 |
@@ -199,7 +213,10 @@ All errors return JSON: `{"error_code": "<CODE>", "error_message": "<human text>
 | `SERVER_BUSY` | 503 | Router reached maximum concurrent request capacity |
 | `ROUTING_FAILED` | 500 | Router exceeded retry limit during map recovery |
 | `AUTH_FAILED` | 401 | Invalid cluster secret, admin token, or client API key |
-| `BODY_TOO_LARGE` | 413 | Request body or document exceeds size limit |
+| `BODY_TOO_LARGE` | 413 | Request body exceeds 2 MB (also enforced without `Content-Length`) |
+| `DOC_TOO_LARGE` | 413 | A single document exceeds 1 MB serialized |
+| `LENGTH_REQUIRED` | 411 | Chunked request bodies are not accepted |
+| `WRONG_SHARD` | 409 | Internal RPC addressed to a different shard |
 | `VALIDATION_ERROR` | 422 | Pydantic input validation failure |
 
 ### Authentication
@@ -265,7 +282,8 @@ Every response includes standard metadata (`ResponseMeta`):
   }
   ```
 
-- **QueryResponse (`POST /query`):**
+- **QueryResponse (`POST /query`):** `total` counts every match across the cluster (not the
+  page size); for multi-shard queries `meta` is an aggregate (see `docs/api.md` §3.5).
   ```json
   {
     "documents": [

@@ -43,6 +43,7 @@ from docstore.common.models import (
     ShardRange,
 )
 from docstore.router.shard_map import ShardMapManager, create_default_3_shard_map
+from docstore.storage.wal import _fsync_dir as _wal_fsync_dir
 
 logger = get_logger(__name__)
 
@@ -57,18 +58,8 @@ def normalize_url(url: str | None) -> str:
 
 
 def _fsync_dir(dir_path: Path) -> None:
-    """Flush directory metadata to disk."""
-    try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            flags |= os.O_DIRECTORY
-        fd = os.open(str(dir_path), flags)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+    """Flush directory metadata to disk; genuine failures propagate (see wal._fsync_dir)."""
+    _wal_fsync_dir(dir_path)
 
 
 class _DurableShardTerms(dict[str, int]):
@@ -166,8 +157,13 @@ class CoordinatorService:
         self.replica_states: dict[str, ReplicaState] = {}  # shard_id -> ReplicaState
         self.failover_metrics: list[dict[str, Any]] = []
         self.failover_in_progress: set[str] = set()
-        # shard_id -> (follower_addr, promote_body): promotions the follower never confirmed
-        self._unconfirmed_promotions: dict[str, tuple[str, dict[str, Any]]] = {}
+        # shard_id -> (new_primary_addr, old_primary_addr): promotions whose shard-map
+        # change is committed but which the follower never confirmed. Backed by the
+        # durable failover-intent file so a coordinator restart can finish them.
+        self._unconfirmed_promotions: dict[str, tuple[str, str | None]] = {}
+        # Per-shard topology lock: failover and migration cutover never interleave.
+        self._topology_locks: dict[str, asyncio.Lock] = {}
+        self._last_headless_attempt: dict[str, float] = {}
         self._started_at_monotonic: float = time.monotonic()
         self._recovery_quarantine_until_monotonic: float = (
             self._started_at_monotonic + settings.LEASE_DURATION_S + settings.SAFETY_MARGIN_S
@@ -194,6 +190,149 @@ class CoordinatorService:
         # Ensure terms are persisted if file did not exist or new shards were added
         if not self.terms_path.exists() or len(recovered_terms) != len(self.shard_terms):
             self._persist_terms()
+
+        self.intents_path = target_path.parent / "failover_intents.json"
+        self._failover_intents: dict[str, dict[str, Any]] = self._load_intents()
+        self._recover_failover_intents()
+
+    # ── Durable failover intents (BUG 2) ──────────────────────────────────────
+
+    def _load_intents(self) -> dict[str, dict[str, Any]]:
+        if not self.intents_path.exists():
+            return {}
+        try:
+            data = json.loads(self.intents_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Corrupt failover intent file {self.intents_path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"Corrupt failover intent file {self.intents_path}")
+        return data
+
+    def _persist_intents(self) -> None:
+        self.intents_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.intents_path.parent / f".tmp.{uuid.uuid4().hex}.failover_intents.json"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._failover_intents, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.intents_path)
+            _fsync_dir(self.intents_path.parent)
+        except Exception:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+            raise
+
+    def _set_intent(self, shard_id: str, intent: dict[str, Any] | None) -> None:
+        old = self._failover_intents.get(shard_id)
+        if intent is None:
+            self._failover_intents.pop(shard_id, None)
+        else:
+            self._failover_intents[shard_id] = intent
+        try:
+            self._persist_intents()
+        except Exception:
+            if old is None:
+                self._failover_intents.pop(shard_id, None)
+            else:
+                self._failover_intents[shard_id] = old
+            raise
+
+    def _map_names_primary(self, shard_id: str, addr: str) -> bool:
+        return any(
+            e.shard_id == shard_id and normalize_url(e.primary) == normalize_url(addr)
+            for e in self.map_mgr.shard_map.entries
+        )
+
+    def _recover_failover_intents(self) -> None:
+        """Finish or discard failovers that were in flight when the coordinator stopped."""
+        for shard_id, intent in list(self._failover_intents.items()):
+            new_primary = intent.get("new_primary")
+            old_primary = intent.get("old_primary")
+            target_term = int(intent.get("target_term", 0))
+            if (
+                isinstance(new_primary, str)
+                and self._map_names_primary(shard_id, new_primary)
+                and self.shard_terms.get(shard_id, 1) >= target_term
+            ):
+                # Map already names the new primary: the promotion MUST be completed.
+                logger.warning(
+                    "Recovered unfinished failover of shard %s: promotion of %s pending",
+                    shard_id,
+                    new_primary,
+                )
+                self._unconfirmed_promotions[shard_id] = (
+                    new_primary,
+                    old_primary if isinstance(old_primary, str) else None,
+                )
+            else:
+                # The map never changed: nothing to finish. Failure detection re-triggers
+                # failover if the primary is still gone (a bumped term just fences it).
+                logger.warning(
+                    "Discarding failover intent for shard %s: map change was never committed",
+                    shard_id,
+                )
+                self._set_intent(shard_id, None)
+
+    def topology_lock(self, shard_id: str) -> asyncio.Lock:
+        lock = self._topology_locks.get(shard_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._topology_locks[shard_id] = lock
+        return lock
+
+    def _build_promote_body(
+        self, shard_id: str, new_primary: str, old_primary: str | None
+    ) -> dict[str, Any]:
+        """Promotion request from the CURRENT map/term, with a freshly granted lease."""
+        entries = [e for e in self.map_mgr.shard_map.entries if e.shard_id == shard_id]
+        term = self.shard_terms.get(shard_id, 1)
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        promoted_node_id = f"{shard_id}-promoted"
+        for n in self.nodes.values():
+            if n.shard_id == shard_id and normalize_url(n.address) == normalize_url(new_primary):
+                promoted_node_id = n.node_id
+                n.role = NodeRole.PRIMARY
+                n.term = term
+                n.last_seen_monotonic = now_mono
+            elif (
+                old_primary
+                and n.shard_id == shard_id
+                and normalize_url(n.address) == normalize_url(old_primary)
+            ):
+                n.role = NodeRole.FOLLOWER
+        lease = LeaseGrant(
+            node_id=promoted_node_id,
+            shard_id=shard_id,
+            term=term,
+            granted_at=now_wall,
+            expires_at=now_wall + self.settings.LEASE_DURATION_S,
+            map_version=self.map_mgr.shard_map.map_version,
+        )
+        self.leases[shard_id] = ActiveLease(
+            node_id=promoted_node_id,
+            shard_id=shard_id,
+            term=term,
+            granted_at_wall=now_wall,
+            expires_at_wall=lease.expires_at,
+            expires_at_monotonic=now_mono + self.settings.LEASE_DURATION_S,
+        )
+        return {
+            "shard_id": shard_id,
+            "term": term,
+            "ownership_epochs": {
+                f"{e.range.start}-{e.range.end}": e.ownership_epoch for e in entries
+            },
+            # Authoritative ownership from the map: a follower that missed a migration
+            # cutover notification still gets the right ranges on promotion.
+            "ranges": [
+                {"start": e.range.start, "end": e.range.end, "ownership_epoch": e.ownership_epoch}
+                for e in sorted(entries, key=lambda e: e.range.start)
+            ],
+            "lease": lease.model_dump(),
+            "follower_url": old_primary,
+        }
 
     def _load_terms(self, path: Path) -> dict[str, int]:
         """Load and strictly validate shard terms metadata from disk.
@@ -339,7 +478,6 @@ class CoordinatorService:
 
         self.failover_in_progress.add(shard_id)
         try:
-            now_mono = time.monotonic()
             now_wall = time.time()
             detected_at = now_wall
 
@@ -390,78 +528,63 @@ class CoordinatorService:
                 logger.info("Safety wait for old primary lease expiry + M: %.2fs", wait_s)
                 await asyncio.sleep(wait_s)
 
-            # Step 5 & 6: Bump term, range epochs, and persist shard map
-            new_term = self.bump_shard_failover(
-                shard_id,
-                new_primary_url=follower_addr,
-                new_follower_url=primary_addr,
-            )
-            promoted_map = self.map_mgr.shard_map
-            promoted_entries = [e for e in promoted_map.entries if e.shard_id == shard_id]
-            epochs_dict = {
-                f"{e.range.start}-{e.range.end}": e.ownership_epoch for e in promoted_entries
-            }
+            async with self.topology_lock(shard_id):
+                # Re-validate under the lock: a concurrent topology change (e.g. a
+                # registration-driven address change) invalidates this failover.
+                if not self._map_names_primary(shard_id, primary_addr):
+                    logger.warning(
+                        "Failover for shard %s aborted: primary changed to another node", shard_id
+                    )
+                    return False
 
-            # Step 7: Grant new lease to promoted follower
-            now_mono = time.monotonic()
-            now_wall = time.time()
-            expires_wall = now_wall + self.settings.LEASE_DURATION_S
-            expires_mono = now_mono + self.settings.LEASE_DURATION_S
-
-            promoted_node_id = f"{shard_id}-promoted"
-            for n in self.nodes.values():
-                if n.address == follower_addr and n.shard_id == shard_id:
-                    promoted_node_id = n.node_id
-                    n.role = NodeRole.PRIMARY
-                    n.term = new_term
-                    n.last_seen_monotonic = now_mono
-                elif n.address == primary_addr and n.shard_id == shard_id:
-                    n.role = NodeRole.FOLLOWER
-
-            lease_grant = LeaseGrant(
-                node_id=promoted_node_id,
-                shard_id=shard_id,
-                term=new_term,
-                granted_at=now_wall,
-                expires_at=expires_wall,
-                map_version=promoted_map.map_version,
-            )
-            self.leases[shard_id] = ActiveLease(
-                node_id=promoted_node_id,
-                shard_id=shard_id,
-                term=new_term,
-                granted_at_wall=now_wall,
-                expires_at_wall=expires_wall,
-                expires_at_monotonic=expires_mono,
-            )
-
-            # Step 8: Promote the follower via /internal/promote
-            promote_client = http_client
-            owns_promote_client = False
-            if promote_client is None:
-                promote_client = httpx.AsyncClient(
-                    timeout=self.settings.REPLICATION_TIMEOUT_S + 2.0
+                # Step 5 & 6: durable intent FIRST, then bump term/epochs and persist map.
+                # A crash anywhere after this point is finished (or discarded) on restart.
+                self._set_intent(
+                    shard_id,
+                    {
+                        "new_primary": follower_addr,
+                        "old_primary": primary_addr,
+                        "target_term": self.shard_terms.get(shard_id, 1) + 1,
+                        "created_at": time.time(),
+                    },
                 )
-                owns_promote_client = True
+                try:
+                    new_term = self.bump_shard_failover(
+                        shard_id,
+                        new_primary_url=follower_addr,
+                        new_follower_url=primary_addr,
+                    )
+                except Exception:
+                    # The bump failed before or during the map write. If the map did not
+                    # change, drop the intent; otherwise it stays for recovery.
+                    if not self._map_names_primary(shard_id, follower_addr):
+                        self._set_intent(shard_id, None)
+                    raise
+                promoted_map = self.map_mgr.shard_map
 
-            req_body = {
-                "shard_id": shard_id,
-                "term": new_term,
-                "ownership_epochs": epochs_dict,
-                "lease": lease_grant.model_dump(),
-                "follower_url": primary_addr,
-            }
-            promoted_ok = await self._send_promote(
-                promote_client, follower_addr, req_body, attempts=3
-            )
-            if owns_promote_client:
-                await promote_client.aclose()
-            if not promoted_ok:
-                # The map already names the follower as primary. Remember the promotion and
-                # keep retrying from the health monitor instead of leaving the shard headless.
-                self._unconfirmed_promotions[shard_id] = (follower_addr, req_body)
-                logger.error("Promotion of %s not confirmed; will keep retrying", follower_addr)
-                return False
+                # Step 7 & 8: grant a fresh lease and promote the follower.
+                promote_client = http_client
+                owns_promote_client = False
+                if promote_client is None:
+                    promote_client = httpx.AsyncClient(
+                        timeout=self.settings.REPLICATION_TIMEOUT_S + 2.0
+                    )
+                    owns_promote_client = True
+                req_body = self._build_promote_body(shard_id, follower_addr, primary_addr)
+                try:
+                    promoted_ok = await self._send_promote(
+                        promote_client, follower_addr, req_body, attempts=3
+                    )
+                finally:
+                    if owns_promote_client:
+                        await promote_client.aclose()
+                if not promoted_ok:
+                    # The map already names the follower as primary. Keep retrying from
+                    # the health monitor (and after restarts, via the durable intent).
+                    self._unconfirmed_promotions[shard_id] = (follower_addr, primary_addr)
+                    logger.error("Promotion of %s not confirmed; will keep retrying", follower_addr)
+                    return False
+                self._set_intent(shard_id, None)
 
             # Step 9: Set replica state to DOWN (Degraded mode)
             self.replica_states[shard_id] = ReplicaState.DOWN
@@ -528,14 +651,24 @@ class CoordinatorService:
         return False
 
     async def _retry_unconfirmed_promotions(self, http_client: httpx.AsyncClient | None) -> None:
-        for shard_id, (addr, body) in list(self._unconfirmed_promotions.items()):
+        for shard_id, (addr, old_primary) in list(self._unconfirmed_promotions.items()):
             if shard_id in self.failover_in_progress:
+                continue
+            if shard_id not in self.leases and time.monotonic() < (
+                self._recovery_quarantine_until_monotonic
+            ):
+                # After a coordinator restart an old lease may still be live somewhere:
+                # never hand out primary authority before the quarantine elapses.
                 continue
             client = http_client or httpx.AsyncClient(
                 timeout=self.settings.REPLICATION_TIMEOUT_S + 2.0
             )
             try:
-                ok = await self._send_promote(client, addr, body)
+                async with self.topology_lock(shard_id):
+                    body = self._build_promote_body(shard_id, addr, old_primary)
+                    ok = await self._send_promote(client, addr, body)
+                    if ok:
+                        self._set_intent(shard_id, None)
             finally:
                 if http_client is None:
                     await client.aclose()
@@ -554,8 +687,12 @@ class CoordinatorService:
         now_mono = time.monotonic()
         promoted: list[str] = []
 
+        seen: set[str] = set()
         for entry in self.map_mgr.shard_map.entries:
             shard_id = entry.shard_id
+            if shard_id in seen:
+                continue  # a shard owning several ranges is checked once
+            seen.add(shard_id)
             if shard_id in self.failover_in_progress or shard_id in self._unconfirmed_promotions:
                 continue
 
@@ -564,6 +701,42 @@ class CoordinatorService:
                 if n.shard_id == shard_id and n.role == NodeRole.PRIMARY:
                     primary_node = n
                     break
+
+            if primary_node is None and entry.follower:
+                # Headless shard: no node holds primary authority, and we have positive
+                # evidence of it (never act merely because nobody registered at all):
+                #  * the incumbent restarted and re-registered as a follower (nodes that
+                #    recover from disk never resume authority on their own), or
+                #  * another node of this shard is registered and alive, yet no primary
+                #    has registered within D of coordinator start.
+                # Promote the follower; the restarted node rejoins it via resync.
+                shard_nodes = [n for n in self.nodes.values() if n.shard_id == shard_id]
+                incumbent_demoted = any(
+                    n.role == NodeRole.FOLLOWER
+                    and normalize_url(n.address) == normalize_url(entry.primary)
+                    for n in shard_nodes
+                )
+                peer_alive_without_primary = now_mono - self._started_at_monotonic >= (
+                    self.settings.FAILURE_TIMEOUT_S
+                ) and any(
+                    now_mono - n.last_seen_monotonic < self.settings.FAILURE_TIMEOUT_S
+                    for n in shard_nodes
+                )
+                last = self._last_headless_attempt.get(shard_id, float("-inf"))
+                if (incumbent_demoted or peer_alive_without_primary) and (
+                    now_mono - last >= self.settings.HEARTBEAT_INTERVAL_S
+                ):
+                    self._last_headless_attempt[shard_id] = now_mono
+                    logger.warning(
+                        "Shard %s has no registered primary (incumbent_demoted=%s); "
+                        "promoting follower %s",
+                        shard_id,
+                        incumbent_demoted,
+                        entry.follower,
+                    )
+                    if await self.trigger_failover(shard_id, http_client=http_client):
+                        promoted.append(shard_id)
+                continue
 
             if primary_node is not None:
                 elapsed = now_mono - primary_node.last_seen_monotonic
@@ -762,7 +935,14 @@ class CoordinatorService:
                         }
                     )
                     map_changed = True
-                elif role == NodeRole.FOLLOWER and normalize_url(entry.follower) != clean_reg:
+                elif (
+                    role == NodeRole.FOLLOWER
+                    and normalize_url(entry.follower) != clean_reg
+                    and normalize_url(entry.primary) != clean_reg
+                ):
+                    # (A restarted incumbent primary registering as follower keeps its map
+                    # slot; the health monitor fails over to the current follower, which
+                    # swaps the two addresses atomically.)
                     entry = entry.model_copy(update={"follower": reg.address})
                     map_changed = True
             updated_entries.append(entry)

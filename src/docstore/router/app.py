@@ -30,7 +30,8 @@ from docstore.common.auth import (
     verify_token,
 )
 from docstore.common.config import Settings
-from docstore.common.errors import InvalidQuery, OutOfRange
+from docstore.common.errors import DocTooLarge, InvalidQuery, OutOfRange
+from docstore.common.http import BodyLimitMiddleware
 from docstore.common.logging import get_logger
 from docstore.common.models import (
     DOC_ID_MAX,
@@ -39,6 +40,7 @@ from docstore.common.models import (
     QueryFilter,
     QueryResponse,
     ShardMapEntry,
+    serialized_doc_size,
 )
 from docstore.query import validate_query_filter
 from docstore.router.scatter import execute_scatter_query
@@ -50,18 +52,33 @@ logger = get_logger(__name__)
 # ── Request / Response models ─────────────────────────────────────────────────
 
 
-class RouterInsertBody(BaseModel):
+class _ClientFencing(BaseModel):
+    # Optional: a client that tracks the shard term may pin it; the primary rejects
+    # the write if its term differs. ownership_epoch is always set by the router.
+    term: int | None = Field(default=None, ge=0)
+
+
+class RouterInsertBody(_ClientFencing):
     request_id: str = Field(min_length=1, max_length=128)
     document: dict[str, Any] = Field(description="Document containing doc_id.")
 
 
-class RouterUpdateBody(BaseModel):
+class RouterUpdateBody(_ClientFencing):
     request_id: str = Field(min_length=1, max_length=128)
     document: dict[str, Any] = Field(description="Full replacement document.")
 
 
-class RouterDeleteBody(BaseModel):
+class RouterDeleteBody(_ClientFencing):
     request_id: str = Field(min_length=1, max_length=128)
+
+
+_WRITE_METHODS = ("POST", "PUT", "DELETE")
+
+
+def _forward_write_body(body: dict[str, Any], term: int | None) -> dict[str, Any]:
+    if term is not None:
+        body["term"] = term
+    return body
 
 
 # ── App factory ───────────────────────────────────────────────────────────────
@@ -123,6 +140,7 @@ def build_router_app(
         logger.info("Router shut down")
 
     app = FastAPI(title="DocStore Router", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(BodyLimitMiddleware, max_bytes=settings.MAX_BODY_SIZE_BYTES)
 
     # ── Concurrency & Body Size Middleware ─────────────────────────────────────
 
@@ -174,7 +192,7 @@ def build_router_app(
     def _verify_client_auth(
         x_api_key: str | None = Header(default=None, alias=CLIENT_KEY_HEADER),
     ) -> None:  # used as a FastAPI dependency on every client-facing route
-        if not x_api_key or not verify_token(x_api_key, settings.CLIENT_API_KEY):
+        if not x_api_key or not verify_token(settings.CLIENT_API_KEY, x_api_key):
             raise HTTPException(
                 status_code=401,
                 detail={
@@ -209,6 +227,13 @@ def build_router_app(
 
         return await client.request(method=method, url=url, content=content, headers=headers)
 
+    def _check_doc_size(doc: dict[str, Any]) -> None:
+        size = serialized_doc_size(doc)
+        if size > settings.MAX_DOC_SIZE_BYTES:
+            raise DocTooLarge(
+                f"Document is {size} bytes; limit is {settings.MAX_DOC_SIZE_BYTES} bytes."
+            ).to_http_exception()
+
     async def _forward_request(
         req: Request,
         doc_id: int,
@@ -217,8 +242,14 @@ def build_router_app(
         body_dict: dict[str, Any] | None,
         target_role: str = "primary",
     ) -> JSONResponse:
-        """Route request to owning shard, refreshing map once if node reports stale map."""
+        """Route request to owning shard, refreshing map once if node reports stale map.
+
+        Writes carry the ownership_epoch of the map entry they were routed by, so the
+        primary can reject a write routed on stale ownership. The request_id is reused
+        unchanged on every retry, so a retried write is deduplicated by the shard.
+        """
         mgr: ShardMapManager = req.app.state.map_mgr
+        base_body = body_dict
 
         pause_retries = 0
         max_pause_retries = 8
@@ -237,6 +268,9 @@ def build_router_app(
                     except Exception as reload_exc:
                         logger.debug("Map reload failed: %s", reload_exc)
                 raise exc.to_http_exception() from exc
+
+            if base_body is not None and method in _WRITE_METHODS:
+                body_dict = {**base_body, "ownership_epoch": entry.ownership_epoch}
 
             # Read from follower if requested and available
             if target_role == "follower" and method in ("GET", "HEAD") and entry.follower:
@@ -296,7 +330,16 @@ def build_router_app(
                         except Exception as reload_exc:
                             logger.debug("Map reload failed: %s", reload_exc)
                         continue
-                    if attempt == 0 and err_code in ("OUT_OF_RANGE", "STALE_EPOCH", "NOT_PRIMARY"):
+                    if attempt == 0 and err_code in (
+                        "OUT_OF_RANGE",
+                        "STALE_EPOCH",
+                        "NOT_PRIMARY",
+                        "LEASE_EXPIRED",
+                    ):
+                        if err_code == "LEASE_EXPIRED":
+                            # The primary lost (or has not yet renewed) its lease: give the
+                            # coordinator a moment to renew it or fail over, then re-route.
+                            await asyncio.sleep(0.1)
                         logger.warning(
                             "Shard %s returned %s on doc_id=%d; reloading map and retrying once",
                             entry.shard_id,
@@ -350,7 +393,10 @@ def build_router_app(
 
         doc_dict = doc.model_dump()
         doc_id = doc_dict["doc_id"]
-        forward_body = {"request_id": body.request_id, "document": doc_dict}
+        _check_doc_size(doc_dict)
+        forward_body = _forward_write_body(
+            {"request_id": body.request_id, "document": doc_dict}, body.term
+        )
 
         return await _forward_request(
             request,
@@ -387,7 +433,10 @@ def build_router_app(
             )
 
         doc_dict = doc.model_dump()
-        forward_body = {"request_id": body.request_id, "document": doc_dict}
+        _check_doc_size(doc_dict)
+        forward_body = _forward_write_body(
+            {"request_id": body.request_id, "document": doc_dict}, body.term
+        )
 
         return await _forward_request(
             request,
@@ -406,7 +455,7 @@ def build_router_app(
         if isinstance(doc_id, bool) or doc_id < DOC_ID_MIN or doc_id > DOC_ID_MAX:
             raise OutOfRange(f"doc_id={doc_id} out of range").to_http_exception()
 
-        forward_body = {"request_id": body.request_id}
+        forward_body = _forward_write_body({"request_id": body.request_id}, body.term)
         return await _forward_request(
             request,
             doc_id=doc_id,

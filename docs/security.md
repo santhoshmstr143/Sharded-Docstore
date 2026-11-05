@@ -47,7 +47,8 @@ Sharded-Docstore enforces defense-in-depth authentication using three distinct c
 ## 2. Threat Model & Mitigations
 
 ### 2.1 Denial of Service & Resource Exhaustion
-- **Payload Limits:** Maximum document size is capped at 1 MB; maximum HTTP request body is capped at 2 MB. Enforced via streaming body length inspection before full memory buffering.
+- **Payload Limits:** Maximum document size is capped at 1 MB (`413 DOC_TOO_LARGE`, checked on the serialized document at both router and shard); maximum HTTP request body is capped at 2 MB (`413 BODY_TOO_LARGE`). Bodies with `Content-Length` are checked from the header; chunked bodies are rejected (`411`); bodies with neither are buffered by an ASGI middleware only up to the limit and rejected as soon as it is exceeded, so memory use stays bounded.
+- **Misaddressed internal RPCs:** an authenticated internal RPC addressed to a different shard is rejected with `409 WRONG_SHARD`.
 - **Query Complexity Restrictions:**
   - Maximum query filter nesting depth: 5 levels.
   - Maximum filter clauses: 50 clauses.

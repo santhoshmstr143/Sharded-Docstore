@@ -175,3 +175,86 @@ async def get_with_retry(
         raise last_exc
     assert last_response is not None
     return last_response
+
+
+# ── Request body limit (ASGI) ────────────────────────────────────────────────
+
+
+class BodyLimitMiddleware:
+    """Enforce a maximum request body size even when no Content-Length is sent.
+
+    Requests that declare ``Content-Length`` (checked by the app middleware) or use
+    ``Transfer-Encoding`` (rejected with 411 by the app middleware) pass through.
+    A request that declares neither is buffered here up to ``max_bytes``: one byte
+    more and it is rejected with 413 before the application sees it, so memory use
+    stays bounded and the limit cannot be bypassed by omitting the header.
+    """
+
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        names = {k.lower() for k, _ in scope.get("headers", [])}
+        if b"content-length" in names or b"transfer-encoding" in names:
+            await self.app(scope, receive, send)
+            return
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                # Client disconnected before finishing the body: hand it on as-is.
+                async def _disconnected(msg: Any = message) -> Any:
+                    return msg
+
+                await self.app(scope, _disconnected, send)
+                return
+            body = message.get("body", b"")
+            total += len(body)
+            if total > self.max_bytes:
+                await _send_json(
+                    send,
+                    413,
+                    {
+                        "error_code": "BODY_TOO_LARGE",
+                        "error_message": f"Request body exceeds {self.max_bytes} bytes.",
+                    },
+                )
+                return
+            chunks.append(body)
+            if not message.get("more_body", False):
+                break
+
+        buffered = b"".join(chunks)
+        replayed = False
+
+        async def _replay() -> Any:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": buffered, "more_body": False}
+            return await receive()
+
+        await self.app(scope, _replay, send)
+
+
+async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
+    import json
+
+    raw = json.dumps(payload).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(raw)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": raw})
