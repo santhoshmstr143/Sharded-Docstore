@@ -1,552 +1,661 @@
 # Sharded-Docstore
 
-A distributed, range-partitioned JSON document store built in Python 3.11 with `asyncio` and `FastAPI`. Features synchronous primary-follower replication, lease-based split-brain prevention, atomic scatter-gather querying, and monotonic epoch tracking.
+A small, distributed **JSON document database** inspired by MongoDB's sharded-cluster design,
+written in Python 3.11 (`asyncio` + FastAPI).
+
+Documents are spread across several **shards** by their `doc_id`. Every shard keeps two copies
+of its data (a **primary** and a **follower**), so no acknowledged write is lost if a machine
+crashes. A **router** hides all of this from clients, and a **coordinator** watches the cluster,
+replaces a failed primary automatically, and can move key ranges between shards while the
+database stays online.
+
+> Course project — *Project 30, Team 50*: Reddem Bhanu Prakash Reddy,
+> Mule Mohan Venkata Santosh Reddy, Mathamsetty Viswaj.
 
 ---
 
-## Architecture & System Overview
+## Contents
+
+1. [What it does](#what-it-does)
+2. [How it works](#how-it-works)
+3. [Requirements](#requirements)
+4. [Quick start with Docker (recommended)](#quick-start-with-docker-recommended)
+5. [Running without Docker](#running-without-docker)
+6. [Configuration: the `.env` file and environment variables](#configuration-the-env-file-and-environment-variables)
+7. [Using the database](#using-the-database)
+8. [Consistency, failover and migration in brief](#consistency-failover-and-migration-in-brief)
+9. [Testing and quality checks](#testing-and-quality-checks)
+10. [Demo and benchmarks](#demo-and-benchmarks)
+11. [Project layout](#project-layout)
+12. [Troubleshooting](#troubleshooting)
+13. [Known limitations](#known-limitations)
+14. [Further documentation](#further-documentation)
+
+---
+
+## What it does
+
+- **Stores JSON documents** keyed by an integer `doc_id` (`0 … 2^63 − 1`): insert, read,
+  full-replace update, delete.
+- **Shards data by key range.** The key space is split into contiguous ranges; each range is
+  owned by one shard. The default cluster has 3 shards.
+- **Replicates every write synchronously.** A write is acknowledged only after it has been
+  `fsync`ed to the write-ahead log (WAL) of *both* the primary and the follower.
+- **Queries with filters**: `$eq`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$and`, `$or`, with
+  sorting, `skip` and `limit`. Queries on `doc_id` go to one shard; other queries fan out to all
+  shards and the router merges the results.
+- **Primary reads vs follower reads.** Primary reads always see every acknowledged write;
+  follower reads may be slightly stale and say how far behind they are (`replication_lag`).
+- **Survives a primary crash.** The coordinator detects the failure, fences the old primary
+  (terms + leases), and promotes the follower — with no acknowledged write lost.
+- **Moves key ranges between shards live** (snapshot copy → catch-up → short write pause →
+  verified cutover), while the rest of the cluster keeps serving traffic.
+- **Idempotent writes.** Every write carries a `request_id`; retrying with the same id never
+  applies the write twice.
+- **Durable storage** per node: WAL with checksums and strict sequence numbering, plus periodic
+  snapshots with safe WAL compaction.
+- **Secured**: API key for clients, admin token for operators, HMAC request signatures between
+  nodes.
+
+---
+
+## How it works
 
 ```
                                  ┌───────────────┐
-                                 │    Clients    │
+                                 │    Clients    │   (curl, CLI, Python SDK)
                                  └───────┬───────┘
-                                         │  (HTTP + X-Api-Key)
+                                         │  HTTP + X-Api-Key
                                          ▼
                                  ┌───────────────┐
-                                 │ Stateless     │
-                                 │ Router        │
-                                 └───────┬───────┘
-                                         │
+                                 │    Router     │  :8000   stateless; routes by doc_id,
+                                 └───────┬───────┘          fans queries out and merges
                  ┌───────────────────────┼───────────────────────┐
-                 │                       │                       │
                  ▼                       ▼                       ▼
           ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
           │   Shard 0   │         │   Shard 1   │         │   Shard 2   │
-          │ [0, S1)     │         │ [S1, S2)    │         │ [S2, 2^63)  │
-          │             │         │             │         │             │
-          │ Primary (W) │         │ Primary (W) │         │ Primary (W) │
-          │      │      │         │      │      │         │      │      │
-          │      ▼ (WAL)│         │      ▼ (WAL)│         │      ▼ (WAL)│
-          │ Follower (R)│         │ Follower (R)│         │ Follower (R)│
+          │  [0, S1)    │         │  [S1, S2)   │         │ [S2, 2^63)  │
+          │ primary     │         │ primary     │         │ primary     │
+          │   │ WAL     │         │   │ WAL     │         │   │ WAL     │
+          │   ▼ (sync)  │         │   ▼ (sync)  │         │   ▼ (sync)  │
+          │ follower    │         │ follower    │         │ follower    │
           └──────┬──────┘         └──────┬──────┘         └──────┬──────┘
-                 │                       │                       │
                  └───────────────────────┼───────────────────────┘
-                                         │  (Heartbeats & Leases)
+                                         │  registration, heartbeats, leases
                                          ▼
                                  ┌───────────────┐
-                                 │  Coordinator  │
-                                 │  (Shard Map,  │
-                                 │  Epochs,      │
-                                 │  Leases)      │
-                                 └───────────────┘
+                                 │  Coordinator  │  :8100   shard map, terms, epochs,
+                                 └───────────────┘          failover, migration
 ```
 
-### Core Components
+`S1 = 3 074 457 345 618 258 602`, `S2 = 6 148 914 691 236 517 204`.
 
-1. **Coordinator Service (`docstore.coordinator`):**
-   - Owns the authoritative cluster shard map with versioning (`map_version` and per-range `ownership_epoch`).
-   - Issues time-bounded leases to primaries via periodic node heartbeats ($H$).
-   - Enforces a safety cutoff ($L + M$) preventing a newly promoted primary from accepting writes while a former primary's lease could still be active.
-   - Records every failover as a durable intent before changing the map, so a coordinator crash mid-failover is finished (or safely discarded) on restart; failover and migration cutover are serialised per shard.
-   - Monitors node health and marks shards **degraded** when their follower is not in the `SYNCED` state.
-   - Protected admin API for cluster status and range migrations (`X-Admin-Token`).
+| Component | Default port | What it does |
+|---|---|---|
+| **Router** (`docstore.router`) | 8000 | The only thing clients talk to. Checks the API key, finds the shard owning a `doc_id` from the shard map, forwards the request to that shard's primary, retries on stale routing, and runs scatter-gather queries. Holds no data. |
+| **Shard node** (`docstore.shard`) | 8200–8205 | Stores documents. A **primary** accepts writes, appends them to its WAL, replicates them to its **follower**, and answers once both have them on disk. A follower serves (possibly stale) reads and takes over if the primary fails. |
+| **Coordinator** (`docstore.coordinator`) | 8100 | Owns the persistent **shard map** (which range lives where), shard **terms**, range **ownership epochs** and primary **leases**. Detects failed primaries, runs failover, and drives range migrations. Admin API for operators. |
 
-2. **Stateless Router (`docstore.router`):**
-   - Validates client API keys (`X-Api-Key`) using constant-time verification.
-   - Caches the shard map; routes CRUD operations directly to the owning primary.
-   - Supports `read_mode=follower` with automatic fallback to primary if the follower is down or laggy.
-   - Executes parallel scatter-gather queries (`POST /query`) across all shards with local limit queries, tie-breaking, global pagination, and de-duplication.
-   - Bounded retries on routing staleness (`OUT_OF_RANGE`, `STALE_EPOCH`, `NOT_PRIMARY`, `LEASE_EXPIRED`, `REPLICATION_UNAVAILABLE`), always reusing the client's `request_id`.
-   - Attaches the routing entry's `ownership_epoch` to every write as a fencing token; enforces the 1 MB document and 2 MB body limits (also for bodies sent without `Content-Length`).
-
-3. **Shard Nodes (`docstore.shard`):**
-   - **Primary Node:** Accepts write traffic, holds a per-shard write lock, validates range ownership, leases, and follower status. Under normal distributed deployment, replication is strictly **fail-closed**: if no follower is configured or the follower is not in `SYNCED` state, writes are rejected with HTTP 503 `REPLICATION_UNAVAILABLE` before WAL append. When a follower is configured, the primary assigns a sequence number, appends to its WAL, fsyncs, synchronously replicates to the follower (which also fsyncs), commits locally, and updates memory and dedup table. Standalone single-node writes require explicit opt-in via `STANDALONE_MODE=true` or `--standalone`.
-   - **Follower Node:** Durably appends replicated oplog entries to its WAL, fsyncs, asynchronously updates memory, detects sequence gaps, supports oplog catch-up (`/internal/catchup`) and snapshot resync (`/internal/snapshot`), and serves reads tagged with `replication_lag`.
-   - **Durability housekeeping:** every node takes periodic snapshots (every 1 000 ops or 60 s) and then compacts its WAL safely (verified snapshot first; never past committed / follower-acked / active-migration positions). WAL sequence continuity is verified on every replay.
-   - Inter-node communications are authenticated using HMAC-SHA256 cluster signatures (`X-Cluster-Signature`).
-
-### Timing Constraints Invariant
-
-The cluster validates timing parameters at startup:
-- $H < L < D$ (Heartbeat interval < Lease duration < Failure detection timeout)
-- $T + M < L - H$ (Replication timeout + Safety margin < Remaining lease renewal window)
-- Standard defaults: $H = 1.0\text{s}, L = 3.0\text{s}, D = 5.0\text{s}, M = 0.5\text{s}, T = 1.0\text{s}$.
+**Life of a write:** client → router (API key check, find owner) → shard primary (lease check,
+dedup check, append + `fsync` WAL) → follower (append + `fsync` WAL, acknowledge) → primary
+applies the write and answers `COMMITTED`.
 
 ---
 
-## Quickstart & Environment Setup
+## Requirements
 
-### 1. Prerequisites
-- Python 3.11+
-- `make`
-- `curl`
+- **Python 3.11+**
+- **make** and **curl**
+- **Docker** with **Docker Compose v2** — only for the Docker quick start
+- Linux or macOS (the shell scripts and Makefile assume a POSIX shell)
 
-### 2. Setup Virtual Environment
+---
+
+## Quick start with Docker (recommended)
+
+This starts the full cluster: 1 coordinator, 3 shards × 2 nodes, and 1 router.
 
 ```bash
-# Clone the repository
+# 1. Get the code
 git clone https://github.com/santhoshmstr143/Sharded-Docstore.git
 cd Sharded-Docstore
 
-# Create virtualenv and install all dependencies (runtime + dev tools)
-make setup
-
-# Activate the virtual environment
-source .venv/bin/activate
+# 2. Start everything
+make up
 ```
 
-### 3. Configure Secrets & Environment
+`make up` does two things:
 
-Copy the example configuration to `.env`:
+1. If there is **no `.env` file yet**, it creates one from `.env.example` and fills
+   `CLUSTER_SECRET`, `ADMIN_TOKEN` and `CLIENT_API_KEY` with **random secrets**. (If you already
+   have a `.env`, it is used as-is — see [Configuration](#configuration-the-env-file-and-environment-variables).)
+2. Runs `docker compose -f docker/docker-compose.yml up -d`, which builds the image and starts
+   the 8 containers in dependency order (coordinator → followers → primaries → router).
+
+Only the **router (`127.0.0.1:8000`)** and **coordinator (`127.0.0.1:8100`)** are published, and
+only on localhost. Shard nodes are reachable only inside the Docker network.
+
+**3. Check it is up**
 
 ```bash
-cp .env.example .env
+curl -s http://127.0.0.1:8000/health      # router
+curl -s http://127.0.0.1:8100/health      # coordinator
+docker compose -f docker/docker-compose.yml ps
 ```
 
-Ensure the tokens meet the security lengths in `.env`:
-- `CLUSTER_SECRET`: At least 32 characters (e.g. `cluster-shared-secret-key-32chars-min`)
-- `ADMIN_TOKEN`: At least 32 characters (e.g. `coordinator-admin-token-32chars-min`)
-- `CLIENT_API_KEY`: At least 16 characters (e.g. `client-api-key-16chars-min`)
+**4. Try it** (the secrets live in your `.env`):
+
+```bash
+export CLIENT_API_KEY=$(grep '^CLIENT_API_KEY=' .env | cut -d= -f2-)
+export ADMIN_TOKEN=$(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)
+
+# Insert a document
+curl -s -X POST http://127.0.0.1:8000/doc \
+  -H "Content-Type: application/json" -H "X-Api-Key: $CLIENT_API_KEY" \
+  -d '{"request_id": "req-1", "document": {"doc_id": 42, "title": "Hello", "rating": 5}}'
+
+# Read it back
+curl -s http://127.0.0.1:8000/doc/42 -H "X-Api-Key: $CLIENT_API_KEY"
+
+# Query
+curl -s -X POST http://127.0.0.1:8000/query \
+  -H "Content-Type: application/json" -H "X-Api-Key: $CLIENT_API_KEY" \
+  -d '{"filter": {"rating": {"$gte": 4}}, "limit": 10}'
+
+# Cluster status (operators)
+curl -s http://127.0.0.1:8100/admin/status -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+**Other Docker commands**
+
+| Command | What it does |
+|---|---|
+| `make logs` | Follow the logs of all containers |
+| `make down` | Stop the cluster (data is kept in Docker volumes) |
+| `make reset` | Stop the cluster **and delete all data volumes** |
 
 ---
 
-## How to Run the Cluster Locally
+## Running without Docker
 
-You can run individual components directly using their Python module entry points.
-
-### Step 1: Start the Coordinator
-
-The coordinator manages the persistent shard map and grants leases.
+First install the project into a virtual environment and create your `.env`:
 
 ```bash
+make setup                      # creates .venv and installs runtime + dev dependencies
 source .venv/bin/activate
-export HOST=127.0.0.1
-export PORT=8100
-export SHARD_MAP_PATH=./data/shard_map.json
-python -m docstore.coordinator
+cp .env.example .env            # then replace the three secrets — see below
 ```
-*Coordinator starts on `http://127.0.0.1:8100`.*
+
+The three `change-me` values in `.env.example` are **rejected at startup**; generate real ones:
+
+```bash
+python -c "import secrets; print('CLUSTER_SECRET=' + secrets.token_hex(32))"
+python -c "import secrets; print('ADMIN_TOKEN=' + secrets.token_hex(32))"
+python -c "import secrets; print('CLIENT_API_KEY=' + secrets.token_hex(16))"
+```
+
+Every process reads `.env` from the **current directory**, so run all commands from the
+repository root.
+
+### Option A — one command: `scripts/local_cluster.sh`
+
+```bash
+scripts/local_cluster.sh start     # coordinator, 6 shard nodes, router (background)
+scripts/local_cluster.sh status    # health of every process
+scripts/local_cluster.sh stop
+```
+
+It writes a shard map with the correct local addresses, starts the processes in the right
+order, waits for each to be healthy, and keeps data, logs and PID files in `data/local/`
+(override with `LOCAL_DATA_DIR`). Delete `data/local/` to start over with an empty cluster.
+
+### Option B — start each process yourself
+
+Use this to see exactly what each process needs. Open one terminal per process, run
+`source .venv/bin/activate` in each, and stay in the repository root.
+
+**1. Create the shard map** (tells the router and coordinator where every node lives):
+
+```bash
+mkdir -p data/manual
+PYTHONPATH=src python - <<'EOF'
+from docstore.router.shard_map import ShardMapManager, create_default_3_shard_map
+smap = create_default_3_shard_map(
+    primaries=["127.0.0.1:8200", "127.0.0.1:8202", "127.0.0.1:8204"],
+    followers=["127.0.0.1:8201", "127.0.0.1:8203", "127.0.0.1:8205"],
+)
+ShardMapManager("data/manual/shard_map.json").save(smap)
+EOF
+```
+
+**2. Start the coordinator:**
+
+```bash
+HOST=127.0.0.1 PORT=8100 SHARD_MAP_PATH=data/manual/shard_map.json \
+DATA_DIR=data/manual/coordinator \
+PYTHONPATH=src python -m docstore.coordinator
+```
+
+**3. Start the shard nodes** — follower first, then its primary. Shard 0:
+
+```bash
+# shard0 follower
+HOST=127.0.0.1 PORT=8201 NODE_ID=shard0-follower SHARD_ID=shard0 ROLE=follower \
+NODE_ADDRESS=127.0.0.1:8201 COORDINATOR_URL=http://127.0.0.1:8100 \
+SHARD_RANGE_START=0 SHARD_RANGE_END=3074457345618258602 \
+DATA_DIR=data/manual/shard0-follower \
+PYTHONPATH=src python -m docstore.shard
+
+# shard0 primary
+HOST=127.0.0.1 PORT=8200 NODE_ID=shard0-primary SHARD_ID=shard0 ROLE=primary \
+NODE_ADDRESS=127.0.0.1:8200 COORDINATOR_URL=http://127.0.0.1:8100 \
+FOLLOWER_URL=127.0.0.1:8201 \
+SHARD_RANGE_START=0 SHARD_RANGE_END=3074457345618258602 \
+DATA_DIR=data/manual/shard0-primary \
+PYTHONPATH=src python -m docstore.shard
+```
+
+Repeat for the other shards, changing `NODE_ID`, `SHARD_ID`, ports, `NODE_ADDRESS`,
+`FOLLOWER_URL`, `DATA_DIR` and the range:
+
+| Shard | Primary port | Follower port | `SHARD_RANGE_START` | `SHARD_RANGE_END` |
+|---|---|---|---|---|
+| `shard0` | 8200 | 8201 | `0` | `3074457345618258602` |
+| `shard1` | 8202 | 8203 | `3074457345618258602` | `6148914691236517204` |
+| `shard2` | 8204 | 8205 | `6148914691236517204` | `9223372036854775808` |
+
+Things that are easy to get wrong:
+
+- `COORDINATOR_URL` is required. Without it a node never registers or renews its lease, and a
+  primary starts rejecting writes with `LEASE_EXPIRED` after a few seconds.
+- `NODE_ADDRESS` must be the exact address listed for the node in the shard map.
+- `SHARD_RANGE_START`/`SHARD_RANGE_END` must match the map; without them a shard claims the
+  whole key space.
+- Give every node its **own** `DATA_DIR`.
+
+**4. Start the router:**
+
+```bash
+HOST=127.0.0.1 PORT=8000 SHARD_MAP_PATH=data/manual/shard_map.json \
+PYTHONPATH=src python -m docstore.router
+```
+
+The router and the coordinator must point at the **same** shard-map file: the router re-reads
+it whenever a shard reports that its routing is stale.
+
+### Option C — no cluster at all: the demo
+
+`make demo` runs the whole cluster **inside one Python process** and walks through loading data,
+a primary crash with automatic failover, fencing, rejoin and a live migration. No `.env` and no
+ports are needed. See [Demo and benchmarks](#demo-and-benchmarks).
 
 ---
 
-### Step 2: Start Shard Nodes (Primaries & Followers)
+## Configuration: the `.env` file and environment variables
 
-To run a replicated shard (e.g., Shard 0 covering `[0, 3074457345618258602)`):
+Settings are read from **environment variables**, with `./.env` as the fallback (real
+environment variables win over `.env`). Docker Compose passes your `.env` to every container
+and then sets the per-node values itself.
 
-#### Terminal A: Shard 0 Follower
-```bash
-source .venv/bin/activate
-export NODE_ID=node0-follower
-export SHARD_ID=shard0
-export ROLE=follower
-export PORT=8201
-export DATA_DIR=./data/node0-follower
-python -m docstore.shard
+### 1. Secrets — required, no defaults
+
+| Variable | Minimum length | Used by | Purpose |
+|---|---|---|---|
+| `CLUSTER_SECRET` | 32 chars | all nodes | Key for the HMAC signatures on node-to-node requests. **Must be identical on every node.** |
+| `ADMIN_TOKEN` | 32 chars | coordinator, CLI | Sent as `X-Admin-Token` for operator endpoints (`/admin/*`, `/shardmap`). |
+| `CLIENT_API_KEY` | 16 chars | router, shards, clients | Sent as `X-Api-Key` by clients; the router forwards it to shards. |
+
+Startup fails if a secret is too short or still contains the `change-me` placeholder from
+`.env.example`. Generate values with `python -c "import secrets; print(secrets.token_hex(32))"`.
+
+### 2. Timing — optional (defaults shown)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HEARTBEAT_INTERVAL_S` | `1.0` | **H** — how often a primary heartbeats and renews its lease |
+| `LEASE_DURATION_S` | `3.0` | **L** — how long a primary lease is valid |
+| `FAILURE_TIMEOUT_S` | `5.0` | **D** — silence after which the coordinator declares a primary dead |
+| `SAFETY_MARGIN_S` | `0.5` | **M** — extra wait after the old lease expires before a new primary may write |
+| `REPLICATION_TIMEOUT_S` | `1.0` | **T** — how long a primary waits for its follower's acknowledgement |
+| `MIGRATION_CATCHUP_MAX_DURATION_S` | `60.0` | Time limit for a migration's catch-up phase |
+| `MIGRATION_FINAL_CATCHUP_MAX_DURATION_S` | `30.0` | Time limit for the catch-up during the write pause |
+
+Startup checks **`H < L < D`** and **`T + M < L − H`** and refuses to run otherwise.
+
+### 3. Storage, snapshots, logging and flags — optional
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATA_DIR` | `./data` | Where a node keeps its WAL, snapshots and metadata (`DATA_DIR/<shard_id>/`). The coordinator keeps migration records in `DATA_DIR/migrations/`. Give each node its own directory. |
+| `SNAPSHOT_EVERY_N_OPS` | `1000` | Take a snapshot (then compact the WAL) after this many applied operations; `0` disables |
+| `SNAPSHOT_EVERY_S` | `60` | …or after this many seconds; `0` disables |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
+| `STANDALONE_MODE` | `false` | Lets a shard primary accept writes **without** a follower (development only — no replication guarantee) |
+| `ENABLE_TEST_HOOKS` | `false` | Crash-injection hooks for fault tests. **Never enable in a real deployment.** |
+
+### 4. Per-process variables — set for each process, not in `.env`
+
+Docker Compose and `scripts/local_cluster.sh` set these for you; set them yourself only when
+starting processes by hand (Option B).
+
+| Variable | Process | Default | Meaning |
+|---|---|---|---|
+| `HOST` | all | `127.0.0.1` | Interface to listen on (`0.0.0.0` inside containers) |
+| `PORT` | all | router `8000`, coordinator `8100`, shard `8200` | Port to listen on |
+| `SHARD_MAP_PATH` | router, coordinator | `./data/shard_map.json` | Shard-map file; must be the **same file** for both. Created with a default 3-shard map if missing. |
+| `TERMS_PATH` | coordinator | next to the shard map | File with the durable shard terms |
+| `NODE_ID` | shard | `shard-node-default` | Unique name of the node |
+| `SHARD_ID` | shard | `shard0` | Which shard this node belongs to (`shard0`, `shard1`, `shard2`) |
+| `ROLE` | shard | `primary` | Starting role on a fresh node: `primary` or `follower`. A node that restarts with existing data always comes back as a follower until the coordinator decides otherwise. |
+| `FOLLOWER_URL` | shard (primary) | — | `host:port` of this shard's follower |
+| `NODE_ADDRESS` | shard | `<NODE_ID>:<PORT>` | Address the node registers with; must match the shard map |
+| `COORDINATOR_URL` | shard | — | Coordinator URL, e.g. `http://127.0.0.1:8100`. Required in a cluster. |
+| `SHARD_RANGE_START` / `SHARD_RANGE_END` | shard | `0` / `2^63` | Key range `[start, end)` owned on first start (later ownership comes from the node's saved metadata) |
+| `SHARD_OWNERSHIP_EPOCH` | shard | `1` | Initial ownership epoch of that range |
+
+### 5. Client variables (CLI and Python SDK)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ROUTER_URL` (or `DOCSTORE_ROUTER_URL`) | `http://127.0.0.1:8000` | Router to send data requests to |
+| `COORDINATOR_URL` (or `DOCSTORE_COORDINATOR_URL`) | `http://127.0.0.1:8100` | Coordinator for admin commands |
+| `CLIENT_API_KEY` | — | Client API key (same value as the cluster's) |
+| `ADMIN_TOKEN` | — | Needed for `status`, `shardmap`, `migrate` |
+
+### Example `.env`
+
+```dotenv
+# Secrets (generate your own — these are examples only)
+CLUSTER_SECRET=3f6c1e0b9a7d4c2e8f5a1b0c9d7e6f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e
+ADMIN_TOKEN=9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d
+CLIENT_API_KEY=0a1b2c3d4e5f60718293a4b5c6d7e8f9
+
+# Timing (H < L < D and T + M < L - H)
+HEARTBEAT_INTERVAL_S=1.0
+LEASE_DURATION_S=3.0
+FAILURE_TIMEOUT_S=5.0
+SAFETY_MARGIN_S=0.5
+REPLICATION_TIMEOUT_S=1.0
+
+# Storage and snapshots
+DATA_DIR=./data
+SNAPSHOT_EVERY_N_OPS=1000
+SNAPSHOT_EVERY_S=60
+
+ENABLE_TEST_HOOKS=false
+LOG_LEVEL=INFO
 ```
 
-#### Terminal B: Shard 0 Primary
-```bash
-source .venv/bin/activate
-export NODE_ID=node0-primary
-export SHARD_ID=shard0
-export ROLE=primary
-export PORT=8200
-export FOLLOWER_URL=127.0.0.1:8201
-export DATA_DIR=./data/node0-primary
-python -m docstore.shard
-```
+> `.env.example` also contains `COORDINATOR_PORT`, `ROUTER_PORT` and `SHARDn_*_PORT` lines.
+> **No code reads them** (and two of them have the router/coordinator values swapped); ports come
+> from `PORT` and the compose file. You can leave or delete them.
+>
+> `.env` is git-ignored — never commit it.
 
-*(Repeat for Shard 1 on ports 8202/8203 and Shard 2 on ports 8204/8205 as needed).*
+### Fixed limits (not configurable)
+
+| Limit | Value |
+|---|---|
+| Document size | 1 MB (serialized JSON) |
+| Request body | 2 MB |
+| Query `limit` | default 100, max 1 000; `skip` max 10 000 |
+| Filter | depth 5, 50 clauses, `$in` list ≤ 1 000 items, ≤ 10 000 values in total |
+| Query response collected by the router | 32 MB |
+| Idempotency window | last 100 000 request ids or 10 minutes |
+| Router concurrent requests | 1 000 |
 
 ---
 
-### Step 3: Start the Stateless Router
+## Using the database
 
-The router exposes the client-facing API on port 8000:
+### Endpoints
 
-```bash
-source .venv/bin/activate
-export HOST=127.0.0.1
-export PORT=8000
-export SHARD_MAP_PATH=./data/shard_map.json
-python -m docstore.router
-```
-*Router starts on `http://127.0.0.1:8000`.*
+**Router — `http://127.0.0.1:8000`** (all except `/health` need `X-Api-Key`)
 
----
+| Method & path | Body | Purpose |
+|---|---|---|
+| `POST /doc` | `{"request_id", "document": {"doc_id", ...}}` | Insert (201) |
+| `GET /doc/{doc_id}[?read_mode=follower]` | — | Read from the primary (default) or the follower |
+| `PUT /doc/{doc_id}` | `{"request_id", "document"}` | Replace the whole document (`doc_id` must match the path) |
+| `DELETE /doc/{doc_id}` | `{"request_id"}` | Delete |
+| `POST /query` | `{"filter", "sort_field", "sort_dir", "skip", "limit", "read_mode"}` | Filtered query across shards |
+| `GET /status` | — | Router status |
+| `GET /health` | — | Liveness |
 
-## Testing & Quality Gates
+**Coordinator — `http://127.0.0.1:8100`** (operator endpoints need `X-Admin-Token`)
 
-The test suite contains **416 automated tests** covering unit storage, safe query filtering, shard routing, coordinator leases, fail-closed replication durability, failover fencing, and live range migration (415 pass and 1 Docker smoke test is skipped when no live cluster is running).
+| Method & path | Purpose |
+|---|---|
+| `GET /admin/status` | Shards, primaries, followers, leases, terms, replica states, failover metrics |
+| `GET /shardmap` | The current shard map |
+| `POST /admin/migrate` | Start a range migration: `{"from_shard", "to_shard", "range": {"start", "end"}, "sync": false}` |
+| `GET /admin/migrate/{id}`, `GET /admin/migrations` | Migration progress |
+| `POST /admin/failover/{shard_id}[?force=true]` | Manual failover (`force` promotes even an unsynced follower — may lose writes) |
+| `GET /health` | Liveness |
 
-### Running Fast Tests (Unit + Integration)
+Shard nodes (`/doc`, `/query`, `/status`, `/internal/*`) are not meant to be called directly.
+Full request/response formats: [`docs/api.md`](docs/api.md).
 
-```bash
-# Run unit and integration tests (recommended for development)
-make test-fast
-```
-Or directly with `pytest`:
-```bash
-.venv/bin/pytest tests/ -v
-```
+### Write outcomes
 
-### Running Specific Test Modules
+| HTTP | `outcome` / `error_code` | Meaning | What to do |
+|---|---|---|---|
+| 201 / 200 | `COMMITTED` | Durable on both replicas | Done |
+| 202 | `OUTCOME_UNKNOWN` | Reached the primary's log, but the follower did not confirm in time | **Retry with the same `request_id`** — it is applied at most once |
+| 4xx / 503 | e.g. `DUPLICATE_KEY`, `NOT_FOUND`, `REPLICATION_UNAVAILABLE`, `RANGE_PAUSED` | Rejected; nothing was written | Fix the request, or retry later (503) |
 
-```bash
-# 1. Coordinator service & leases (Module 6)
-.venv/bin/pytest tests/unit/test_coordinator.py -v
+After a failover the shard is in **degraded mode**: reads work, writes return
+`503 REPLICATION_UNAVAILABLE` until the old primary has rejoined as a follower.
 
-# 2. Replication & M4 Gate replicated cluster (Module 7 & M4 Gate)
-.venv/bin/pytest tests/integration/test_replication.py -v
-
-# 3. Router CRUD, boundaries & M2 Gate tests (Module 4 & M2 Gate)
-.venv/bin/pytest tests/integration/test_router.py -v
-
-# 4. Safe Query filter engine & scatter-gather (Module 5 & M3 Gate)
-.venv/bin/pytest tests/unit/test_query.py -v
-
-# 5. Storage engine (WAL CRC32, torn tail, snapshots, dedup) (Module 2)
-.venv/bin/pytest tests/unit/test_storage.py -v
-
-# 6. Single shard node durable HTTP API (Module 3 & M1 Gate)
-.venv/bin/pytest tests/integration/test_shard_node.py -v
-
-# 7. Failover, fencing & rejoin (Module 8 & M5 Gate)
-.venv/bin/pytest tests/fault/test_failover.py -v
-
-# 8. Live range migration & checksum verification (Module 9 & M6 Gate)
-.venv/bin/pytest tests/fault/test_migration.py -v
-
-# 9. Regression tests for audited correctness and durability bugs
-.venv/bin/pytest tests/integration/test_bugs.py -v
-```
-
-### Full Test Suite with Coverage Report
+### More `curl` examples
 
 ```bash
-make test
+H=(-H "Content-Type: application/json" -H "X-Api-Key: $CLIENT_API_KEY")
+
+# Retrying the same request_id returns the original result instead of inserting twice
+curl -s -X POST http://127.0.0.1:8000/doc "${H[@]}" \
+  -d '{"request_id": "req-1", "document": {"doc_id": 42, "title": "Hello", "rating": 5}}'
+
+# Follower read (may be stale; shows replication_lag)
+curl -s "http://127.0.0.1:8000/doc/42?read_mode=follower" -H "X-Api-Key: $CLIENT_API_KEY"
+
+# Full replace
+curl -s -X PUT http://127.0.0.1:8000/doc/42 "${H[@]}" \
+  -d '{"request_id": "req-2", "document": {"doc_id": 42, "title": "Hello again", "rating": 4}}'
+
+# Query with $and / $in, sorted, paginated ("total" counts all matches, not just this page)
+curl -s -X POST http://127.0.0.1:8000/query "${H[@]}" -d '{
+  "filter": {"$and": [{"rating": {"$gte": 4}}, {"tags": {"$in": ["db", "nosql"]}}]},
+  "sort_field": "rating", "sort_dir": "desc", "skip": 0, "limit": 10}'
+
+# Delete
+curl -s -X DELETE http://127.0.0.1:8000/doc/42 "${H[@]}" -d '{"request_id": "req-3"}'
+
+# Move keys [1000, 2000) from shard0 to shard1 while the cluster keeps running
+curl -s -X POST http://127.0.0.1:8100/admin/migrate \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"from_shard": "shard0", "to_shard": "shard1", "range": {"start": 1000, "end": 2000}, "sync": false}'
 ```
-*Generates terminal coverage metrics and an HTML report in `htmlcov/`.*
 
-### Code Quality & Security Audits
+### Command-line client
 
-All code must pass strict type-checking and security scans:
+Install it as the `docstore` command with `pip install -e .` (inside the virtual environment),
+or run it without installing as `PYTHONPATH=src python -m docstore.client ...`. It reads
+`CLIENT_API_KEY`, `ADMIN_TOKEN`, `ROUTER_URL` and `COORDINATOR_URL` from the environment, or
+takes `--api-key`, `--admin-token`, `--router-url`, `--coordinator-url`.
 
 ```bash
-# Run Ruff linting and auto-formatting
-make lint
-
-# Check linting and formatting without modifying files (CI mode)
-make lint-check
-
-# Strict static type-checking (mypy)
-make typecheck
-
-# Static security vulnerability analysis (bandit)
-make security
-
-# Audit dependencies for known CVEs
-make audit
-
-# Run all quality checks together before committing
-make check
+docstore insert --doc '{"doc_id": 42, "title": "DistSys", "rating": 5}'
+docstore get 42 --read-mode follower
+docstore update 42 --doc '{"doc_id": 42, "title": "DistSys 2", "rating": 4}'
+docstore delete 42
+docstore query --filter '{"rating": {"$gte": 4}}' --sort-field rating --limit 10
+docstore status
+docstore shardmap
+docstore migrate --from-shard shard0 --to-shard shard1 --start 1000 --end 2000
+docstore bulk-load dataset.json
 ```
 
----
+Writes accept `--request-id`. If a write ends with `OUTCOME_UNKNOWN`, the CLI prints its
+request id — run the same command again with `--request-id <that id>` to resolve it safely.
 
-## Client CLI & Python SDK (Module 10 / M7)
+### Python SDK
 
-The project includes a Python client library and CLI tool with automatic request ID generation, transparent retries reusing the same request ID, and typed exceptions:
-
-### 1. Python SDK (`docstore.client`)
+Run with `PYTHONPATH=src` (or after `pip install -e .`):
 
 ```python
 from docstore.client import DocStoreClient
 
-# Connect to cluster router & coordinator
-with DocStoreClient(router_url="http://127.0.0.1:8000", api_key="secret-key") as client:
-    # Insert document (auto-generates and reuses UUID request_id across retries)
-    res = client.insert({"doc_id": 100, "name": "Antigravity", "tags": ["db"]})
-    print(res["outcome"])  # "COMMITTED"
-
-    # Read from primary (default) or follower with replication lag
-    doc_primary = client.get(100, read_mode="primary")
-    doc_follower = client.get(100, read_mode="follower")
-    print(doc_follower["meta"]["served_by"], doc_follower["meta"]["replication_lag"])
-
-    # Query with filter, sorting, and pagination
-    results = client.query(filter={"tags": "db"}, sort_field="name", limit=10)
-    print(f"Total found: {results['total']}")
-
-    # Update and delete
-    client.update(100, {"doc_id": 100, "name": "Antigravity 2.0"})
-    client.delete(100)
+with DocStoreClient(router_url="http://127.0.0.1:8000", api_key="<CLIENT_API_KEY>") as db:
+    db.insert({"doc_id": 100, "name": "Ada", "tags": ["db"]})       # request_id generated
+    print(db.get(100)["document"])
+    print(db.get(100, read_mode="follower")["meta"]["replication_lag"])
+    res = db.query(filter={"tags": "db"}, sort_field="name", limit=10)
+    print(res["total"], res["documents"])
+    db.update(100, {"doc_id": 100, "name": "Ada L."})
+    db.delete(100)
 ```
 
-### 2. Command Line Interface (`python -m docstore.client` or `docstore`)
+Retries reuse the same `request_id` automatically. An async client (`AsyncDocStoreClient`) with
+the same methods is also available.
+
+---
+
+## Consistency, failover and migration in brief
+
+- **Commit point:** a write is committed once the follower has `fsync`ed it. Primary reads
+  (served only while the primary holds a valid lease) see every committed write; follower reads
+  may lag and report `replication_lag`.
+- **Fencing:** every primary change increments the shard's **term**; followers reject writes
+  from an older term, and a primary stops writing when its lease runs out. Every routed write also
+  carries the range's **ownership epoch**, so writes routed with an outdated map are rejected.
+- **Failover:** if a primary stops heartbeating for `D` seconds, the coordinator waits until its
+  lease has surely expired (+`M`), records the failover durably, bumps the term and epochs, and
+  promotes the follower. A follower that is known to be out of sync is not promoted automatically.
+  The old primary later rejoins as a follower, drops any unconfirmed tail of its log, and catches
+  up. A primary that simply restarts also comes back as a follower and the coordinator promotes
+  its partner.
+- **Migration:** `SNAPSHOT_COPY → CATCHUP → PAUSE → FINAL_CATCHUP → VERIFY → CUTOVER → CLEANUP →
+  DONE`. Writes to the moving range pause briefly; the router retries them. Source and destination
+  checksums must match before the map is switched; after the switch the migration only rolls
+  forward. Unfinished migrations are retried or cleanly aborted (`ABORTING → ABORTED`).
+
+Details: [`docs/consistency.md`](docs/consistency.md), [`docs/failover.md`](docs/failover.md),
+[`docs/migration.md`](docs/migration.md).
+
+---
+
+## Testing and quality checks
 
 ```bash
-# Set client credentials
-export CLIENT_API_KEY="client-api-key-16chars-min"
-export ADMIN_TOKEN="coordinator-admin-token-32chars-min"
+make test-fast        # unit + integration tests
+make test             # full suite with coverage report (htmlcov/)
+make test-fault       # crash-injection tests (sets ENABLE_TEST_HOOKS=true)
+make test-security    # security tests
+make lint             # ruff: auto-fix and format
+make lint-check       # ruff: check only
+make typecheck        # mypy --strict
+make security         # bandit
+make audit            # pip-audit on the pinned dependencies
+make check            # lint-check + typecheck + security + audit + test-fast
+```
 
-# 1. Insert document
-python -m docstore.client insert --doc '{"doc_id": 42, "title": "DistSys", "rating": 5}'
+Or run pytest directly, e.g. `.venv/bin/pytest tests/integration/test_bugs.py -v`.
 
-# 2. Read document (primary or follower)
-python -m docstore.client get 42 --read-mode primary
-python -m docstore.client get 42 --read-mode follower
+The suite has **416 tests**: 415 pass and 1 Docker smoke test
+(`tests/integration/test_smoke_docker.py`) is skipped unless a live cluster is running on
+`127.0.0.1:8000`. `tests/integration/test_bugs.py` holds the regression tests for the bugs fixed
+during the code reviews. `tests/conftest.py` contains a small, documented test-only adapter that
+upgrades the older tests' request signatures; see the comment there.
 
-# 3. Query documents
-python -m docstore.client query --filter '{"rating": {"$gte": 4}}' --limit 10
+---
 
-# 4. Check cluster status & topology
-python -m docstore.client status
-python -m docstore.client shardmap
+## Demo and benchmarks
 
-# 5. Live range migration
-python -m docstore.client migrate --from-shard shard0 --to-shard shard1 --start 0 --end 1000
+```bash
+make demo     # scripted end-to-end demo, entirely in one process (no Docker, no .env)
+make bench    # benchmarks; results in results/, figures in docs/figures/
+```
 
-# 6. Bulk-load JSON file
-python -m docstore.client bulk-load dataset.json
+The demo loads data across 3 shards, crashes a primary during writes, shows automatic failover,
+fencing of the old primary, its rejoin, a full audit that no acknowledged write was lost, a live
+range migration with checksum verification, and tagged follower reads.
+
+---
+
+## Project layout
+
+```
+src/docstore/
+  common/        settings (.env), models, errors, auth (HMAC / tokens), HTTP helpers, logging
+  storage/       WAL, snapshots, in-memory engine + dedup table, WAL compaction
+  query/         filter validator, evaluator, sorter, shard-key detection
+  shard/         shard node: writes, replication, recovery, failover and migration endpoints
+  coordinator/   shard map, terms, leases, failure detection, failover, migration manager
+  router/        client API, routing, scatter-gather queries, shard-map cache
+  client/        Python SDK (sync + async) and the `docstore` CLI
+tests/           unit/, integration/, fault/, security/
+scripts/         demo.py, local_cluster.sh
+bench/           load generator, benchmark runner, plots
+docker/          docker-compose.yml, initial shard_map.json
+docs/            design and API documentation, report
 ```
 
 ---
 
-## Example Usage with `curl`
+## Troubleshooting
 
-Once the cluster (or router + shard node) is running, you can test operations using `curl`.
-
-### 1. Insert a Document (Write Path)
-
-Writes go to the router, which routes to the primary shard owning the `doc_id`. Replicated synchronously to the follower before returning `COMMITTED`:
-
-```bash
-curl -X POST http://127.0.0.1:8000/doc \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: client-api-key-16chars-min" \
-  -d '{
-    "request_id": "client-req-001",
-    "document": {
-      "doc_id": 42,
-      "name": "Distributed Systems",
-      "rating": 5,
-      "tags": ["database", "python"]
-    }
-  }'
-```
-
-**Expected Response (HTTP 201):**
-```json
-{
-  "outcome": "COMMITTED",
-  "request_id": "client-req-001",
-  "seq": 1,
-  "meta": {
-    "served_by": "primary",
-    "term": 1,
-    "ownership_epoch": 1,
-    "applied_seq": 1,
-    "replication_lag": null
-  }
-}
-```
-
-### 2. Idempotent Retry Test
-
-Sending the exact same `request_id` returns the cached outcome without duplicate insertion:
-
-```bash
-curl -X POST http://127.0.0.1:8000/doc \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: client-api-key-16chars-min" \
-  -d '{
-    "request_id": "client-req-001",
-    "document": {
-      "doc_id": 42,
-      "name": "Distributed Systems"
-    }
-  }'
-```
-
-### 3. Read from Primary vs Follower
-
-#### Read from Primary (Default):
-```bash
-curl -X GET http://127.0.0.1:8000/doc/42 \
-  -H "X-Api-Key: client-api-key-16chars-min"
-```
-*(Response has `"served_by": "primary"`)*
-
-#### Read from Follower:
-```bash
-curl -X GET "http://127.0.0.1:8000/doc/42?read_mode=follower" \
-  -H "X-Api-Key: client-api-key-16chars-min"
-```
-*(Response has `"served_by": "follower"`, `"applied_seq": 1`, and `"replication_lag": 0`)*
-
-### 4. Scatter-Gather Query (`POST /query`)
-
-Query documents matching structured Mongo-style filter expressions with pagination and sorting:
-
-```bash
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -H "X-Api-Key: client-api-key-16chars-min" \
-  -d '{
-    "filter": {
-      "$and": [
-        {"rating": {"$gte": 4}},
-        {"tags": {"$in": ["database", "nosql"]}}
-      ]
-    },
-    "sort_field": "rating",
-    "sort_dir": "desc",
-    "skip": 0,
-    "limit": 10
-  }'
-```
-
-Supported filter operators: `$eq`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$and`, `$or`.
-
-`total` in the response is the number of matching documents across the whole cluster (not the page size).
-
-### 5. Inspect Coordinator Status (`GET /admin/status`)
-
-Inspect lease states, replica states, terms, failover metrics, and shard health:
-
-```bash
-curl -X GET http://127.0.0.1:8100/admin/status \
-  -H "X-Admin-Token: coordinator-admin-token-32chars-min"
-```
+| Symptom | Cause / fix |
+|---|---|
+| Startup error mentioning the `.env.example` **placeholder** | Replace the `change-me` secrets in `.env` with generated values. |
+| Startup error about **`H < L < D`** or **`T + M < L - H`** | Your timing variables violate the lease constraints; restore the defaults or adjust them. |
+| `401 AUTH_FAILED` | Missing/wrong `X-Api-Key` (data) or `X-Admin-Token` (admin), or nodes started with different `CLUSTER_SECRET`s. |
+| Writes fail with `409 LEASE_EXPIRED` | The primary cannot renew its lease: is the coordinator running and is `COORDINATOR_URL` set on the shard nodes? |
+| Writes fail with `503 REPLICATION_UNAVAILABLE` | The shard's follower is down or still catching up (e.g. right after a failover). Reads keep working; writes resume once the follower is `SYNCED`. |
+| A node returns `503 NODE_NOT_READY` / refuses to start | Its local data failed a safety check (corrupt WAL, sequence gap, or a node data directory from an older build). Check its log; for old development data, delete the node's data directory (`rm -rf data/...`, or `make reset` with Docker). |
+| A shard never gets a primary after restarting everything | Startup takes a few seconds: the coordinator waits for old leases to expire (`L + M`) and for failure detection (`D`) before promoting. Watch `GET /admin/status`. |
+| Address already in use | Another process is on 8000/8100/8200–8205; stop it (or `scripts/local_cluster.sh stop`, `make down`). |
 
 ---
 
-## Failover, Fencing & Degraded Mode (Module 8 / M5)
+## Known limitations
 
-### Promotion Procedure
-1. **Detection:** Coordinator detects primary failure if no heartbeat is received within timeout $D$ (default 5.0 s), or when a shard has no registered primary — e.g. the primary restarted and came back as a follower.
-2. **Follower Verification:** Coordinator checks that the follower is alive and queries its highest durable sequence number.
-3. **Safety Wait:** Coordinator waits for the failed primary's lease to expire plus a safety margin $M$ ($L + M$) before allowing promotion.
-4. **Term & Epoch Bump:** A durable failover intent is written first; then the shard `term` is incremented and `ownership_epoch` for all ranges of that shard is bumped. The updated shard map and epoch history are saved durably to disk.
-5. **Promotion:** Follower is promoted to PRIMARY via `POST /internal/promote` with the map's authoritative ranges; it persists the new term, role and ranges **before** accepting writes. Unconfirmed promotions are retried, including after a coordinator restart.
-6. **Degraded Mode:** The newly promoted primary serves reads immediately (once granted a lease), but rejects writes with `503 REPLICATION_UNAVAILABLE` until a follower is `SYNCED`.
-
-### Old Primary Rejoin & Divergence Truncation
-- A returning failed primary never resumes as primary from past state.
-- When it restarts or contacts the coordinator, it is forced to role `FOLLOWER`.
-- It contacts the new primary via `POST /internal/divergence` to find the highest seq where both logs hold the identical entry (full entry identity, not just `term`).
-- Any uncommitted tail beyond the divergence point is truncated from its WAL, and memory index + dedup tables are rebuilt.
-- It catches up remaining ops via `/internal/catchup` (or falls back to snapshot resync), marks itself `SYNCED`, and notifies the primary.
-- The shard leaves degraded mode and normal synchronous replication resumes.
-
-### Two Metrics Tracked
-- **Failover Time:** Crash detection → follower promotion → first successful primary read.
-- **Write-Restoration Time:** Crash detection → old primary restarted & resynced to `SYNCED` → first successful write.
-
-### Test Crash Hooks
-- Enabled via `ENABLE_TEST_HOOKS=true` for deterministic fault injection:
-  1. `before_wal_append`: SIGKILL before appending write to WAL.
-  2. `after_primary_fsync`: Crash after primary WAL fsync, before follower replication.
-  3. `after_follower_fsync_before_ack`: Crash after follower WAL fsync, before follower returns ACK.
-  4. `after_follower_ack_before_client_ack`: Crash after follower ACK, before client reply.
-  5. `after_client_ack`: Normal completion crash.
+- **Single coordinator.** The coordinator is not replicated. If it is down, leases cannot be
+  renewed and writes stop until it is back; its state is on disk and recovered on restart.
+- **Single-node failures only.** If both replicas of a shard fail, that shard is unavailable.
+- **Writes need both replicas.** A shard whose follower is unavailable rejects writes rather than
+  weaken durability (`STANDALONE_MODE` exists for development only).
+- **Same-request replay.** Node-to-node signatures cover method, path, query and body but have
+  no timestamp, so someone able to capture internal traffic can re-send that *same* request.
+  There is no TLS; run the cluster on a trusted network.
+- **Coordinator restart while a primary is down.** If the follower had registered with the
+  previous coordinator instance, no automatic failover happens; use
+  `POST /admin/failover/{shard_id}`.
+- **Interrupted migrations** that had not reached cutover are aborted when the coordinator
+  restarts, and must be started again.
+- **No multi-document transactions**; writes are atomic per document and serialized per shard.
+- **Upgrades:** routers, shards and the coordinator must run the same version (request-signing
+  and shard authentication changed). Node data from older builds may fail the stricter WAL checks
+  and must be deleted.
 
 ---
 
-## Live Range Migration (Module 9 / M6)
+## Further documentation
 
-Live range migration allows transparent rebalancing of key ranges between shards without cluster downtime or data loss:
-
-### 1. Multi-Phase Persisted State Machine
-
-Managed and persisted by the Coordinator under `DATA_DIR/migrations/<id>.json`:
-
-```
-PLANNED ──► SNAPSHOT_COPY ──► CATCHUP ──► PAUSE ──► FINAL_CATCHUP ──► VERIFY ──► CUTOVER ──► CLEANUP ──► DONE
-   │                                                                     │          │
-   └──────────────────────────► ABORTED ◄────────────────────────────────┘          └── (Point of No Return)
-```
-
-- **SNAPSHOT_COPY:** Copies the range in cursor-paginated pages (500 docs, also bounded by bytes), starting at source sequence number $S$. Streamed to the destination primary via `/internal/migration/apply-batch` in batches bounded by count and serialized size; retried batches are not re-applied. Source keeps accepting live traffic, and pins its WAL after $S$ until catch-up has read it.
-- **Normal Replicated Write Path:** Destination ingests migrating records through its normal write-path and replicates them synchronously to its follower.
-- **Invisibility Invariant:** Migrating documents on the destination remain invisible to client reads (`GET /doc/{id}`) and queries (`POST /query`) until cutover occurs.
-- **CATCHUP:** Source streams WAL oplog entries with $\text{seq} > S$ overlapping $[start, end)$. Replayed idempotently (insert $\to$ upsert, delete $\to$ no-op if missing) on destination. Repeated until replication lag is minimized.
-- **PAUSE:** Coordinator temporarily pauses writes for the specific key range only (`RANGE_PAUSED`). Reads and queries continue to be served by the source shard.
-- **FINAL_CATCHUP:** Destination catches up with all remaining ops through paused sequence number $H$.
-- **VERIFY:** Coordinator verifies that source and destination have identical document counts and matching deterministic **SHA-256 canonical JSON** checksums (documents sorted by `doc_id`, keys sorted).
-- **CUTOVER (Commit Point):** Coordinator atomically persists the updated shard map with a bumped `ownership_epoch`. `VERIFY` and this write run under both shards' topology locks, after re-checking that neither primary nor term changed. This disk write is the **point of no return**:
-  - *Before Cutover:* Any error or failover aborts the migration, safely unpauses the source, and discards destination state.
-  - *After Cutover:* The migration must roll forward. If the map write reports an error, the coordinator re-reads the persisted map and rolls forward whenever the range already moved.
-  - Destination primary **and follower** must both confirm the new ownership; until they do, the migration stays in `CUTOVER` and is retried automatically.
-- **CLEANUP:** Source deletes old copies and drops the range only after cutover is durable.
-
-### 2. Transparent Cutover & Router Retries
-
-- Router retries transparently on HTTP 503 `RANGE_PAUSED` with bounded exponential backoff (up to 8 attempts, max 0.3s backoff).
-- Router automatically reloads the shard map on epoch bumps and redirects to the new owning shard with zero client-visible errors.
-
-### 3. Admin Migration API
-
-```bash
-# Start an asynchronous live migration
-curl -X POST http://127.0.0.1:8100/admin/migrate \
-  -H "Content-Type: application/json" \
-  -H "X-Admin-Token: coordinator-admin-token-32chars-min" \
-  -d '{
-    "from_shard": "shard0",
-    "to_shard": "shard1",
-    "start": 1000,
-    "end": 2000,
-    "sync": false
-  }'
-
-# Inspect migration progress and metrics
-curl -X GET http://127.0.0.1:8100/admin/migrate/{migration_id} \
-  -H "X-Admin-Token: coordinator-admin-token-32chars-min"
-```
-
----
-
-## Module Roadmap & Status
-
-| Module | Status | Milestone | Description |
-|---|---|---|---|
-| **0** | ✅ Done | Foundations | Project setup, Make, virtualenv, CI hygiene |
-| **1** | ✅ Done | Foundations | System contracts, config, typed errors, models, auth |
-| **2** | ✅ Done | M1 Gate | Storage engine (WAL with CRC32/fsync, snapshot, B-tree/index) |
-| **3** | ✅ Done | M1 Gate | Basic shard node durable HTTP CRUD API |
-| **4** | ✅ Done | M2 Gate | Shard map manager, static keyspace routing, router app |
-| **5** | ✅ Done | M3 Gate | Safe query filter engine, tie-breaking scatter-gather |
-| **6** | ✅ Done | M4 Gate | Central Coordinator, monotonic leases, epochs, heartbeats |
-| **7** | ✅ Done | M4 Gate | Sync durable replication, follower reads, catch-up, lag metrics |
-| **8** | ✅ Done | M5 Gate | Failover detection, fencing & demotion/promotion |
-| **9** | ✅ Done | M6 Gate | Live range migration, catch-up, pause, epoch cutover |
-| **10** | ✅ Done | M7 Gate | Python client library and Click CLI (`docstore-cli`) |
-| **12** | ✅ Done | M7 Gate | Security hardening, static analysis, cross-system test suite |
-| **13** | ✅ Done | M7 Gate | Benchmarking suite, metrics runner, publication plots |
-| **14** | ✅ Done | M7 Gate | Scripted end-to-end interactive demo (`make demo`) |
-| **15** | ✅ Done | M7 Gate | Final architecture & consistency documentation and report (`docs/REPORT.md`, `docs/report.tex`) |
-| **11** | ✅ Done | M7 Gate | Production Dockerfile and Docker Compose deployment (`make up`) |
-| **16** | ✅ Done | M7 Gate | Final release v1.0.0 (tagged and verified) |
-
----
-
-## Known Limitations
-
-- **Coordinator Single-Point-of-Failure:** Coordinator is not fault-tolerant. If it fails, existing primary leases expire and writes halt until restored.
-- **Single-Node Failure Scope:** Failover supports single-node (primary) failure per shard. If both replicas of a shard fail simultaneously, that shard is unavailable.
-- **Fail-Closed Synchronous Replication & Degraded Mode:** Writes require durable 2-node synchronous quorum (primary and follower WAL fsync). A primary without a configured follower or with an unavailable follower strictly rejects writes with `503 REPLICATION_UNAVAILABLE` before WAL append. Standalone development mode requires explicit opt-in (`STANDALONE_MODE=true` or `allow_standalone=True`) and is clearly separated from replicated production guarantees.
-- **Clock Assumptions:** Elapsed monotonic clock time is used locally for leases; cross-machine clock synchronization is not required.
-- **Single-Writer Shard Model:** One write at a time per shard lock provides serialized writes within each individual shard; cross-shard multi-document transactions are not coordinated.
-- **Same-request replay:** cluster signatures are bound to method, path, query and body, but carry no timestamp/nonce; someone who can capture internal traffic can re-send that *same* request (see `docs/security.md`).
-- **Coordinator restart with a dead primary:** if the coordinator restarts while a primary is down and its follower had registered with the previous coordinator instance, no automatic failover happens (followers do not re-register). Use `POST /admin/failover/{shard_id}`.
-- **Interrupted migration copies restart from scratch:** copy progress is persisted, but a coordinator restart aborts any migration that has not reached cutover.
-- **Upgrading clients and nodes together:** shard data routes now require `X-Api-Key` and cluster signatures cover the request route, so routers, shards and the coordinator must all run this version. `GET /shardmap` now needs `X-Admin-Token`, and the server refuses to start with the `change-me` placeholder secrets from `.env.example`.
-- **Upgrading old data directories:** nodes now verify WAL sequence continuity on startup. `data/` directories written by older builds may contain a WAL gap left by the old snapshot-install path and will refuse to start — delete them (`rm -rf data/`, or remove the Docker volumes) after upgrading. `make clean` does not touch node data.
+| Document | Contents |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Components, data and control paths, storage engine |
+| [`docs/api.md`](docs/api.md) | Every endpoint, request/response formats, error codes |
+| [`docs/contracts.md`](docs/contracts.md) | Exact system contracts (IDs, sequences, terms, epochs, idempotency, queries) |
+| [`docs/consistency.md`](docs/consistency.md) | Consistency model and fencing argument |
+| [`docs/failover.md`](docs/failover.md) | Failure detection, promotion, rejoin |
+| [`docs/migration.md`](docs/migration.md) | Live range migration state machine |
+| [`docs/security.md`](docs/security.md) | Authentication, threat model, limitations |
+| [`docs/REPORT.md`](docs/REPORT.md) | Evaluation results (latency, failover time, migration pause) |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Branching and commit conventions |
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [`LICENSE`](LICENSE).
