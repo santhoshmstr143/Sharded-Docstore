@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from docstore.common.auth import make_admin_auth_dependency, make_cluster_auth_dependency
@@ -32,6 +33,7 @@ from docstore.common.models import (
     NodeRegistration,
     RegistrationResponse,
     ShardMap,
+    safe_validation_message,
 )
 from docstore.coordinator.coordinator import CoordinatorService
 
@@ -62,31 +64,37 @@ def build_coordinator_app(
 
         # H5 / Module 8: Background health monitor — checks for timed-out nodes and auto-failovers.
         async def _health_monitor() -> None:
-            ticks = 0
             while True:
                 await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S)
-                ticks += 1
                 try:
                     await svc.check_and_trigger_failover()
                 except Exception as exc:
                     logger.warning("Health monitor failover check error: %s", exc)
-                # Drive migrations stuck past cutover (e.g. destination follower was
-                # down) to completion, without waiting for a coordinator restart.
-                if ticks % 5 == 0:
-                    try:
-                        await svc.migration_mgr.retry_post_cutover(svc)
-                    except Exception as exc:
-                        logger.warning("Post-cutover migration retry error: %s", exc)
 
-        monitor_task = asyncio.create_task(_health_monitor())
+        # Separate loop: migration RPCs (10 s timeouts) must never delay failure detection.
+        async def _migration_monitor() -> None:
+            while True:
+                await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S * 5)
+                # Drive migrations stuck past cutover (e.g. destination follower was down)
+                # or in ABORTING to completion, without waiting for a coordinator restart.
+                try:
+                    await svc.migration_mgr.retry_post_cutover(svc)
+                except Exception as exc:
+                    logger.warning("Stalled migration retry error: %s", exc)
+
+        tasks = [
+            asyncio.create_task(_health_monitor()),
+            asyncio.create_task(_migration_monitor()),
+        ]
 
         yield
 
-        monitor_task.cancel()
-        try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
+        for t in tasks:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
         logger.info("Coordinator shut down")
 
@@ -105,7 +113,7 @@ def build_coordinator_app(
 
     # ── Public Endpoints ──────────────────────────────────────────────────────
 
-    @app.get("/shardmap")
+    @app.get("/shardmap", dependencies=[Depends(admin_auth)])
     async def get_shard_map(request: Request) -> ShardMap:
         service = get_service(request)
         return service.shard_map
@@ -144,10 +152,16 @@ def build_coordinator_app(
         return service.get_cluster_status()
 
     @app.post("/admin/failover/{shard_id}", dependencies=[Depends(admin_auth)])
-    async def admin_failover(shard_id: str, request: Request) -> dict[str, Any]:
-        """Manually trigger failover for a shard."""
+    async def admin_failover(
+        shard_id: str, request: Request, force: bool = False
+    ) -> dict[str, Any]:
+        """Manually trigger failover for a shard.
+
+        ``force=true`` promotes the follower even if it is known to be unsynced or behind
+        the primary's last reported sequence number (may lose committed writes).
+        """
         service = get_service(request)
-        promoted = await service.trigger_failover(shard_id)
+        promoted = await service.trigger_failover(shard_id, force=force)
         if not promoted:
             raise HTTPException(
                 status_code=400,
@@ -164,7 +178,10 @@ def build_coordinator_app(
         sync: bool = False,
     ) -> dict[str, Any]:
         """Trigger live range migration from one shard to another."""
-        rng = body.get("range", {})
+        rng = body.get("range")
+        if not isinstance(rng, dict):
+            # Also accept top-level start/end (the shape documented in the README).
+            rng = {"start": body.get("start"), "end": body.get("end")}
         start = rng.get("start")
         end = rng.get("end")
         from_shard = body.get("from_shard")
@@ -240,6 +257,19 @@ def build_coordinator_app(
         return [m.to_dict() for m in svc.migration_mgr.migrations.values()]
 
     # ── Error handler (no stack traces) ───────────────────────────────────────
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # FastAPI's default 422 echoes the submitted input back; report only what failed.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "VALIDATION_ERROR",
+                "error_message": safe_validation_message(exc),
+            },
+        )
 
     @app.exception_handler(HTTPException)
     async def _http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:

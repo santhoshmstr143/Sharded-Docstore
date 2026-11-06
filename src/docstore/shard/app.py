@@ -52,13 +52,15 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from docstore.common.auth import (
     CLUSTER_SIG_HEADER,
-    compute_signature,
+    make_client_auth_dependency,
     make_cluster_auth_dependency,
+    sign_request,
 )
 from docstore.common.config import Settings
 from docstore.common.errors import (
@@ -95,6 +97,7 @@ from docstore.common.models import (
     WriteOp,
     WriteOutcome,
     WriteResponse,
+    safe_validation_message,
     serialized_doc_size,
 )
 from docstore.common.test_hooks import trigger_hook
@@ -145,11 +148,42 @@ class DeleteBody(_FencedWrite):
     request_id: str = Field(min_length=1, max_length=128)
 
 
+_MAX_QUERY_RANGES = 64
+_KEYSPACE_END = 2**63
+
+
+def _merge_ranges(ranges: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and coalesce overlapping / adjacent half-open ranges."""
+    merged: list[tuple[int, int]] = []
+    for s, e in sorted(ranges):
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 class ShardQueryBody(QueryFilter):
     """Shard-side query: the router may restrict evaluation to the ranges it
-    attributes to this shard, so pagination happens *after* the range restriction."""
+    attributes to this shard, so pagination happens *after* the range restriction.
 
-    ranges: list[tuple[int, int]] | None = None
+    The list is bounded and validated: duplicate / overlapping entries used to be
+    scanned once each, letting one small request multiply the scan cost unboundedly.
+    """
+
+    ranges: list[tuple[StrictInt, StrictInt]] | None = Field(
+        default=None, max_length=_MAX_QUERY_RANGES
+    )
+
+    @field_validator("ranges")
+    @classmethod
+    def _valid_ranges(cls, v: list[tuple[int, int]] | None) -> list[tuple[int, int]] | None:
+        if v is None:
+            return None
+        for s, e in v:
+            if not (0 <= s < e <= _KEYSPACE_END):
+                raise ValueError(f"invalid range [{s}, {e})")
+        return _merge_ranges(v)
 
 
 # ── Node state ────────────────────────────────────────────────────────────────
@@ -495,15 +529,29 @@ async def _recover(state: NodeState) -> None:
     wal.open()
     state.wal = wal
 
+    if snap and snap.get("installed"):
+        earliest = wal.earliest_seq()
+        if earliest is not None and earliest <= after_seq:
+            # Crashed after installing a snapshot from the primary but before resetting the
+            # local WAL: the old entries are superseded (possibly divergent) history.
+            logger.warning(
+                "Recovery: discarding local WAL superseded by installed snapshot at seq %d",
+                after_seq,
+            )
+            wal.reset(after_seq + 1)
+
     state.committed_seq = max(state.committed_seq, state.engine.last_applied_seq)
-    if not is_disk_recovery and snap is None:
-        state.committed_seq = wal.last_seq
-    elif state.allow_standalone:
-        # In standalone mode, all local WAL operations are committed locally.
-        state.committed_seq = max(state.committed_seq, wal.last_seq)
 
     # base_seq: the retained WAL must continue the snapshot without a gap.
+    # Replay first: wal.last_seq is only known once the log has been read.
     wal_entries = list(wal.replay(after_seq=after_seq, base_seq=after_seq))
+    if state.allow_standalone and (is_disk_recovery or snap is not None):
+        # Standalone mode has no follower: every locally durable WAL entry is committed.
+        # (Computing this before the replay saw last_seq == 0 and wedged the node with a
+        # permanently "pending" write after a crash between WAL append and metadata write.)
+        state.committed_seq = max(state.committed_seq, wal.last_seq)
+    # Without metadata or a snapshot nothing is known to be committed: any WAL entries
+    # stay unresolved until reconciled with a follower.
     for entry in wal_entries:
         entry_term = entry.get("term", 1)
         if entry_term > state.term:
@@ -584,7 +632,8 @@ def _rebuild_engine_from_disk(state: NodeState) -> None:
     The WAL may have been compacted, so it alone is not the full history: start from
     the snapshot and replay only the entries after it.
     """
-    assert state.wal is not None
+    if state.wal is None:  # explicit: asserts are stripped under -O
+        raise RuntimeError("state.wal is unavailable")
     state.engine._docs.clear()
     state.engine._index.clear()
     state.engine._doc_seq.clear()
@@ -612,6 +661,50 @@ def _rebuild_engine_from_disk(state: NodeState) -> None:
                     term=entry.get("term", state.term),
                 ),
             )
+
+
+_MISSING: Any = object()
+
+
+def _bad_body(msg: str) -> HTTPException:
+    return HTTPException(
+        status_code=422, detail={"error_code": "VALIDATION_ERROR", "error_message": msg}
+    )
+
+
+def _strict_int(
+    body: dict[str, Any],
+    name: str,
+    *,
+    lo: int = 0,
+    hi: int = 2**63,
+    default: Any = _MISSING,
+) -> int:
+    """Read an integer field from an internal request body, strictly (no bool / str)."""
+    if name not in body or body[name] is None:
+        if default is _MISSING:
+            raise _bad_body(f"'{name}' is required")
+        return int(default)
+    v = body[name]
+    if isinstance(v, bool) or not isinstance(v, int) or not (lo <= v <= hi):
+        raise _bad_body(f"'{name}' must be an integer in [{lo}, {hi}]")
+    return v
+
+
+def _body_range(body: dict[str, Any]) -> tuple[int, int]:
+    """``start`` / ``end`` of an internal range request: integers, 0 <= start < end <= 2^63."""
+    start = _strict_int(body, "start", hi=_KEYSPACE_END - 1)
+    end = _strict_int(body, "end", lo=1, hi=_KEYSPACE_END)
+    if start >= end:
+        raise _bad_body(f"empty or inverted range [{start}, {end})")
+    return start, end
+
+
+def _migration_id(body: dict[str, Any]) -> str:
+    mig = body.get("migration_id", "mig")
+    if not isinstance(mig, str) or not mig or len(mig) > 128:
+        raise _bad_body("'migration_id' must be a non-empty string of at most 128 chars")
+    return mig
 
 
 def _require_same_shard(state: NodeState, shard_id: Any) -> None:
@@ -785,7 +878,7 @@ async def _replicate_to_follower(
             "payload": payload,
         }
         body_bytes = json.dumps(req_body, separators=(",", ":")).encode("utf-8")
-        sig = compute_signature(state.settings.CLUSTER_SECRET, body_bytes)
+        sig = sign_request(state.settings.CLUSTER_SECRET, "POST", url, body_bytes)
         headers = {
             "Content-Type": "application/json",
             CLUSTER_SIG_HEADER: sig,
@@ -874,7 +967,7 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
         "entry_id": entry_id,
     }
     body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    sig = compute_signature(state.settings.CLUSTER_SECRET, body_bytes)
+    sig = sign_request(state.settings.CLUSTER_SECRET, "POST", url, body_bytes)
     headers = {
         "Content-Type": "application/json",
         CLUSTER_SIG_HEADER: sig,
@@ -923,7 +1016,9 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
                         "request_id": request_id,
                         "payload": pending.get("payload"),
                     }
-                    state.engine.apply(apply_entry)
+                    state.engine.apply(
+                        apply_entry, migration_mode=bool(pending.get("migration_mode"))
+                    )
                 elif state.wal:
                     for w in state.wal.replay(after_seq=max(0, seq - 1)):
                         if w.get("seq") == seq and w.get("request_id") == request_id:
@@ -1012,6 +1107,132 @@ async def _require_no_pending_writes(state: NodeState, what: str) -> None:
                 "error_message": f"Unresolved pending writes exist; cannot {what}.",
             },
         )
+
+
+def _fail_stop(state: NodeState, reason: str) -> None:
+    """Take the node out of service after an unrecoverable local I/O failure.
+
+    A node that cannot write its WAL must not keep looking healthy: it stops serving
+    (every endpoint returns NODE_NOT_READY), stops heartbeating and drops its lease, so
+    the coordinator fails over to the follower. A restart re-runs recovery.
+    """
+    state.ready = False
+    state.lease_expires_at = 0.0
+    logger.critical("Node %s fail-stopped: %s", state.node_id, reason)
+
+
+def _wal_append(state: NodeState, **record: Any) -> dict[str, Any]:
+    """Append to the WAL; on an uncertain I/O failure fail-stop the node, then re-raise."""
+    if state.wal is None:
+        raise RuntimeError("WAL is not open.")
+    try:
+        return state.wal.append(**record)
+    except Exception as exc:
+        if state.wal.failed:
+            _fail_stop(state, f"WAL append failed: {exc}")
+        raise
+
+
+def _mark_pending(
+    state: NodeState,
+    request_id: str,
+    seq: int,
+    op: WriteOp,
+    doc_id: int,
+    payload: dict[str, Any] | None,
+    *,
+    fingerprint: str | None = None,
+    migration_mode: bool = False,
+) -> None:
+    """Track a WAL entry whose replication outcome is unknown.
+
+    Every path that appends to the WAL and then fails to replicate MUST call this:
+    an untracked entry would leave the engine behind the WAL, so the next write
+    would commit but fail to apply (and its retry would execute twice).
+    """
+    state.follower_state = ReplicaState.DOWN
+    state.pending_unresolved_writes[request_id] = {
+        "seq": seq,
+        "term": state.term,
+        "op": op.value,
+        "doc_id": doc_id,
+        "payload": payload,
+        "migration_mode": migration_mode,
+    }
+    state.engine.dedup_store(
+        request_id,
+        DedupEntry(
+            seq=seq,
+            outcome=WriteOutcome.OUTCOME_UNKNOWN,
+            result={"outcome": WriteOutcome.OUTCOME_UNKNOWN, "seq": seq},
+            term=state.term,
+            fingerprint=fingerprint,
+        ),
+    )
+
+
+def _persist_commit_best_effort(state: NodeState) -> None:
+    """Persist committed_seq after a write is already durable on both replicas.
+
+    The write is committed once the follower fsynced it; failing to record the
+    high-water mark locally only means recovery will re-confirm it with the
+    follower. It must not turn a committed write into an error for the client.
+    """
+    try:
+        _persist_node_metadata(state)
+    except Exception as exc:
+        logger.error(
+            "Node %s: committed write durable on both replicas, but persisting "
+            "committed_seq=%d failed: %s",
+            state.node_id,
+            state.committed_seq,
+            exc,
+        )
+
+
+async def _append_replicated(
+    state: NodeState,
+    op: WriteOp,
+    doc_id: int,
+    request_id: str,
+    payload: dict[str, Any] | None,
+    *,
+    what: str,
+) -> int:
+    """Append + replicate + apply one internal (migration / purge) operation.
+
+    On replication failure the entry is tracked as pending (never orphaned) and a
+    503 is raised; the caller may retry once the pending entry is reconciled.
+    Caller holds the write lock and has verified no writes are pending.
+    """
+    if state.wal is None:  # explicit: asserts are stripped under -O
+        raise RuntimeError("state.wal is unavailable")
+    seq = state.wal.next_seq()
+    entry = _wal_append(
+        state,
+        seq=seq,
+        op=op.value,
+        doc_id=doc_id,
+        term=state.term,
+        request_id=request_id,
+        payload=payload,
+    )
+    if state.follower_url:
+        ok = await _replicate_to_follower(state, seq, op, doc_id, request_id, payload)
+        if not ok:
+            _mark_pending(state, request_id, seq, op, doc_id, payload, migration_mode=True)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "REPLICATION_UNAVAILABLE",
+                    "error_message": f"Follower replication failed during {what}",
+                },
+            )
+        state.follower_acked_seq = max(state.follower_acked_seq, seq)
+    state.engine.apply(entry, migration_mode=True)
+    state.committed_seq = max(state.committed_seq, seq)
+    _store_committed(state, request_id, seq)
+    return seq
 
 
 def _store_committed(state: NodeState, request_id: str, seq: int) -> None:
@@ -1181,16 +1402,27 @@ async def _execute_write(
         )
 
         # 8. Assign sequence number & append to primary WAL (durable)
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         seq = state.wal.next_seq()
-        state.wal.append(
-            seq=seq,
-            term=state.term,
-            op=op.value,
-            doc_id=doc_id,
-            request_id=request_id,
-            payload=payload,
-        )
+        try:
+            _wal_append(
+                state,
+                seq=seq,
+                term=state.term,
+                op=op.value,
+                doc_id=doc_id,
+                request_id=request_id,
+                payload=payload,
+            )
+        except Exception as exc:
+            if state.wal.failed:
+                # The record may or may not be on disk: the outcome is genuinely unknown.
+                raise OutcomeUnknown(
+                    f"WAL write failed (seq={seq}); node stopped serving. "
+                    "Retry with the same request_id."
+                ) from exc
+            raise
 
         # Test hook 2: after primary fsync
         trigger_hook(
@@ -1206,35 +1438,18 @@ async def _execute_write(
             replicated = await _replicate_to_follower(state, seq, op, doc_id, request_id, payload)
             if not replicated:
                 # Follower failed after primary WAL append: outcome unknown
-                state.follower_state = ReplicaState.DOWN
-                state.pending_unresolved_writes[request_id] = {
-                    "seq": seq,
-                    "term": state.term,
-                    "op": op.value,
-                    "doc_id": doc_id,
-                    "payload": payload,
-                }
-                state.engine.dedup_store(
-                    request_id,
-                    DedupEntry(
-                        seq=seq,
-                        outcome=WriteOutcome.OUTCOME_UNKNOWN,
-                        result={"outcome": WriteOutcome.OUTCOME_UNKNOWN, "seq": seq},
-                        term=state.term,
-                        fingerprint=fp,
-                    ),
-                )
+                _mark_pending(state, request_id, seq, op, doc_id, payload, fingerprint=fp)
                 raise OutcomeUnknown(
                     f"Write appended to primary WAL (seq={seq}), but follower replication failed."
                 )
             state.follower_acked_seq = seq
             state.committed_seq = max(state.committed_seq, seq)
             state.pending_unresolved_writes.pop(request_id, None)
-            _persist_node_metadata(state)
+            _persist_commit_best_effort(state)
         elif state.allow_standalone:
             # Explicit standalone mode: local-only commit (clearly distinguished)
             state.committed_seq = max(state.committed_seq, seq)
-            _persist_node_metadata(state)
+            _persist_commit_best_effort(state)
         else:
             raise ReplicationUnavailable(
                 "Primary has no configured follower; cannot commit without synchronous replication."
@@ -1310,8 +1525,8 @@ async def resync_with_primary(
         owns_client = True
 
     try:
-        assert state.wal is not None
-        # 1. Collect local log entries with deterministic identities
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         local_entries = [
             {
                 "seq": e["seq"],
@@ -1332,7 +1547,7 @@ async def resync_with_primary(
         base_seq = (local_entries[0]["seq"] - 1) if local_entries else state.wal.last_seq
         body_dict = {"shard_id": state.shard_id, "entries": local_entries, "base_seq": base_seq}
         body_bytes = json.dumps(body_dict, separators=(",", ":")).encode("utf-8")
-        sig = compute_signature(state.settings.CLUSTER_SECRET, body_bytes)
+        sig = sign_request(state.settings.CLUSTER_SECRET, "POST", div_url, body_bytes)
         headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
 
         resp = await client.post(div_url, content=body_bytes, headers=headers)
@@ -1350,7 +1565,7 @@ async def resync_with_primary(
             if needs_snapshot:
                 # Full snapshot resync
                 snap_url = f"http://{clean_primary}/internal/snapshot"
-                snap_sig = compute_signature(state.settings.CLUSTER_SECRET, b"")
+                snap_sig = sign_request(state.settings.CLUSTER_SECRET, "GET", snap_url)
                 snap_resp = await client.get(snap_url, headers={CLUSTER_SIG_HEADER: snap_sig})
                 if snap_resp.status_code != 200:
                     logger.warning("Snapshot fetch failed: %d", snap_resp.status_code)
@@ -1450,6 +1665,7 @@ async def resync_with_primary(
                         term=target_term,
                         ownership_epochs=target_epochs,
                         dedup_table=dedup_table,
+                        installed=True,
                     )
                 except Exception as exc:
                     logger.error(
@@ -1475,6 +1691,7 @@ async def resync_with_primary(
                 #    sequence gap (or divergent history) in front of the next entries.
                 if state.wal is not None:
                     state.wal.reset(state.engine.last_applied_seq + 1)
+                catchup_from = state.engine.last_applied_seq
             else:
                 # Invariant: Rejoining node must never silently overwrite locally committed history!
                 if div_seq < state.committed_seq:
@@ -1519,48 +1736,59 @@ async def resync_with_primary(
                 # Rebuild in-memory engine and dedup up to div_seq (snapshot + WAL)
                 _rebuild_engine_from_disk(state)
 
-                # Catchup missing entries with seq > div_seq
-                catchup_url = f"http://{clean_primary}/internal/catchup"
-                req_b = {"shard_id": state.shard_id, "after_seq": div_seq}
-                b_bytes = json.dumps(req_b, separators=(",", ":")).encode("utf-8")
-                c_sig = compute_signature(state.settings.CLUSTER_SECRET, b_bytes)
-                c_resp = await client.post(
-                    catchup_url,
-                    content=b_bytes,
-                    headers={
-                        "Content-Type": "application/json",
-                        CLUSTER_SIG_HEADER: c_sig,
-                    },
-                )
-                if c_resp.status_code != 200:
-                    logger.warning(
-                        "Catchup failed with status %d: %s", c_resp.status_code, c_resp.text
-                    )
-                    return False
+                catchup_from = div_seq
 
-                c_data = c_resp.json()
-                for entry in c_data.get("entries", []):
-                    state.wal.append(
-                        seq=entry["seq"],
-                        term=entry["term"],
-                        op=entry["op"],
-                        doc_id=entry["doc_id"],
-                        request_id=entry.get("request_id", ""),
-                        payload=entry.get("payload"),
+            # Catch up every entry after the installed snapshot / divergence point.
+            # Both paths need this: after a snapshot install the primary may still hold
+            # WAL entries beyond its snapshot (e.g. a pending write); skipping them would
+            # leave the follower "SYNCED" yet missing entries the primary waits for.
+            catchup_url = f"http://{clean_primary}/internal/catchup"
+            req_b = {"shard_id": state.shard_id, "after_seq": catchup_from}
+            b_bytes = json.dumps(req_b, separators=(",", ":")).encode("utf-8")
+            c_sig = sign_request(state.settings.CLUSTER_SECRET, "POST", catchup_url, b_bytes)
+            c_resp = await client.post(
+                catchup_url,
+                content=b_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    CLUSTER_SIG_HEADER: c_sig,
+                },
+            )
+            if c_resp.status_code != 200:
+                logger.warning("Catchup failed with status %d: %s", c_resp.status_code, c_resp.text)
+                return False
+
+            c_data = c_resp.json()
+            if c_data.get("needs_snapshot"):
+                # The primary compacted past our position since the divergence check;
+                # fail this round: the next attempt is told to install a snapshot.
+                logger.warning(
+                    "Catch-up from seq %d needs a snapshot; retrying resync later", catchup_from
+                )
+                return False
+            for entry in c_data.get("entries", []):
+                _wal_append(
+                    state,
+                    seq=entry["seq"],
+                    term=entry["term"],
+                    op=entry["op"],
+                    doc_id=entry["doc_id"],
+                    request_id=entry.get("request_id", ""),
+                    payload=entry.get("payload"),
+                )
+                if entry.get("term", 0) > state.term:
+                    state.term = entry["term"]
+                state.engine.apply(entry)
+                rid = entry.get("request_id")
+                if rid:
+                    state.engine.dedup_store(
+                        rid,
+                        DedupEntry(
+                            seq=entry["seq"],
+                            outcome=WriteOutcome.COMMITTED,
+                            result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
+                        ),
                     )
-                    if entry.get("term", 0) > state.term:
-                        state.term = entry["term"]
-                    state.engine.apply(entry)
-                    rid = entry.get("request_id")
-                    if rid:
-                        state.engine.dedup_store(
-                            rid,
-                            DedupEntry(
-                                seq=entry["seq"],
-                                outcome=WriteOutcome.COMMITTED,
-                                result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
-                            ),
-                        )
 
             state.committed_seq = max(state.committed_seq, state.engine.last_applied_seq)
             _persist_node_metadata(state)
@@ -1578,7 +1806,7 @@ async def resync_with_primary(
                 "ownership_epochs": {f"{r.start}-{r.end}": r.ownership_epoch for r in state.ranges},
             }
             comp_bytes = json.dumps(comp_body, separators=(",", ":")).encode("utf-8")
-            comp_sig = compute_signature(state.settings.CLUSTER_SECRET, comp_bytes)
+            comp_sig = sign_request(state.settings.CLUSTER_SECRET, "POST", complete_url, comp_bytes)
             comp_resp = await client.post(
                 complete_url,
                 content=comp_bytes,
@@ -1716,7 +1944,7 @@ def build_app(
                                 "requested_role": state.role.value,
                             }
                             rb = json.dumps(reg_body, separators=(",", ":")).encode("utf-8")
-                            rsig = compute_signature(settings.CLUSTER_SECRET, rb)
+                            rsig = sign_request(settings.CLUSTER_SECRET, "POST", reg_url, rb)
                             t_reg = time.monotonic()
                             rresp = await hb_client.post(
                                 reg_url,
@@ -1746,7 +1974,7 @@ def build_app(
                             "timestamp_monotonic": time.monotonic(),
                         }
                         body_b = json.dumps(hb_data, separators=(",", ":")).encode("utf-8")
-                        sig = compute_signature(settings.CLUSTER_SECRET, body_b)
+                        sig = sign_request(settings.CLUSTER_SECRET, "POST", url, body_b)
                         headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
                         # Lease safety: count from when the request was SENT, never from when
                         # the reply arrived, so we can never outlive the coordinator's lease.
@@ -1800,7 +2028,7 @@ def build_app(
                     raw = json.dumps(
                         {"primary_url": state.advertise_addr}, separators=(",", ":")
                     ).encode("utf-8")
-                    sig = compute_signature(settings.CLUSTER_SECRET, raw)
+                    sig = sign_request(settings.CLUSTER_SECRET, "POST", "/internal/resync", raw)
                     client = state.http_client
                     own = client is None
                     if client is None:
@@ -1912,6 +2140,9 @@ def build_app(
         return response
 
     cluster_auth = make_cluster_auth_dependency(lambda: settings.CLUSTER_SECRET)
+    # Data routes are reachable on the shard's port, not just via the router: they must
+    # authenticate the client API key themselves (the router forwards it).
+    client_auth = make_client_auth_dependency(lambda: settings.CLIENT_API_KEY)
 
     def _check_doc_size(doc: dict[str, Any]) -> None:
         size = serialized_doc_size(doc)
@@ -1931,7 +2162,7 @@ def build_app(
 
     # ── Public Endpoints ──────────────────────────────────────────────────────
 
-    @app.post("/doc", status_code=201)
+    @app.post("/doc", status_code=201, dependencies=[Depends(client_auth)])
     async def insert_doc(body: InsertBody, request: Request) -> WriteResponse:
         state = get_node(request)
         if state.role != NodeRole.PRIMARY:
@@ -1944,7 +2175,10 @@ def build_app(
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
-                detail={"error_code": "VALIDATION_ERROR", "error_message": str(exc)},
+                detail={
+                    "error_code": "VALIDATION_ERROR",
+                    "error_message": safe_validation_message(exc),
+                },
             ) from exc
 
         doc_dict = doc.model_dump()
@@ -1963,7 +2197,7 @@ def build_app(
         except DocstoreError as exc:
             raise exc.to_http_exception() from exc
 
-    @app.put("/doc/{doc_id}")
+    @app.put("/doc/{doc_id}", dependencies=[Depends(client_auth)])
     async def update_doc(doc_id: int, body: UpdateBody, request: Request) -> WriteResponse:
         state = get_node(request)
         if state.role != NodeRole.PRIMARY:
@@ -1976,7 +2210,10 @@ def build_app(
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
-                detail={"error_code": "VALIDATION_ERROR", "error_message": str(exc)},
+                detail={
+                    "error_code": "VALIDATION_ERROR",
+                    "error_message": safe_validation_message(exc),
+                },
             ) from exc
 
         if doc.doc_id != doc_id:
@@ -2003,7 +2240,7 @@ def build_app(
         except DocstoreError as exc:
             raise exc.to_http_exception() from exc
 
-    @app.delete("/doc/{doc_id}")
+    @app.delete("/doc/{doc_id}", dependencies=[Depends(client_auth)])
     async def delete_doc(doc_id: int, body: DeleteBody, request: Request) -> WriteResponse:
         state = get_node(request)
         if state.role != NodeRole.PRIMARY:
@@ -2024,7 +2261,7 @@ def build_app(
         except DocstoreError as exc:
             raise exc.to_http_exception() from exc
 
-    @app.get("/doc/{doc_id}")
+    @app.get("/doc/{doc_id}", dependencies=[Depends(client_auth)])
     async def get_doc(doc_id: int, request: Request) -> ReadResponse:
         state = get_node(request)
         if not state.owns(doc_id):
@@ -2042,7 +2279,7 @@ def build_app(
             meta=state.response_meta(doc_id),
         )
 
-    @app.post("/query")
+    @app.post("/query", dependencies=[Depends(client_auth)])
     async def query_docs(body: ShardQueryBody, request: Request) -> QueryResponse:
         state = get_node(request)
         try:
@@ -2064,7 +2301,18 @@ def build_app(
                     lo, hi = max(o_s, q_s), min(o_e, q_e)
                     if lo < hi:
                         restricted.append((lo, hi))
-            effective = sorted(restricted)
+            effective = _merge_ranges(restricted)
+            # The caller believes this shard owns these ranges. If it does not own all
+            # of them, the caller's map is stale (e.g. a range migrated away): answering
+            # with a silent partial result would hide documents, so refuse instead and
+            # let the router refresh its map and retry.
+            covered = sum(hi - lo for lo, hi in effective)
+            requested = sum(e - s for s, e in body.ranges)
+            if covered != requested:
+                raise OutOfRange(
+                    f"Shard {state.shard_id} does not own all requested ranges "
+                    f"{body.ranges}; owned {[(r.start, r.end) for r in state.ranges]}."
+                ).to_http_exception()
 
         def _in_effective(did: int) -> bool:
             return any(lo <= did < hi for lo, hi in effective)
@@ -2074,7 +2322,8 @@ def build_app(
         candidates: list[dict[str, Any]] = []
 
         if constraint.kind == "exact":
-            assert constraint.doc_id is not None
+            if constraint.doc_id is None:  # explicit: asserts are stripped under -O
+                raise RuntimeError("constraint.doc_id is unavailable")
             if _in_effective(constraint.doc_id):
                 doc = state.engine.get(constraint.doc_id)
                 if doc is not None:
@@ -2086,7 +2335,10 @@ def build_app(
                     if doc is not None:
                         candidates.append(doc)
         elif constraint.kind == "range":
-            assert constraint.range_start is not None and constraint.range_end is not None
+            if (
+                constraint.range_start is None or constraint.range_end is None
+            ):  # explicit: asserts are stripped under -O
+                raise RuntimeError("constraint.range_start / constraint.range_end unavailable")
             for lo, hi in effective:
                 s = max(constraint.range_start, lo)
                 e = min(constraint.range_end, hi)
@@ -2097,7 +2349,12 @@ def build_app(
                 candidates.extend(state.engine.range_scan(lo, hi))
 
         matched = [doc for doc in candidates if evaluate_filter(doc, body.filter)]
-        sorted_docs = sort_documents(matched, sort_field=body.sort_field, sort_dir=body.sort_dir)
+        try:
+            sorted_docs = sort_documents(
+                matched, sort_field=body.sort_field, sort_dir=body.sort_dir
+            )
+        except InvalidQuery as exc:  # e.g. sorting on an array / object field
+            raise exc.to_http_exception() from exc
         total = len(sorted_docs)
         paginated = sorted_docs[body.skip : body.skip + body.limit]
 
@@ -2117,7 +2374,7 @@ def build_app(
             )
         return {"status": "ok"}
 
-    @app.get("/status")
+    @app.get("/status", dependencies=[Depends(client_auth)])
     async def node_status(request: Request) -> dict[str, Any]:
         state: NodeState = request.app.state.node
         lag = None
@@ -2162,12 +2419,14 @@ def build_app(
         if body.term > state.term:
             state.term = body.term
 
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         expected_seq = state.wal.next_seq()
 
         if body.seq == expected_seq:
             # 1. Append to follower WAL and fsync
-            state.wal.append(
+            _wal_append(
+                state,
                 seq=body.seq,
                 term=body.term,
                 op=body.op.value,
@@ -2248,7 +2507,8 @@ def build_app(
     async def catchup(body: CatchupRequest, request: Request) -> CatchupResponse:
         state = get_node(request)
         _require_same_shard(state, body.shard_id)
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
 
         earliest = state.wal.earliest_seq()
         if earliest is not None and earliest > body.after_seq + 1:
@@ -2276,7 +2536,15 @@ def build_app(
         wal_last_seq = state.wal.last_seq if state.wal else 0
         last_applied_seq = state.engine.last_applied_seq
 
-        if seq is None or term is None or not request_id:
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or seq < 1
+            or not isinstance(term, int)
+            or isinstance(term, bool)
+            or not isinstance(request_id, str)
+            or not request_id
+        ):
             return {
                 "status": "invalid_identity",
                 "has_op": False,
@@ -2354,7 +2622,7 @@ def build_app(
         state = get_node(request)
         _require_same_shard(state, body.get("shard_id"))
         async with state.write_lock():
-            snap_seq = int(body.get("last_applied_seq", 0))
+            snap_seq = _strict_int(body, "last_applied_seq", default=0)
             if snap_seq < state.committed_seq:
                 raise HTTPException(
                     status_code=409,
@@ -2363,7 +2631,7 @@ def build_app(
                         f"local committed_seq ({state.committed_seq})"
                     ),
                 )
-            snap_term = int(body.get("term", state.term))
+            snap_term = _strict_int(body, "term", default=state.term)
             if snap_term < state.term:
                 raise HTTPException(
                     status_code=409,
@@ -2415,6 +2683,7 @@ def build_app(
                         term=target_term,
                         ownership_epochs=target_epochs,
                         dedup_table=dedup_table,
+                        installed=True,
                     )
                 except Exception as exc:
                     logger.error("Failed to durably persist applied snapshot: %s", exc)
@@ -2647,7 +2916,8 @@ def build_app(
     async def get_divergence_point(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         _require_same_shard(state, body.get("shard_id"))
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
 
         entries = body.get("entries", [])
         earliest = state.wal.earliest_seq() or 1
@@ -2676,8 +2946,9 @@ def build_app(
             base_seq = 0
         base_seq = max(0, base_seq)
 
-        if base_seq > 0 and (base_seq > last_seq or base_seq + 1 < earliest):
-            # We cannot continue the follower's log from its base: full snapshot needed.
+        if base_seq > last_seq or base_seq + 1 < earliest:
+            # We cannot continue the follower's log from its base (this includes an empty,
+            # freshly provisioned follower against a compacted WAL): full snapshot needed.
             needs_snapshot = True
         # If follower's earliest entry is older than primary's earliest available entry
         elif sorted_entries and int(sorted_entries[0].get("seq", 0)) < earliest:
@@ -2824,20 +3095,24 @@ def build_app(
                         ),
                     )
 
-            # 2. Sequence check: follower must have caught up to at least primary's committed_seq
+            # 2. Sequence check: the follower must hold EVERY entry in the primary's WAL,
+            #    not just the committed prefix. A pending (unresolved) tail entry that the
+            #    follower lacks could never be confirmed, so marking it SYNCED would block
+            #    all writes behind that entry indefinitely.
             follower_seq = body.get("last_applied_seq", state.wal.last_seq if state.wal else 0)
-            if follower_seq < state.committed_seq:
+            required_seq = max(state.committed_seq, state.wal.last_seq if state.wal else 0)
+            if follower_seq < required_seq:
                 logger.warning(
                     "Follower rejoin rejected: sequence lag (follower_seq=%d < primary "
-                    "committed_seq=%d)",
+                    "required_seq=%d)",
                     follower_seq,
-                    state.committed_seq,
+                    required_seq,
                 )
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         f"Follower has not caught up: seq {follower_seq} < "
-                        f"committed_seq {state.committed_seq}"
+                        f"primary log end {required_seq}"
                     ),
                 )
 
@@ -2886,8 +3161,7 @@ def build_app(
     @app.post("/internal/migration/snapshot", dependencies=[Depends(cluster_auth)])
     async def migration_snapshot(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             # Resolve all pending writes before migration snapshot
             if state.pending_unresolved_writes:
@@ -2906,7 +3180,9 @@ def build_app(
             s_seq = state.engine.last_applied_seq
             # Pin the WAL after the copy's start seq until catch-up has consumed it.
             state.hold_migration(start, end, s_seq, reset=body.get("after_doc_id") is None)
-            limit = body.get("limit")
+            limit = (
+                None if body.get("limit") is None else _strict_int(body, "limit", lo=1, hi=10_000)
+            )
             if limit is None:
                 # Legacy single-shot copy of the whole range.
                 docs = state.engine.range_snapshot(start, end)
@@ -2918,8 +3194,18 @@ def build_app(
                     "done": True,
                 }
             # Cursor-paginated copy, bounded by count and serialized bytes.
-            after_doc_id = body.get("after_doc_id")
-            max_bytes = int(body.get("max_bytes") or settings.MAX_BODY_SIZE_BYTES // 2)
+            after_doc_id = (
+                None
+                if body.get("after_doc_id") is None
+                else _strict_int(body, "after_doc_id", hi=_KEYSPACE_END - 1)
+            )
+            max_bytes = _strict_int(
+                body,
+                "max_bytes",
+                lo=1,
+                hi=64 * 1024 * 1024,
+                default=settings.MAX_BODY_SIZE_BYTES // 2,
+            )
             fetched = state.engine.range_page(
                 start, end, after_doc_id=after_doc_id, limit=max(1, int(limit))
             )
@@ -2943,12 +3229,12 @@ def build_app(
     @app.post("/internal/migration/oplog", dependencies=[Depends(cluster_auth)])
     async def migration_oplog(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
-        after_seq = body.get("after_seq", 0)
-        limit = body.get("limit", 1000)
+        start, end = _body_range(body)
+        after_seq = _strict_int(body, "after_seq", default=0)
+        limit = _strict_int(body, "limit", lo=1, hi=10_000, default=1000)
 
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         state.hold_migration(start, end, after_seq)  # cursor advanced: release older entries
         earliest = state.wal.earliest_seq()
         if earliest is not None and earliest > after_seq + 1:
@@ -2982,10 +3268,18 @@ def build_app(
     async def migration_apply_batch(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         docs = body.get("documents", [])
-        mig_id = body.get("migration_id", "mig")
+        mig_id = _migration_id(body)
+        if not isinstance(docs, list):
+            raise _bad_body("'documents' must be a list")
+        for d in docs:
+            try:
+                Document.model_validate(d)
+            except Exception as exc:
+                raise _bad_body("invalid document in batch") from exc
         skipped = 0
 
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         async with state.write_lock():
             await _require_no_pending_writes(state, "apply migration batch")
             try:
@@ -2996,32 +3290,9 @@ def build_app(
                     if prior is not None and prior.outcome == WriteOutcome.COMMITTED:
                         skipped += 1  # retried batch: already durably applied
                         continue
-                    seq = state.wal.next_seq()
-                    wal_entry = state.wal.append(
-                        seq=seq,
-                        op=WriteOp.INSERT.value,
-                        doc_id=doc_id,
-                        term=state.term,
-                        request_id=req_id,
-                        payload=doc,
+                    await _append_replicated(
+                        state, WriteOp.INSERT, doc_id, req_id, doc, what="batch"
                     )
-                    if state.follower_url:
-                        ok = await _replicate_to_follower(
-                            state, seq, WriteOp.INSERT, doc_id, req_id, doc
-                        )
-                        if not ok:
-                            raise HTTPException(
-                                status_code=503,
-                                detail={
-                                    "error_code": "REPLICATION_UNAVAILABLE",
-                                    "error_message": "Follower replication failed during batch",
-                                },
-                            )
-                        state.follower_acked_seq = max(state.follower_acked_seq, seq)
-
-                    state.engine.apply(wal_entry, migration_mode=True)
-                    state.committed_seq = max(state.committed_seq, seq)
-                    _store_committed(state, req_id, seq)
             finally:
                 _persist_node_metadata(state)
             return {
@@ -3035,10 +3306,22 @@ def build_app(
     async def migration_apply_oplog(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
         entries = body.get("entries", [])
-        mig_id = body.get("migration_id", "mig")
+        mig_id = _migration_id(body)
+        if not isinstance(entries, list):
+            raise _bad_body("'entries' must be a list")
+        for e in entries:
+            if not isinstance(e, dict):
+                raise _bad_body("each oplog entry must be an object")
+            _strict_int(e, "seq", lo=1)
+            _strict_int(e, "doc_id", hi=_KEYSPACE_END - 1)
+            if e.get("op") not in {o.value for o in WriteOp}:
+                raise _bad_body(f"invalid op {e.get('op')!r}")
+            if e.get("payload") is not None and not isinstance(e.get("payload"), dict):
+                raise _bad_body("'payload' must be an object or null")
         skipped = 0
 
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         async with state.write_lock():
             await _require_no_pending_writes(state, "apply migration oplog")
             try:
@@ -3052,30 +3335,7 @@ def build_app(
                         skipped += 1  # this source op was already replayed
                         continue
 
-                    seq = state.wal.next_seq()
-                    wal_entry = state.wal.append(
-                        seq=seq,
-                        op=op.value,
-                        doc_id=doc_id,
-                        term=state.term,
-                        request_id=req_id,
-                        payload=payload,
-                    )
-                    if state.follower_url:
-                        ok = await _replicate_to_follower(state, seq, op, doc_id, req_id, payload)
-                        if not ok:
-                            raise HTTPException(
-                                status_code=503,
-                                detail={
-                                    "error_code": "REPLICATION_UNAVAILABLE",
-                                    "error_message": "Follower replication failed during catchup",
-                                },
-                            )
-                        state.follower_acked_seq = max(state.follower_acked_seq, seq)
-
-                    state.engine.apply(wal_entry, migration_mode=True)
-                    state.committed_seq = max(state.committed_seq, seq)
-                    _store_committed(state, req_id, seq)
+                    await _append_replicated(state, op, doc_id, req_id, payload, what="catchup")
             finally:
                 _persist_node_metadata(state)
             return {
@@ -3088,8 +3348,7 @@ def build_app(
     @app.post("/internal/migration/pause", dependencies=[Depends(cluster_auth)])
     async def migration_pause(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             if (start, end) not in state.paused_ranges:
                 state.paused_ranges.append((start, end))
@@ -3106,8 +3365,7 @@ def build_app(
     @app.post("/internal/migration/unpause", dependencies=[Depends(cluster_auth)])
     async def migration_unpause(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             state.paused_ranges = [
                 r for r in state.paused_ranges if not (r[0] == start and r[1] == end)
@@ -3119,8 +3377,7 @@ def build_app(
     @app.post("/internal/migration/checksum", dependencies=[Depends(cluster_auth)])
     async def migration_checksum(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             docs = state.engine.range_snapshot(start, end)
             from docstore.coordinator.migration import compute_deterministic_checksum
@@ -3131,9 +3388,8 @@ def build_app(
     @app.post("/internal/migration/cutover", dependencies=[Depends(cluster_auth)])
     async def migration_cutover(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
-        epoch = body["ownership_epoch"]
+        start, end = _body_range(body)
+        epoch = _strict_int(body, "ownership_epoch")
         async with state.write_lock():
             candidate = [r.model_copy() for r in state.ranges]
             existing = next((r for r in candidate if r.start == start and r.end == end), None)
@@ -3157,37 +3413,16 @@ def build_app(
 
     async def _purge_range_docs(state: NodeState, start: int, end: int, prefix: str) -> int:
         """Delete every doc in [start, end) through the WAL, replicated and committed."""
-        assert state.wal is not None
+        if state.wal is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("state.wal is unavailable")
         await _require_no_pending_writes(state, "purge range")
         docs = state.engine.range_snapshot(start, end)
         try:
             for d in docs:
                 doc_id = d["doc_id"]
-                seq = state.wal.next_seq()
-                req_id = f"{prefix}-{doc_id}"
-                entry = state.wal.append(
-                    seq=seq,
-                    op=WriteOp.DELETE.value,
-                    doc_id=doc_id,
-                    term=state.term,
-                    request_id=req_id,
-                    payload=None,
-                )
-                if state.follower_url:
-                    ok = await _replicate_to_follower(
-                        state, seq, WriteOp.DELETE, doc_id, req_id, None
-                    )
-                    if not ok:
-                        raise HTTPException(
-                            status_code=503,
-                            detail={
-                                "error_code": "REPLICATION_UNAVAILABLE",
-                                "error_message": "Follower replication failed during purge",
-                            },
-                        )
-                    state.follower_acked_seq = max(state.follower_acked_seq, seq)
-                state.engine.apply(entry, migration_mode=True)
-                state.committed_seq = max(state.committed_seq, seq)
+                # Unique per operation (seq), so repeated purges never share a dedup key.
+                req_id = f"{prefix}-{state.wal.next_seq()}-{doc_id}"
+                await _append_replicated(state, WriteOp.DELETE, doc_id, req_id, None, what="purge")
         finally:
             _persist_node_metadata(state)
         return len(docs)
@@ -3201,7 +3436,7 @@ def build_app(
         try:
             clean = state.follower_url.removeprefix("http://").removeprefix("https://").rstrip("/")
             raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
-            sig = compute_signature(state.settings.CLUSTER_SECRET, raw)
+            sig = sign_request(state.settings.CLUSTER_SECRET, "POST", path, raw)
             resp = await client.post(
                 f"http://{clean}{path}",
                 content=raw,
@@ -3219,8 +3454,7 @@ def build_app(
     @app.post("/internal/migration/cleanup", dependencies=[Depends(cluster_auth)])
     async def migration_cleanup(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             # 1. Stop owning the range (works for prefix / suffix / interior / whole ranges)
             candidate = _subtract_range(state.ranges, start, end)
@@ -3254,8 +3488,7 @@ def build_app(
     async def migration_ranges_remove(body: dict[str, Any], request: Request) -> dict[str, Any]:
         """Follower side of cleanup: drop ownership only (docs arrive via replicated DELETEs)."""
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             candidate = _subtract_range(state.ranges, start, end)
             _persist_node_metadata(state, ranges=candidate)
@@ -3268,8 +3501,7 @@ def build_app(
     @app.post("/internal/migration/abort", dependencies=[Depends(cluster_auth)])
     async def migration_abort(body: dict[str, Any], request: Request) -> dict[str, Any]:
         state = get_node(request)
-        start = body["start"]
-        end = body["end"]
+        start, end = _body_range(body)
         async with state.write_lock():
             # Only purge staged docs that are NOT in a range this shard owns.
             if any(r.start < end and start < r.end for r in state.ranges):
@@ -3285,6 +3517,19 @@ def build_app(
             return {"status": "aborted", "purged_docs": purged}
 
     # ── Error handler ─────────────────────────────────────────────────────────
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # FastAPI's default 422 echoes the submitted input back; report only what failed.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "VALIDATION_ERROR",
+                "error_message": safe_validation_message(exc),
+            },
+        )
 
     @app.exception_handler(HTTPException)
     async def _http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:

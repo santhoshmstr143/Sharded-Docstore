@@ -54,9 +54,9 @@ This document specifies the failure detection, promotion protocol, split-brain f
 1. **Failure Detection:** The coordinator monitors heartbeats. If no heartbeat is received from the primary within failure detection timeout $D = 5.0s$, the coordinator marks the primary as down. A shard is also failed over when it has **no registered primary** and there is positive evidence of it:
    - the incumbent primary restarted and re-registered as a follower (nodes recovering from disk never resume authority on their own), or
    - another node of the shard is registered and alive, yet no primary has registered within $D$ of coordinator start.
-2. **Follower Health Check:** The coordinator contacts the follower to verify its reachability and query its highest durable sequence number (`last_durable_seq`).
+2. **Candidate Check:** The coordinator contacts the promotion candidate (normally the follower) and reads its `last_applied_seq`. Unless an operator forces it (`POST /admin/failover/{shard}?force=true`), it refuses to promote a follower that the primary's heartbeats last reported as not `SYNCED`, or that is behind the primary's last reported sequence number — promoting it could lose committed writes. If the incumbent primary restarted (its data intact) while the follower is unsynced, the incumbent is re-promoted under a new term instead. Failovers of different shards run concurrently, so one slow failover never delays another shard's recovery.
 3. **Log Drain:** Follower finishes applying all durable WAL entries to memory.
-4. **Safety Wait:** The coordinator waits until the old primary's lease has definitively expired plus safety margin $M = 0.5s$:
+4. **Safety Wait:** While a shard is failing over, the coordinator refuses to renew or grant its primary lease (`503 FAILOVER_IN_PROGRESS` on heartbeats). Under the topology lock it then waits until the old primary's lease has definitively expired plus safety margin $M = 0.5s$:
    $$t_{wait} = \text{lease.expires\_at} + M - \text{now()}$$
 5. **Durable Failover Intent:** Under the shard's **topology lock** (failover and migration cutover never interleave), the coordinator re-checks that the map still names the failed primary, then writes a failover intent (`failover_intents.json`: new primary, old primary, target term) before changing anything else.
 6. **Epoch and Term Bumping:**
@@ -101,3 +101,6 @@ When an old crashed primary restarts, it must never resume as primary from its s
 | **Primary restarts before $D$ elapses** | It recovers as a follower; the coordinator sees the incumbent re-registered as follower and promotes the current follower. |
 | **Promotion metadata write fails** | The follower returns 500 and stays a follower with its old term; the coordinator keeps retrying. |
 | **Unrelated 409 on heartbeat** | Ignored; a primary steps down only on `STALE_TERM`. |
+| **WAL write/fsync fails on a node** | The node fail-stops: it stops serving (`NODE_NOT_READY`), heartbeating and holding a lease, so the coordinator fails over; the client gets `OUTCOME_UNKNOWN` and retries with the same `request_id`. |
+| **Follower is unsynced when the primary dies** | No automatic promotion (it could lose writes); the shard waits for the primary or an operator's forced failover. |
+| **Promotion target never confirms** | Retried, then abandoned after 30 attempts so the shard can fail over to the other replica. |

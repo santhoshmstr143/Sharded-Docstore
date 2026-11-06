@@ -16,6 +16,8 @@ import httpx
 
 from docstore.common.models import QueryFilter, ReadMode
 
+_DEFAULT: Any = object()  # sentinel: "use the client's configured timeout"
+
 
 class DocStoreClientError(Exception):
     """Base exception for client errors."""
@@ -25,6 +27,8 @@ class DocStoreClientError(Exception):
         self.message = message
         self.status_code = status_code
         self.error_code = error_code
+        # Set for writes: retry with this id to resolve OUTCOME_UNKNOWN idempotently.
+        self.request_id: str | None = None
 
 
 class NotFoundError(DocStoreClientError):
@@ -55,8 +59,20 @@ class OutcomeUnknownError(DocStoreClientError):
     """Operation outcome unknown (replicated append did not confirm in time)."""
 
 
-def _map_error(status_code: int, data: dict[str, Any]) -> DocStoreClientError:
-    """Map HTTP error status and response payload to typed DocStoreClientError."""
+def _map_error(
+    status_code: int, data: dict[str, Any], request_id: str | None = None
+) -> DocStoreClientError:
+    """Map HTTP error status and response payload to typed DocStoreClientError.
+
+    ``request_id`` (for writes) is attached so an OUTCOME_UNKNOWN write can be retried
+    idempotently with the same id.
+    """
+    err = _map_error_type(status_code, data)
+    err.request_id = request_id
+    return err
+
+
+def _map_error_type(status_code: int, data: dict[str, Any]) -> DocStoreClientError:
     code = data.get("error_code") or (
         data.get("detail", {}).get("error_code") if isinstance(data.get("detail"), dict) else None
     )
@@ -155,11 +171,16 @@ class DocStoreClient:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        retry: bool = True,
+        timeout: Any = _DEFAULT,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         req_headers = headers or self._client_headers()
         backoff = self.backoff_base_s
 
-        for attempt in range(self.max_retries + 1):
+        attempts = self.max_retries + 1 if retry else 1
+        extra: dict[str, Any] = {} if timeout is _DEFAULT else {"timeout": timeout}
+        for attempt in range(attempts):
             try:
                 resp = self._client.request(
                     method=method,
@@ -167,6 +188,7 @@ class DocStoreClient:
                     json=json_body,
                     params=params,
                     headers=req_headers,
+                    **extra,
                 )
                 if resp.status_code in (200, 201):
                     return resp.json()  # type: ignore[no-any-return]
@@ -176,6 +198,8 @@ class DocStoreClient:
                     data = resp.json()
                 except Exception:
                     data = {}
+                if not isinstance(data, dict):  # e.g. a proxy's list / string error body
+                    data = {"error_message": str(data)}
 
                 code = data.get("error_code")
                 is_retryable = resp.status_code in (202, 503) or code in (
@@ -185,19 +209,23 @@ class DocStoreClient:
                     "OUTCOME_UNKNOWN",
                 )
 
-                if is_retryable and attempt < self.max_retries:
+                if is_retryable and attempt < attempts - 1:
                     time.sleep(backoff)
                     backoff = min(backoff * 2.0, 1.5)
                     continue
 
-                raise _map_error(resp.status_code, data)
+                raise _map_error(resp.status_code, data, request_id)
 
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                if attempt < self.max_retries:
+            except httpx.TransportError as exc:
+                # Any dropped / failed connection (connect, timeout, read/write errors,
+                # protocol errors). Writes are safe to retry: they reuse their request_id.
+                if attempt < attempts - 1:
                     time.sleep(backoff)
                     backoff = min(backoff * 2.0, 1.5)
                     continue
-                raise DocStoreClientError(f"Network error after {attempt} retries: {exc}") from exc
+                err = DocStoreClientError(f"Network error after {attempt} retries: {exc}")
+                err.request_id = request_id
+                raise err from exc
 
         raise DocStoreClientError("Exceeded maximum retries")
 
@@ -214,6 +242,7 @@ class DocStoreClient:
             "POST",
             f"{self.router_url}/doc",
             json_body=payload,
+            request_id=rid,
         )
 
     def get(self, doc_id: int, read_mode: str | ReadMode = ReadMode.PRIMARY) -> dict[str, Any]:
@@ -244,6 +273,7 @@ class DocStoreClient:
             "PUT",
             f"{self.router_url}/doc/{doc_id}",
             json_body=payload,
+            request_id=rid,
         )
 
     def delete(self, doc_id: int, request_id: str | None = None) -> dict[str, Any]:
@@ -257,6 +287,7 @@ class DocStoreClient:
             "DELETE",
             f"{self.router_url}/doc/{doc_id}",
             json_body=payload,
+            request_id=rid,
         )
 
     def query(
@@ -289,7 +320,9 @@ class DocStoreClient:
 
     def shard_map(self) -> dict[str, Any]:
         """Fetch current cluster topology and map_version."""
-        return self._request_with_retry("GET", f"{self.coordinator_url}/shardmap")
+        return self._request_with_retry(
+            "GET", f"{self.coordinator_url}/shardmap", headers=self._admin_headers()
+        )
 
     def status(self) -> dict[str, Any]:
         """Fetch cluster administrative health, leases, and replica status."""
@@ -311,15 +344,19 @@ class DocStoreClient:
         payload = {
             "from_shard": from_shard,
             "to_shard": to_shard,
-            "start": start,
-            "end": end,
+            "range": {"start": start, "end": end},
             "sync": sync,
         }
+        # Not idempotent: never retried (a retry would hit "migration already overlaps"
+        # while the first one is still running). A synchronous migration can take far
+        # longer than the default timeout, so it gets none.
         return self._request_with_retry(
             "POST",
             f"{self.coordinator_url}/admin/migrate",
             json_body=payload,
             headers=self._admin_headers(),
+            retry=False,
+            timeout=None if sync else _DEFAULT,
         )
 
     def migration_status(self, migration_id: str) -> dict[str, Any]:
@@ -420,13 +457,18 @@ class AsyncDocStoreClient:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        retry: bool = True,
+        timeout: Any = _DEFAULT,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         import asyncio
 
         req_headers = headers or self._client_headers()
         backoff = self.backoff_base_s
 
-        for attempt in range(self.max_retries + 1):
+        attempts = self.max_retries + 1 if retry else 1
+        extra: dict[str, Any] = {} if timeout is _DEFAULT else {"timeout": timeout}
+        for attempt in range(attempts):
             try:
                 resp = await self._client.request(
                     method=method,
@@ -434,6 +476,7 @@ class AsyncDocStoreClient:
                     json=json_body,
                     params=params,
                     headers=req_headers,
+                    **extra,
                 )
                 if resp.status_code in (200, 201):
                     return resp.json()  # type: ignore[no-any-return]
@@ -442,6 +485,8 @@ class AsyncDocStoreClient:
                     data = resp.json()
                 except Exception:
                     data = {}
+                if not isinstance(data, dict):  # e.g. a proxy's list / string error body
+                    data = {"error_message": str(data)}
 
                 code = data.get("error_code")
                 is_retryable = resp.status_code in (202, 503) or code in (
@@ -451,26 +496,32 @@ class AsyncDocStoreClient:
                     "OUTCOME_UNKNOWN",
                 )
 
-                if is_retryable and attempt < self.max_retries:
+                if is_retryable and attempt < attempts - 1:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2.0, 1.5)
                     continue
 
-                raise _map_error(resp.status_code, data)
+                raise _map_error(resp.status_code, data, request_id)
 
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                if attempt < self.max_retries:
+            except httpx.TransportError as exc:
+                # Any dropped / failed connection (connect, timeout, read/write errors,
+                # protocol errors). Writes are safe to retry: they reuse their request_id.
+                if attempt < attempts - 1:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2.0, 1.5)
                     continue
-                raise DocStoreClientError(f"Network error after {attempt} retries: {exc}") from exc
+                err = DocStoreClientError(f"Network error after {attempt} retries: {exc}")
+                err.request_id = request_id
+                raise err from exc
 
         raise DocStoreClientError("Exceeded maximum retries")
 
     async def insert(self, doc: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         rid = request_id or str(uuid.uuid4())
         payload = {"request_id": rid, "document": doc}
-        return await self._request_with_retry("POST", f"{self.router_url}/doc", json_body=payload)
+        return await self._request_with_retry(
+            "POST", f"{self.router_url}/doc", json_body=payload, request_id=rid
+        )
 
     async def get(
         self,
@@ -496,6 +547,7 @@ class AsyncDocStoreClient:
             "PUT",
             f"{self.router_url}/doc/{doc_id}",
             json_body=payload,
+            request_id=rid,
         )
 
     async def delete(self, doc_id: int, request_id: str | None = None) -> dict[str, Any]:
@@ -505,6 +557,7 @@ class AsyncDocStoreClient:
             "DELETE",
             f"{self.router_url}/doc/{doc_id}",
             json_body=payload,
+            request_id=rid,
         )
 
     async def query(
@@ -533,7 +586,9 @@ class AsyncDocStoreClient:
         )
 
     async def shard_map(self) -> dict[str, Any]:
-        return await self._request_with_retry("GET", f"{self.coordinator_url}/shardmap")
+        return await self._request_with_retry(
+            "GET", f"{self.coordinator_url}/shardmap", headers=self._admin_headers()
+        )
 
     async def status(self) -> dict[str, Any]:
         return await self._request_with_retry(
@@ -553,8 +608,7 @@ class AsyncDocStoreClient:
         payload = {
             "from_shard": from_shard,
             "to_shard": to_shard,
-            "start": start,
-            "end": end,
+            "range": {"start": start, "end": end},
             "sync": sync,
         }
         return await self._request_with_retry(
@@ -562,4 +616,6 @@ class AsyncDocStoreClient:
             f"{self.coordinator_url}/admin/migrate",
             json_body=payload,
             headers=self._admin_headers(),
+            retry=False,
+            timeout=None if sync else _DEFAULT,
         )

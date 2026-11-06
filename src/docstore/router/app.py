@@ -20,13 +20,14 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from docstore.common.auth import (
     CLIENT_KEY_HEADER,
     CLUSTER_SIG_HEADER,
-    compute_signature,
+    sign_request,
     verify_token,
 )
 from docstore.common.config import Settings
@@ -40,6 +41,7 @@ from docstore.common.models import (
     QueryFilter,
     QueryResponse,
     ShardMapEntry,
+    safe_validation_message,
     serialized_doc_size,
 )
 from docstore.query import validate_query_filter
@@ -217,13 +219,15 @@ def build_router_app(
 
         if body_dict is not None:
             body_bytes = json.dumps(body_dict, separators=(",", ":")).encode("utf-8")
-            sig = compute_signature(cluster_secret, body_bytes)
+            sig = sign_request(cluster_secret, method, url, body_bytes)
             headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
             content = body_bytes
         else:
-            sig = compute_signature(cluster_secret, b"")
+            sig = sign_request(cluster_secret, method, url)
             headers = {CLUSTER_SIG_HEADER: sig}
             content = b""
+        # Shard data routes authenticate the client API key (BUG: they used to be open).
+        headers[CLIENT_KEY_HEADER] = req.app.state.settings.CLIENT_API_KEY
 
         return await client.request(method=method, url=url, content=content, headers=headers)
 
@@ -298,13 +302,13 @@ def build_router_app(
                         continue
                     except Exception as reload_exc:
                         logger.debug("Map reload failed: %s", reload_exc)
+                logger.warning("Shard %s (%s) unavailable: %s", entry.shard_id, primary, exc)
                 raise HTTPException(
                     status_code=503,
                     detail={
                         "error_code": "SHARD_UNAVAILABLE",
-                        "error_message": (
-                            f"Shard {entry.shard_id} ({primary}) is unavailable: {exc}"
-                        ),
+                        # Internal addresses / exception text stay in the log only.
+                        "error_message": f"Shard {entry.shard_id} is unavailable.",
                     },
                 ) from exc
 
@@ -388,7 +392,10 @@ def build_router_app(
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
-                detail={"error_code": "VALIDATION_ERROR", "error_message": str(exc)},
+                detail={
+                    "error_code": "VALIDATION_ERROR",
+                    "error_message": safe_validation_message(exc),
+                },
             ) from exc
 
         doc_dict = doc.model_dump()
@@ -420,7 +427,10 @@ def build_router_app(
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
-                detail={"error_code": "VALIDATION_ERROR", "error_message": str(exc)},
+                detail={
+                    "error_code": "VALIDATION_ERROR",
+                    "error_message": safe_validation_message(exc),
+                },
             ) from exc
 
         if doc.doc_id != doc_id:
@@ -527,6 +537,19 @@ def build_router_app(
         }
 
     # ── Error handler ─────────────────────────────────────────────────────────
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # FastAPI's default 422 echoes the submitted input back; report only what failed.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "VALIDATION_ERROR",
+                "error_message": safe_validation_message(exc),
+            },
+        )
 
     @app.exception_handler(HTTPException)
     async def _http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:

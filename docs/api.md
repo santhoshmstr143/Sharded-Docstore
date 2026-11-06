@@ -8,9 +8,9 @@ This document provides the complete REST API specification for Sharded-Docstore 
 
 | Header | Description | Target Component | Required On |
 |---|---|---|---|
-| `X-Api-Key` | Client authentication key (`CLIENT_API_KEY`) | Router | All client document and query requests |
-| `X-Admin-Token` | Cluster administrator token (`ADMIN_TOKEN`) | Coordinator | Admin endpoints (`/admin/*`) |
-| `X-Cluster-Signature` | HMAC-SHA256 hex digest of raw request body signed with `CLUSTER_SECRET` | Coordinator, Shard Nodes | Inter-node RPCs (`/register`, `/heartbeat`, `/internal/*`) |
+| `X-Api-Key` | Client authentication key (`CLIENT_API_KEY`) | Router, Shard Nodes | All client document and query requests; shard `/doc`, `/query`, `/status` (the router forwards it) |
+| `X-Admin-Token` | Cluster administrator token (`ADMIN_TOKEN`) | Coordinator | Admin endpoints (`/admin/*`) and `GET /shardmap` |
+| `X-Cluster-Signature` | HMAC-SHA256 hex digest, keyed with `CLUSTER_SECRET`, over `METHOD\npath\nquery\n` followed by the raw body (see `docstore.common.auth.sign_request`) | Coordinator, Shard Nodes | Inter-node RPCs (`/register`, `/heartbeat`, `/internal/*`) |
 
 ---
 
@@ -71,6 +71,8 @@ Errors return JSON and **never expose stack traces**:
 | `SHARD_UNAVAILABLE` | 503 | Target shard primary is down or unreachable |
 | `SERVER_BUSY` | 503 | Router reached maximum concurrent request capacity |
 | `ROUTING_FAILED` | 500 | Router exceeded retry limit during map recovery |
+| `RESULT_TOO_LARGE` | 413 | A query would pull more than 32 MB of shard responses; reduce `skip`/`limit` or narrow the filter |
+| `FAILOVER_IN_PROGRESS` | 503 | (Coordinator `/heartbeat`) the shard is failing over; its old primary's lease is not renewed |
 
 #### Router retries and write fencing
 
@@ -365,6 +367,11 @@ Sent by the coordinator during failover. Body is strictly validated:
 ```
 
 - `term` lower than the node's term → `409 STALE_TERM`.
+- The coordinator checks the target first: a follower that its primary last reported as not
+  `SYNCED`, or that is behind the primary's last reported sequence number, is not promoted
+  automatically (`POST /admin/failover/{shard}?force=true` overrides). If the old primary
+  restarted with its data while the follower is unsynced, the old primary is re-promoted
+  under a new term instead.
 - `ranges` (sent by the coordinator, authoritative from the shard map) replace the node's
   ranges; an epoch lower than the node's own for the same range → `409 STALE_EPOCH`.
   Without `ranges`, `ownership_epochs` must name exactly the node's ranges
@@ -396,11 +403,11 @@ The coordinator listens by default on port `8200`.
 
 ### 5.1 Get Cluster Shard Map (`GET /shardmap`)
 
-Public endpoint returning active cluster topology, primary/follower endpoints, and epochs.
+Returns active cluster topology, primary/follower endpoints, and epochs. Requires `X-Admin-Token` (it exposes internal node addresses).
 
 - **Curl:**
   ```bash
-  curl -s http://127.0.0.1:8200/shardmap
+  curl -s http://127.0.0.1:8200/shardmap -H "X-Admin-Token: $ADMIN_TOKEN"
   ```
 - **Response (200 OK):**
   ```json

@@ -290,7 +290,9 @@ class TestCoordinatorFastAPI:
     async def test_shardmap_endpoint(self, app: Any) -> None:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
-            resp = await c.get("/shardmap")
+            # Topology (internal addresses) is admin-only.
+            assert (await c.get("/shardmap")).status_code == 401
+            resp = await c.get("/shardmap", headers={ADMIN_TOKEN_HEADER: ADMIN})
             assert resp.status_code == 200
             data = resp.json()
             assert data["map_version"] == 1

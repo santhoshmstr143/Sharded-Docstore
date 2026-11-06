@@ -124,7 +124,7 @@ async def post_with_retry(
 
         if attempt < max_retries:
             delay = min(
-                BACKOFF_BASE * (2**attempt) + random.uniform(0, BACKOFF_JITTER),  # noqa: S311 - backoff jitter only
+                BACKOFF_BASE * (2**attempt) + random.uniform(0, BACKOFF_JITTER),  # noqa: S311 (backoff jitter only)  # nosec B311
                 BACKOFF_MAX,
             )
             await asyncio.sleep(delay)
@@ -132,7 +132,8 @@ async def post_with_retry(
     # Exhausted retries
     if last_exc is not None:
         raise last_exc
-    assert last_response is not None  # guaranteed if we entered the loop
+    if last_response is None:  # explicit: asserts are stripped under -O
+        raise RuntimeError("last_response is unavailable")
     return last_response
 
 
@@ -166,14 +167,15 @@ async def get_with_retry(
 
         if attempt < max_retries:
             delay = min(
-                BACKOFF_BASE * (2**attempt) + random.uniform(0, BACKOFF_JITTER),  # noqa: S311
+                BACKOFF_BASE * (2**attempt) + random.uniform(0, BACKOFF_JITTER),  # noqa: S311 (backoff jitter only)  # nosec B311
                 BACKOFF_MAX,
             )
             await asyncio.sleep(delay)
 
     if last_exc is not None:
         raise last_exc
-    assert last_response is not None
+    if last_response is None:  # explicit: asserts are stripped under -O
+        raise RuntimeError("last_response is unavailable")
     return last_response
 
 

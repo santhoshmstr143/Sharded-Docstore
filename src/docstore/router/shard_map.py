@@ -137,7 +137,8 @@ class ShardMapManager:
                 self.load()
             else:
                 raise RuntimeError("Shard map is not loaded and no existing map file found.")
-        assert self._shard_map is not None
+        if self._shard_map is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("self._shard_map is unavailable")
         return self._shard_map
 
     def set_map(self, shard_map: ShardMap) -> None:

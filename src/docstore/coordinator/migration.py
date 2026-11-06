@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from pydantic import BaseModel, Field
 
-from docstore.common.auth import CLUSTER_SIG_HEADER, compute_signature
+from docstore.common.auth import CLUSTER_SIG_HEADER, sign_request
 from docstore.storage.wal import _fsync_dir
 
 if TYPE_CHECKING:
@@ -77,7 +77,14 @@ class MigrationState(enum.StrEnum):
     CUTOVER = "CUTOVER"
     CLEANUP = "CLEANUP"
     DONE = "DONE"
+    # Abort decided but not yet confirmed (source unpaused + destination purged).
+    # Non-terminal: retried until both succeed, so a failed unpause can never leave
+    # the source range paused forever.
+    ABORTING = "ABORTING"
     ABORTED = "ABORTED"
+
+
+_STALLED_STATES = (MigrationState.CUTOVER, MigrationState.CLEANUP, MigrationState.ABORTING)
 
 
 class MigrationRecord(BaseModel):
@@ -242,10 +249,11 @@ class MigrationManager:
 
         async def _rpc(url: str, body: dict[str, Any]) -> dict[str, Any]:
             body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
-            sig = compute_signature(self.cluster_secret, body_bytes)
-            headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
             clean_url = url.removeprefix("http://").removeprefix("https://")
-            resp = await client.post(f"http://{clean_url}", content=body_bytes, headers=headers)
+            target = f"http://{clean_url}"
+            sig = sign_request(self.cluster_secret, "POST", target, body_bytes)
+            headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
+            resp = await client.post(target, content=body_bytes, headers=headers)
             if resp.status_code >= 400:
                 raise RuntimeError(
                     f"RPC to {url} failed status={resp.status_code} body={resp.text}"
@@ -335,7 +343,8 @@ class MigrationManager:
                     self.save_record(rec)
                 if page.get("done", True) or not docs:
                     break
-            assert s_seq is not None
+            if s_seq is None:  # explicit: asserts are stripped under -O
+                raise RuntimeError("s_seq is unavailable")
 
             if on_phase_hook:
                 await on_phase_hook(MigrationState.SNAPSHOT_COPY)
@@ -644,11 +653,12 @@ class MigrationManager:
             logger.error("Migration %s failed: %s", rec.migration_id, exc)
             if rec.state != MigrationState.CUTOVER and rec.state != MigrationState.CLEANUP:
                 # Abort safely before commit point
-                rec.state = MigrationState.ABORTED
+                rec.state = MigrationState.ABORTING
                 rec.error = str(exc)
                 if pause_start is not None:
                     rec.pause_duration_s = time.monotonic() - pause_start
                 self.save_record(rec)
+                abort_ok = True
                 try:
                     # Unpause source
                     cur_map = coord.map_mgr.shard_map
@@ -662,6 +672,7 @@ class MigrationManager:
                             {"start": rec.range_start, "end": rec.range_end},
                         )
                 except Exception as unpause_exc:
+                    abort_ok = False
                     logger.warning("Failed to unpause source on abort: %s", unpause_exc)
                 try:
                     # Abort staged data on destination
@@ -676,7 +687,16 @@ class MigrationManager:
                             {"start": rec.range_start, "end": rec.range_end},
                         )
                 except Exception as abort_exc:
+                    abort_ok = False
                     logger.warning("Failed to clean destination on abort: %s", abort_exc)
+                if abort_ok:
+                    rec.state = MigrationState.ABORTED
+                    self.save_record(rec)
+                else:
+                    logger.warning(
+                        "Migration %s left in ABORTING; the health monitor will retry",
+                        rec.migration_id,
+                    )
                 raise
             else:
                 # After cutover, roll forward (keep in CUTOVER or CLEANUP, do not abort)
@@ -716,12 +736,15 @@ class MigrationManager:
         *,
         http_client: httpx.AsyncClient | None = None,
     ) -> list[MigrationRecord]:
-        """Periodically drive stalled post-cutover migrations (CUTOVER / CLEANUP) to DONE."""
+        """Periodically drive stalled migrations to a terminal state.
+
+        CUTOVER / CLEANUP roll forward to DONE; ABORTING finishes its abort (source
+        unpause + destination purge) to ABORTED.
+        """
         pending = [
             r
             for r in self.migrations.values()
-            if r.state in (MigrationState.CUTOVER, MigrationState.CLEANUP)
-            and r.migration_id not in self._executing
+            if r.state in _STALLED_STATES and r.migration_id not in self._executing
         ]
         if not pending:
             return []
@@ -742,9 +765,7 @@ class MigrationManager:
             for r in self.migrations.values()
             if r.state not in (MigrationState.DONE, MigrationState.ABORTED)
             and r.migration_id not in self._executing
-            and (
-                not only_post_cutover or r.state in (MigrationState.CUTOVER, MigrationState.CLEANUP)
-            )
+            and (not only_post_cutover or r.state in _STALLED_STATES)
         ]
         if not unfinished:
             return []
@@ -757,10 +778,11 @@ class MigrationManager:
 
         async def _rpc(url: str, body: dict[str, Any]) -> dict[str, Any]:
             body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
-            sig = compute_signature(self.cluster_secret, body_bytes)
-            headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
             clean_url = url.removeprefix("http://").removeprefix("https://")
-            resp = await client.post(f"http://{clean_url}", content=body_bytes, headers=headers)
+            target = f"http://{clean_url}"
+            sig = sign_request(self.cluster_secret, "POST", target, body_bytes)
+            headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
+            resp = await client.post(target, content=body_bytes, headers=headers)
             if resp.status_code >= 400:
                 raise RuntimeError(
                     f"RPC to {url} failed status={resp.status_code} body={resp.text}"

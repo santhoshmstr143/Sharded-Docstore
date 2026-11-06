@@ -53,6 +53,7 @@ class SnapshotManager:
         term: int,
         ownership_epochs: dict[str, int],
         dedup_table: dict[str, Any],
+        installed: bool = False,
     ) -> None:
         """Atomically write a new snapshot.
 
@@ -62,6 +63,8 @@ class SnapshotManager:
             term:             Current shard term.
             ownership_epochs: ``{shard_range_key: epoch}`` mapping.
             dedup_table:      Serialisable dedup table state.
+            installed:        True when the snapshot came from another node (resync);
+                              it then supersedes the ENTIRE local WAL (see recovery).
         """
         self._dir.mkdir(parents=True, exist_ok=True)
 
@@ -72,6 +75,7 @@ class SnapshotManager:
             "term": term,
             "ownership_epochs": ownership_epochs,
             "dedup_table": dedup_table,
+            "installed": installed,
             "documents": {str(k): v for k, v in documents.items()},
         }
 

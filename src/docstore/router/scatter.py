@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
-from docstore.common.auth import CLUSTER_SIG_HEADER, compute_signature
+from docstore.common.auth import CLIENT_KEY_HEADER, CLUSTER_SIG_HEADER, sign_request
 from docstore.common.config import Settings
 from docstore.common.errors import OutOfRange
 from docstore.common.logging import get_logger
@@ -46,31 +46,6 @@ from docstore.router.shard_map import ShardMapManager
 logger = get_logger(__name__)
 
 
-def _specialize_in_filter(
-    filter_dict: dict[str, Any],
-    shard_doc_ids: list[int],
-) -> dict[str, Any]:
-    """Create a copy of filter_dict with doc_id.$in restricted to shard_doc_ids."""
-    new_filter = dict(filter_dict)
-    if "doc_id" in new_filter and isinstance(new_filter["doc_id"], dict):
-        d = dict(new_filter["doc_id"])
-        d["$in"] = shard_doc_ids
-        new_filter["doc_id"] = d
-        return new_filter
-
-    if "$and" in new_filter and isinstance(new_filter["$and"], list):
-        new_and = []
-        for sub in new_filter["$and"]:
-            if isinstance(sub, dict) and "doc_id" in sub:
-                new_and.append(_specialize_in_filter(sub, shard_doc_ids))
-            else:
-                new_and.append(sub)
-        new_filter["$and"] = new_and
-        return new_filter
-
-    return new_filter
-
-
 def resolve_target_shards(
     map_mgr: ShardMapManager,
     filter_dict: dict[str, Any],
@@ -85,7 +60,8 @@ def resolve_target_shards(
     constraint: ShardKeyConstraint = detect_shard_key_constraint(filter_dict)
 
     if constraint.kind == "exact":
-        assert constraint.doc_id is not None
+        if constraint.doc_id is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("constraint.doc_id is unavailable")
         try:
             entry = map_mgr.get_shard_for_doc_id(constraint.doc_id)
             return [(entry, filter_dict)]
@@ -94,7 +70,8 @@ def resolve_target_shards(
             return []
 
     if constraint.kind == "in":
-        assert constraint.doc_ids is not None
+        if constraint.doc_ids is None:  # explicit: asserts are stripped under -O
+            raise RuntimeError("constraint.doc_ids is unavailable")
         grouped: dict[str, list[int]] = {}
         entry_map: dict[str, ShardMapEntry] = {}
 
@@ -106,15 +83,16 @@ def resolve_target_shards(
             except OutOfRange:
                 continue
 
-        targets = []
-        for shard_id, ids in grouped.items():
-            entry = entry_map[shard_id]
-            specialized = _specialize_in_filter(filter_dict, ids)
-            targets.append((entry, specialized))
-        return targets
+        # Send the client's filter unchanged. Rewriting doc_id.$in per shard used to
+        # clobber every other doc_id constraint in an $and (wrong results); the shard
+        # already restricts evaluation to its own ranges, so no rewrite is needed.
+        return [(entry_map[shard_id], filter_dict) for shard_id in grouped]
 
     if constraint.kind == "range":
-        assert constraint.range_start is not None and constraint.range_end is not None
+        if (
+            constraint.range_start is None or constraint.range_end is None
+        ):  # explicit: asserts are stripped under -O
+            raise RuntimeError("constraint.range_start / constraint.range_end unavailable")
         if constraint.range_start >= constraint.range_end:
             return []
         entries = map_mgr.get_shards_for_range(constraint.range_start, constraint.range_end)
@@ -122,6 +100,36 @@ def resolve_target_shards(
 
     # Non-key filter: scatter to all shards
     return [(entry, filter_dict) for entry in map_mgr.shard_map.entries]
+
+
+class _ClientQueryError(Exception):
+    """A shard rejected the query itself (not a shard failure): pass it to the client."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
+
+
+_CLIENT_QUERY_ERRORS = frozenset({"INVALID_QUERY", "VALIDATION_ERROR"})
+
+# Upper bound on shard response bytes one query may pull into the router (all shards,
+# all chunks). skip + limit allows up to 11k candidates of up to 1 MB each otherwise.
+QUERY_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
+class _ByteBudget:
+    def __init__(self, limit: int) -> None:
+        self.remaining = limit
+
+    def charge(self, n: int) -> None:
+        self.remaining -= n
+        if self.remaining < 0:
+            raise _ClientQueryError(
+                413,
+                "RESULT_TOO_LARGE",
+                "Query result exceeds the response size limit; reduce skip/limit or "
+                "narrow the filter.",
+            )
 
 
 class _ShardTarget:
@@ -159,6 +167,8 @@ async def _query_single_shard(
     cluster_secret: str,
     timeout_s: float,
     needed_candidates: int,
+    api_key: str = "",
+    budget: _ByteBudget | None = None,
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
     """Query one shard (restricted to its attributed ranges) up to needed_candidates.
 
@@ -186,10 +196,11 @@ async def _query_single_shard(
         chunk_payload["limit"] = chunk_limit
 
         body_bytes = json.dumps(chunk_payload, separators=(",", ":")).encode("utf-8")
-        sig = compute_signature(cluster_secret, body_bytes)
+        sig = sign_request(cluster_secret, "POST", url, body_bytes)
         headers = {
             "Content-Type": "application/json",
             CLUSTER_SIG_HEADER: sig,
+            CLIENT_KEY_HEADER: api_key,
         }
 
         try:
@@ -221,10 +232,16 @@ async def _query_single_shard(
             except Exception:
                 err_code = "SHARD_ERROR"
                 err_msg = resp.text
+            if resp.status_code in (400, 422) and err_code in _CLIENT_QUERY_ERRORS:
+                # The query is invalid (e.g. sort on an array field): retrying or
+                # reporting the shard as unavailable would be wrong.
+                raise _ClientQueryError(resp.status_code, str(err_code), str(err_msg))
             raise RuntimeError(
                 f"Shard {entry.shard_id} returned HTTP {resp.status_code} ({err_code}): {err_msg}"
             )
 
+        if budget is not None:
+            budget.charge(len(resp.content))
         data = resp.json()
         if shard_total is None:
             raw_total = data.get("total")
@@ -299,7 +316,8 @@ async def execute_scatter_query(
 
     # Allow up to 2 attempts (initial + 1 bounded retry on shard failure)
     last_error: Exception | None = None
-    failed_shard_desc: str = "unknown"
+    failed_shard_desc: str = "unknown"  # with address: logs only
+    failed_shard_id: str = "unknown"  # safe for client-facing messages
 
     for attempt in range(2):
         targets = group_targets_by_shard(resolve_target_shards(map_mgr, query.filter))
@@ -307,6 +325,7 @@ async def execute_scatter_query(
             return QueryResponse(documents=[], total=0)
 
         tasks = []
+        budget = _ByteBudget(QUERY_MAX_RESPONSE_BYTES)
         for tgt in targets:
             shard_payload = {
                 "filter": tgt.filter,
@@ -322,6 +341,8 @@ async def execute_scatter_query(
                     settings.CLUSTER_SECRET,
                     timeout_s,
                     needed_candidates,
+                    settings.CLIENT_API_KEY,
+                    budget,
                 )
             )
 
@@ -332,12 +353,19 @@ async def execute_scatter_query(
         total = 0
         metas: list[dict[str, Any] | None] = []
 
+        for res in results:
+            if isinstance(res, _ClientQueryError):
+                raise HTTPException(
+                    status_code=res.status,
+                    detail={"error_code": res.code, "error_message": res.message},
+                )
         for tgt, res in zip(targets, results, strict=False):
             entry = tgt.entry
             if isinstance(res, BaseException):
                 failed_entry = entry
                 last_error = res if isinstance(res, Exception) else RuntimeError(str(res))
                 failed_shard_desc = f"{entry.shard_id} ({entry.primary})"
+                failed_shard_id = entry.shard_id
                 break
             docs, shard_total, shard_meta = res
             shard_lists.append(docs)
@@ -362,7 +390,7 @@ async def execute_scatter_query(
                 status_code=503,
                 detail={
                     "error_code": "SHARD_UNAVAILABLE",
-                    "error_message": f"Shard {failed_shard_desc} is unavailable: {last_error}",
+                    "error_message": f"Shard {failed_shard_id} is unavailable.",
                 },
             )
 
@@ -393,6 +421,6 @@ async def execute_scatter_query(
         status_code=503,
         detail={
             "error_code": "SHARD_UNAVAILABLE",
-            "error_message": f"Shard {failed_shard_desc} is unavailable: {last_error}",
+            "error_message": f"Shard {failed_shard_id} is unavailable.",
         },
     )

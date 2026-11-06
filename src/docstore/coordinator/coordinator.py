@@ -20,16 +20,16 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from docstore.common.auth import CLUSTER_SIG_HEADER, compute_signature
+from docstore.common.auth import CLUSTER_SIG_HEADER, sign_request
 from docstore.common.config import Settings
-from docstore.common.errors import InvalidQuery, StaleTerm
+from docstore.common.errors import FailoverInProgress, InvalidQuery, StaleTerm
 from docstore.common.logging import get_logger
 from docstore.common.models import (
     Heartbeat,
@@ -127,6 +127,9 @@ class ActiveLease:
         return max(0.0, self.expires_at_monotonic - now)
 
 
+_MAX_PROMOTION_RETRIES = 30
+
+
 class CoordinatorService:
     """Core state and business logic of the Coordinator node."""
 
@@ -164,6 +167,12 @@ class CoordinatorService:
         # Per-shard topology lock: failover and migration cutover never interleave.
         self._topology_locks: dict[str, asyncio.Lock] = {}
         self._last_headless_attempt: dict[str, float] = {}
+        # Learned from primary heartbeats since coordinator start: whether the primary has
+        # reported its follower state at all, and the primary's last applied seq.
+        self._replica_reported: set[str] = set()
+        self._last_primary_seq: dict[str, int] = {}
+        # Consecutive failed retries of an unconfirmed promotion (bounded, see below).
+        self._promotion_attempts: dict[str, int] = {}
         self._started_at_monotonic: float = time.monotonic()
         self._recovery_quarantine_until_monotonic: float = (
             self._started_at_monotonic + settings.LEASE_DURATION_S + settings.SAFETY_MARGIN_S
@@ -448,14 +457,34 @@ class CoordinatorService:
         )
         return self.shard_terms[shard_id]
 
+    def follower_known_unsynced(self, shard_id: str) -> bool:
+        """True if the primary's own heartbeats last reported its follower as NOT synced.
+
+        Unknown (no heartbeat since coordinator start) returns False: the sequence check
+        in :meth:`trigger_failover` still applies.
+        """
+        return (
+            shard_id in self._replica_reported
+            and self.replica_states.get(shard_id) != ReplicaState.SYNCED
+        )
+
     async def trigger_failover(
         self,
         shard_id: str,
         *,
         http_client: httpx.AsyncClient | None = None,
         crash_time: float | None = None,
+        promote_addr: str | None = None,
+        force: bool = False,
     ) -> bool:
-        """Execute step-by-step failover and promotion for a shard (Module 8)."""
+        """Execute step-by-step failover and promotion for a shard (Module 8).
+
+        By default the map's follower is promoted. ``promote_addr`` may instead name the
+        map's current primary address: a restarted incumbent (which recovered from disk
+        as a follower) is then re-promoted under a new term when its follower is not a
+        safe candidate. Unless ``force`` is set, a follower known to be unsynced or behind
+        the primary's last reported sequence number is never promoted (data loss).
+        """
         if shard_id in self.failover_in_progress:
             logger.warning(
                 "Failover already in progress for shard %s; double failover blocked",
@@ -475,13 +504,28 @@ class CoordinatorService:
         if not follower_addr:
             logger.warning("Failover for shard %s aborted: no follower configured", shard_id)
             return False
+        repromote = promote_addr is not None and normalize_url(promote_addr) == normalize_url(
+            primary_addr
+        )
+        candidate = primary_addr if repromote else follower_addr
+        other = follower_addr if repromote else primary_addr
+
+        if not force and not repromote and self.follower_known_unsynced(shard_id):
+            logger.error(
+                "Failover for shard %s refused: follower %s was last reported %s, not SYNCED "
+                "(promoting it could lose committed writes; use force to override)",
+                shard_id,
+                follower_addr,
+                self.replica_states.get(shard_id),
+            )
+            return False
 
         self.failover_in_progress.add(shard_id)
         try:
             now_wall = time.time()
             detected_at = now_wall
 
-            # Step 2: Verify follower is alive
+            # Step 2: Verify the candidate is alive and not behind the last known primary.
             owns_client = False
             client = http_client
             if client is None:
@@ -489,21 +533,25 @@ class CoordinatorService:
                 owns_client = True
 
             try:
-                clean_follower = follower_addr.removeprefix("http://").removeprefix("https://")
-                url = f"http://{clean_follower}/internal/status"
-                sig = compute_signature(self.settings.CLUSTER_SECRET, b"")
+                clean_candidate = candidate.removeprefix("http://").removeprefix("https://")
+                url = f"http://{clean_candidate}/internal/status"
+                sig = sign_request(self.settings.CLUSTER_SECRET, "GET", url)
                 headers = {CLUSTER_SIG_HEADER: sig}
                 resp = await client.get(url, headers=headers)
                 if resp.status_code != 200:
                     logger.warning(
-                        "Failover for shard %s failed: follower returned status %d",
+                        "Failover for shard %s failed: candidate returned status %d",
                         shard_id,
                         resp.status_code,
                     )
                     return False
+                try:
+                    cand_seq = int(resp.json().get("last_applied_seq", 0))
+                except Exception:
+                    cand_seq = 0
             except Exception as exc:
                 logger.warning(
-                    "Failover for shard %s failed: follower unreachable: %s "
+                    "Failover for shard %s failed: candidate unreachable: %s "
                     "(single-node failure only)",
                     shard_id,
                     exc,
@@ -513,20 +561,17 @@ class CoordinatorService:
                 if owns_client:
                     await client.aclose()
 
-            # Step 4: Wait until old primary's lease expired + safety margin M
-            existing_lease = self.leases.get(shard_id)
-            wait_s = 0.0
-            if existing_lease:
-                safety_cutoff = existing_lease.expires_at_monotonic + self.settings.SAFETY_MARGIN_S
-                wait_s = max(0.0, safety_cutoff - time.monotonic())
-            else:
-                # Coordinator restart: wait for quarantine window to elapse
-                # so any old lease is guaranteed to have expired
-                wait_s = max(0.0, self._recovery_quarantine_until_monotonic - time.monotonic())
-
-            if wait_s > 0:
-                logger.info("Safety wait for old primary lease expiry + M: %.2fs", wait_s)
-                await asyncio.sleep(wait_s)
+            known_seq = self._last_primary_seq.get(shard_id)
+            if not force and known_seq is not None and cand_seq < known_seq:
+                logger.error(
+                    "Failover for shard %s refused: candidate %s is at seq %d but the primary "
+                    "last reported seq %d",
+                    shard_id,
+                    candidate,
+                    cand_seq,
+                    known_seq,
+                )
+                return False
 
             async with self.topology_lock(shard_id):
                 # Re-validate under the lock: a concurrent topology change (e.g. a
@@ -537,32 +582,51 @@ class CoordinatorService:
                     )
                     return False
 
+                # Step 4: wait until the old primary's lease has expired + M. Computed
+                # here, under the lock: leases are not renewed while a failover is in
+                # progress, so once this loop exits no old lease can still be valid.
+                while True:
+                    existing_lease = self.leases.get(shard_id)
+                    if existing_lease is not None:
+                        cutoff = existing_lease.expires_at_monotonic + self.settings.SAFETY_MARGIN_S
+                    else:
+                        # Coordinator restart: an old lease may exist that we never saw.
+                        cutoff = self._recovery_quarantine_until_monotonic
+                    wait_s = cutoff - time.monotonic()
+                    if wait_s <= 0:
+                        break
+                    logger.info("Safety wait for old primary lease expiry + M: %.2fs", wait_s)
+                    await asyncio.sleep(wait_s)
+
                 # Step 5 & 6: durable intent FIRST, then bump term/epochs and persist map.
                 # A crash anywhere after this point is finished (or discarded) on restart.
                 self._set_intent(
                     shard_id,
                     {
-                        "new_primary": follower_addr,
-                        "old_primary": primary_addr,
+                        "new_primary": candidate,
+                        "old_primary": other,
                         "target_term": self.shard_terms.get(shard_id, 1) + 1,
                         "created_at": time.time(),
                     },
                 )
+                term_before = self.shard_terms.get(shard_id, 1)
                 try:
                     new_term = self.bump_shard_failover(
                         shard_id,
-                        new_primary_url=follower_addr,
-                        new_follower_url=primary_addr,
+                        new_primary_url=candidate,
+                        new_follower_url=other,
                     )
                 except Exception:
-                    # The bump failed before or during the map write. If the map did not
-                    # change, drop the intent; otherwise it stays for recovery.
-                    if not self._map_names_primary(shard_id, follower_addr):
+                    # The bump failed before or during the map write. If the term (and
+                    # hence the map) did not change, drop the intent; otherwise it stays.
+                    if self.shard_terms.get(shard_id, 1) == term_before or not (
+                        self._map_names_primary(shard_id, candidate)
+                    ):
                         self._set_intent(shard_id, None)
                     raise
                 promoted_map = self.map_mgr.shard_map
 
-                # Step 7 & 8: grant a fresh lease and promote the follower.
+                # Step 7 & 8: grant a fresh lease and promote the candidate.
                 promote_client = http_client
                 owns_promote_client = False
                 if promote_client is None:
@@ -570,19 +634,20 @@ class CoordinatorService:
                         timeout=self.settings.REPLICATION_TIMEOUT_S + 2.0
                     )
                     owns_promote_client = True
-                req_body = self._build_promote_body(shard_id, follower_addr, primary_addr)
+                req_body = self._build_promote_body(shard_id, candidate, other)
                 try:
                     promoted_ok = await self._send_promote(
-                        promote_client, follower_addr, req_body, attempts=3
+                        promote_client, candidate, req_body, attempts=3
                     )
                 finally:
                     if owns_promote_client:
                         await promote_client.aclose()
                 if not promoted_ok:
-                    # The map already names the follower as primary. Keep retrying from
+                    # The map already names the candidate as primary. Keep retrying from
                     # the health monitor (and after restarts, via the durable intent).
-                    self._unconfirmed_promotions[shard_id] = (follower_addr, primary_addr)
-                    logger.error("Promotion of %s not confirmed; will keep retrying", follower_addr)
+                    self._unconfirmed_promotions[shard_id] = (candidate, other)
+                    self._promotion_attempts[shard_id] = 0
+                    logger.error("Promotion of %s not confirmed; will keep retrying", candidate)
                     return False
                 self._set_intent(shard_id, None)
 
@@ -608,7 +673,7 @@ class CoordinatorService:
                 "Failover successful: shard %s promoted %s to PRIMARY in term %d "
                 "(map_v=%d, degraded=True)",
                 shard_id,
-                follower_addr,
+                candidate,
                 new_term,
                 promoted_map.map_version,
             )
@@ -627,7 +692,7 @@ class CoordinatorService:
         """POST /internal/promote (idempotent for the same term) with bounded retries."""
         clean = follower_addr.removeprefix("http://").removeprefix("https://")
         raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        sig = compute_signature(self.settings.CLUSTER_SECRET, raw)
+        sig = sign_request(self.settings.CLUSTER_SECRET, "POST", "/internal/promote", raw)
         headers = {"Content-Type": "application/json", CLUSTER_SIG_HEADER: sig}
         for attempt in range(attempts):
             try:
@@ -663,6 +728,7 @@ class CoordinatorService:
             client = http_client or httpx.AsyncClient(
                 timeout=self.settings.REPLICATION_TIMEOUT_S + 2.0
             )
+            ok = False
             try:
                 async with self.topology_lock(shard_id):
                     body = self._build_promote_body(shard_id, addr, old_primary)
@@ -674,8 +740,25 @@ class CoordinatorService:
                     await client.aclose()
             if ok:
                 del self._unconfirmed_promotions[shard_id]
+                self._promotion_attempts.pop(shard_id, None)
                 self.replica_states[shard_id] = ReplicaState.DOWN
                 logger.info("Deferred promotion of %s for shard %s confirmed", addr, shard_id)
+                continue
+            attempts = self._promotion_attempts.get(shard_id, 0) + 1
+            self._promotion_attempts[shard_id] = attempts
+            if attempts >= _MAX_PROMOTION_RETRIES:
+                # The promotion target looks gone for good. Stop pinning the shard to it:
+                # headless detection may now promote the other replica (whose own status
+                # and sequence are checked first).
+                logger.error(
+                    "Giving up on promoting %s for shard %s after %d attempts",
+                    addr,
+                    shard_id,
+                    attempts,
+                )
+                del self._unconfirmed_promotions[shard_id]
+                self._promotion_attempts.pop(shard_id, None)
+                self._set_intent(shard_id, None)
 
     async def check_and_trigger_failover(
         self,
@@ -686,6 +769,7 @@ class CoordinatorService:
         await self._retry_unconfirmed_promotions(http_client)
         now_mono = time.monotonic()
         promoted: list[str] = []
+        pending: list[tuple[str, Coroutine[Any, Any, bool]]] = []
 
         seen: set[str] = set()
         for entry in self.map_mgr.shard_map.entries:
@@ -734,8 +818,22 @@ class CoordinatorService:
                         incumbent_demoted,
                         entry.follower,
                     )
-                    if await self.trigger_failover(shard_id, http_client=http_client):
-                        promoted.append(shard_id)
+                    # If the follower is known to be unsynced while the incumbent (with
+                    # its data intact) is back as a follower, re-promote the incumbent
+                    # rather than an incomplete follower.
+                    candidate = (
+                        entry.primary
+                        if incumbent_demoted and self.follower_known_unsynced(shard_id)
+                        else None
+                    )
+                    pending.append(
+                        (
+                            shard_id,
+                            self.trigger_failover(
+                                shard_id, http_client=http_client, promote_addr=candidate
+                            ),
+                        )
+                    )
                 continue
 
             if primary_node is not None:
@@ -748,14 +846,25 @@ class CoordinatorService:
                         elapsed,
                         self.settings.FAILURE_TIMEOUT_S,
                     )
-                    success = await self.trigger_failover(
-                        shard_id,
-                        http_client=http_client,
-                        crash_time=time.time() - elapsed,
+                    pending.append(
+                        (
+                            shard_id,
+                            self.trigger_failover(
+                                shard_id,
+                                http_client=http_client,
+                                crash_time=time.time() - elapsed,
+                            ),
+                        )
                     )
-                    if success:
-                        promoted.append(shard_id)
 
+        # Fail over affected shards concurrently: one slow failover (lease wait, topology
+        # lock, promotion retries) must not delay detection/recovery of other shards.
+        results = await asyncio.gather(*(c for _, c in pending), return_exceptions=True)
+        for (shard_id, _), res in zip(pending, results, strict=True):
+            if isinstance(res, BaseException):
+                logger.error("Failover of shard %s raised: %s", shard_id, res)
+            elif res:
+                promoted.append(shard_id)
         return promoted
 
     def bump_range_migration(
@@ -771,14 +880,16 @@ class CoordinatorService:
         found = False
         new_epoch = 1
 
-        dest_primary = None
-        dest_follower = None
+        dest_primary: str = ""
+        dest_follower: str | None = None
         if new_shard_id:
-            for e in current_map.entries:
-                if e.shard_id == new_shard_id:
-                    dest_primary = e.primary
-                    dest_follower = e.follower
-                    break
+            dest = next((e for e in current_map.entries if e.shard_id == new_shard_id), None)
+            if dest is None:
+                raise ValueError(f"Unknown destination shard {new_shard_id!r}")
+            # Taken verbatim: falling back to the SOURCE's follower when the destination
+            # has none would label the moved range with another shard's replica.
+            dest_primary = dest.primary
+            dest_follower = dest.follower
 
         for entry in current_map.entries:
             if entry.shard_id == shard_id and entry.range.start <= start and end <= entry.range.end:
@@ -795,8 +906,8 @@ class CoordinatorService:
                         entry.model_copy(
                             update={
                                 "shard_id": new_shard_id or entry.shard_id,
-                                "primary": dest_primary or entry.primary,
-                                "follower": dest_follower or entry.follower,
+                                "primary": dest_primary if new_shard_id else entry.primary,
+                                "follower": dest_follower if new_shard_id else entry.follower,
                                 "ownership_epoch": new_epoch,
                                 "map_version": current_map.map_version + 1,
                             }
@@ -818,8 +929,8 @@ class CoordinatorService:
                         ShardMapEntry(
                             shard_id=new_shard_id or entry.shard_id,
                             range=ShardRange(start=start, end=end),
-                            primary=dest_primary or entry.primary,
-                            follower=dest_follower or entry.follower,
+                            primary=dest_primary if new_shard_id else entry.primary,
+                            follower=dest_follower if new_shard_id else entry.follower,
                             ownership_epoch=new_epoch,
                             map_version=current_map.map_version + 1,
                         )
@@ -965,6 +1076,21 @@ class CoordinatorService:
         )
 
         lease_grant: LeaseGrant | None = None
+        if role == NodeRole.PRIMARY and shard_id in self.failover_in_progress:
+            logger.warning(
+                "Registration: no lease for %s while shard %s is failing over",
+                reg.node_id,
+                shard_id,
+            )
+            return RegistrationResponse(
+                node_id=reg.node_id,
+                shard_id=shard_id,
+                role=role,
+                term=term,
+                ranges=ranges,
+                lease=None,
+                map_version=current_map.map_version,
+            )
         if role == NodeRole.PRIMARY:
             # Check if an old lease from a DIFFERENT primary is still within expiry + M
             existing_lease = self.leases.get(shard_id)
@@ -1143,9 +1269,18 @@ class CoordinatorService:
                     )
                     return None
 
+            # 7. No lease renewal while this shard is failing over: the failover waits for
+            #    the old lease to run out, so it must not be extended under its feet.
+            if shard_id in self.failover_in_progress:
+                raise FailoverInProgress(
+                    f"Failover in progress for shard {shard_id}; lease not renewed."
+                )
+
             # Update follower state as seen by primary
             prev_state = self.replica_states.get(shard_id)
             self.replica_states[shard_id] = hb.follower_state
+            self._replica_reported.add(shard_id)
+            self._last_primary_seq[shard_id] = hb.last_applied_seq
             if hb.follower_state == ReplicaState.SYNCED and prev_state != ReplicaState.SYNCED:
                 now_wall = time.time()
                 for m in reversed(self.failover_metrics):

@@ -1090,7 +1090,17 @@ async def test_destination_unavailable_aborts_safely(tmp_path: Path):
                 coord_service,
                 http_client=client,
             )
-        assert rec.state == MigrationState.ABORTED
+        # The destination is down, so purging its staged data failed: the abort is not
+        # finished yet, and the record must stay retryable rather than claim ABORTED.
+        assert rec.state == MigrationState.ABORTING
+
+    class DestBackTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "ok"})
+
+    async with AsyncClient(transport=DestBackTransport(), base_url="http://test") as client:
+        await coord_service.migration_mgr.retry_post_cutover(coord_service, http_client=client)
+    assert coord_service.migration_mgr.migrations[rec.migration_id].state == MigrationState.ABORTED
 
 
 @pytest.mark.asyncio

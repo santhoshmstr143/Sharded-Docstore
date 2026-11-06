@@ -212,6 +212,8 @@ All errors return JSON: `{"error_code": "<CODE>", "error_message": "<human text>
 | `SHARD_UNAVAILABLE` | 503 | Owning shard primary is down or timed out |
 | `SERVER_BUSY` | 503 | Router reached maximum concurrent request capacity |
 | `ROUTING_FAILED` | 500 | Router exceeded retry limit during map recovery |
+| `RESULT_TOO_LARGE` | 413 | Query would exceed the 32 MB response budget |
+| `FAILOVER_IN_PROGRESS` | 503 | Lease renewal refused while the shard fails over |
 | `AUTH_FAILED` | 401 | Invalid cluster secret, admin token, or client API key |
 | `BODY_TOO_LARGE` | 413 | Request body exceeds 2 MB (also enforced without `Content-Length`) |
 | `DOC_TOO_LARGE` | 413 | A single document exceeds 1 MB serialized |
@@ -366,7 +368,7 @@ Signals node of demotion or epoch/term invalidation during failover.
 ## 11. Coordinator Endpoints
 
 ### 11.1 `GET /shardmap`
-Public endpoint returning current cluster topology and `map_version`.
+Returns current cluster topology and `map_version`. Requires `X-Admin-Token`.
 ```json
 {
   "map_version": 1,

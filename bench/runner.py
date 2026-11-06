@@ -30,7 +30,7 @@ from bench.load_generator import LoadConfig, LoadGenerator, compute_percentiles
 from docstore.common.auth import (
     CLIENT_KEY_HEADER,
     CLUSTER_SIG_HEADER,
-    compute_signature,
+    sign_request,
 )
 from docstore.common.config import Settings
 from docstore.common.models import NodeRole, ReplicaState, ShardMap, ShardMapEntry, ShardRange
@@ -51,13 +51,18 @@ ADMIN = "b" * 32
 CLIENT_KEY = "c" * 16
 
 
-def _sig_headers(payload: dict[str, Any] | None = None) -> dict[str, str]:
-    if payload is not None:
-        body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        sig = compute_signature(SECRET, body_bytes)
-    else:
-        sig = compute_signature(SECRET, b"")
-    return {CLUSTER_SIG_HEADER: sig}
+def _sig_headers(
+    payload: dict[str, Any] | None = None, *, method: str = "POST", path: str = "/doc"
+) -> dict[str, str]:
+    """Headers for a direct node call: the client API key (shard data routes) plus a
+    cluster signature bound to *method* + *path* (internal routes)."""
+    body_bytes = (
+        json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else b""
+    )
+    return {
+        CLUSTER_SIG_HEADER: sign_request(SECRET, method, path, body_bytes),
+        CLIENT_KEY_HEADER: CLIENT_KEY,
+    }
 
 
 def record_environment(results_dir: Path) -> dict[str, Any]:
@@ -89,9 +94,7 @@ def record_environment(results_dir: Path) -> dict[str, Any]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-async def run_throughput_latency_suite(
-    results_dir: Path, raw_dir: Path
-) -> list[dict[str, Any]]:
+async def run_throughput_latency_suite(results_dir: Path, raw_dir: Path) -> list[dict[str, Any]]:
     """Measure throughput (ops/sec) and latency (p50, p95, p99) across concurrency."""
     print("\n--- Running Throughput & Latency Suite ---")
     tmp_path = Path(tempfile.mkdtemp(prefix="bench_tput_"))
@@ -116,7 +119,7 @@ async def run_throughput_latency_suite(
                 shard_id=sid,
                 role=NodeRole.PRIMARY,
                 ranges=ranges,
-                follower_url=f"127.0.0.1:{8201 + i*2}",
+                follower_url=f"127.0.0.1:{8201 + i * 2}",
             )
             app_f = build_app(
                 settings.model_copy(update={"DATA_DIR": str(tmp_path / f"f{i}")}),
@@ -125,8 +128,8 @@ async def run_throughput_latency_suite(
                 role=NodeRole.FOLLOWER,
                 ranges=ranges,
             )
-            p_addr = f"127.0.0.1:{8200 + i*2}"
-            f_addr = f"127.0.0.1:{8201 + i*2}"
+            p_addr = f"127.0.0.1:{8200 + i * 2}"
+            f_addr = f"127.0.0.1:{8201 + i * 2}"
 
             trans_p = ASGITransport(app=app_p)
             trans_f = ASGITransport(app=app_f)
@@ -151,8 +154,8 @@ async def run_throughput_latency_suite(
 
         try:
             for i in range(3):
-                p_addr = f"127.0.0.1:{8200 + i*2}"
-                f_addr = f"127.0.0.1:{8201 + i*2}"
+                p_addr = f"127.0.0.1:{8200 + i * 2}"
+                f_addr = f"127.0.0.1:{8201 + i * 2}"
                 shard_apps[p_addr].state.node.http_client = AsyncClient(
                     mounts={f"http://{f_addr}": transports[f_addr]}, timeout=5.0
                 )
@@ -267,9 +270,7 @@ async def run_throughput_latency_suite(
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-async def run_query_comparison_suite(
-    results_dir: Path, raw_dir: Path
-) -> list[dict[str, Any]]:
+async def run_query_comparison_suite(results_dir: Path, raw_dir: Path) -> list[dict[str, Any]]:
     """Compare direct shard-key routing vs scatter-gather queries (1, 2, 3 shards)."""
     print("\n--- Running Query Routing & Scatter-Gather Comparison ---")
     tmp_path = Path(tempfile.mkdtemp(prefix="bench_query_"))
@@ -294,7 +295,7 @@ async def run_query_comparison_suite(
                 shard_id=sid,
                 role=NodeRole.PRIMARY,
                 ranges=ranges,
-                follower_url=f"127.0.0.1:{8201 + i*2}",
+                follower_url=f"127.0.0.1:{8201 + i * 2}",
             )
             app_f = build_app(
                 settings.model_copy(update={"DATA_DIR": str(tmp_path / f"f{i}")}),
@@ -303,8 +304,8 @@ async def run_query_comparison_suite(
                 role=NodeRole.FOLLOWER,
                 ranges=ranges,
             )
-            p_addr = f"127.0.0.1:{8200 + i*2}"
-            f_addr = f"127.0.0.1:{8201 + i*2}"
+            p_addr = f"127.0.0.1:{8200 + i * 2}"
+            f_addr = f"127.0.0.1:{8201 + i * 2}"
 
             trans_p = ASGITransport(app=app_p)
             trans_f = ASGITransport(app=app_f)
@@ -329,8 +330,8 @@ async def run_query_comparison_suite(
 
         try:
             for i in range(3):
-                p_addr = f"127.0.0.1:{8200 + i*2}"
-                f_addr = f"127.0.0.1:{8201 + i*2}"
+                p_addr = f"127.0.0.1:{8200 + i * 2}"
+                f_addr = f"127.0.0.1:{8201 + i * 2}"
                 shard_apps[p_addr].state.node.http_client = AsyncClient(
                     mounts={f"http://{f_addr}": transports[f_addr]}, timeout=2.0
                 )
@@ -559,7 +560,7 @@ async def run_failover_recovery_suite(
                     prom_resp = await cb.post(
                         "/internal/promote",
                         json=prom_payload,
-                        headers=_sig_headers(prom_payload),
+                        headers=_sig_headers(prom_payload, path="/internal/promote"),
                     )
                     assert prom_resp.status_code == 200
 
@@ -661,9 +662,7 @@ async def run_failover_recovery_suite(
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-async def run_migration_metrics_suite(
-    results_dir: Path, raw_dir: Path
-) -> list[dict[str, Any]]:
+async def run_migration_metrics_suite(results_dir: Path, raw_dir: Path) -> list[dict[str, Any]]:
     """Measure live migration write pause and catch-up operations vs range size."""
     print("\n--- Running Live Migration Metrics Suite ---")
     tmp_path = Path(tempfile.mkdtemp(prefix="bench_mig_"))

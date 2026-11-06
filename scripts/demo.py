@@ -35,7 +35,7 @@ from httpx import ASGITransport, AsyncClient
 from docstore.common.auth import (
     CLIENT_KEY_HEADER,
     CLUSTER_SIG_HEADER,
-    compute_signature,
+    sign_request,
 )
 from docstore.common.config import Settings
 from docstore.common.models import (
@@ -80,13 +80,18 @@ def _client_headers() -> dict[str, str]:
     return {CLIENT_KEY_HEADER: CLIENT_KEY}
 
 
-def _sig_headers(payload: dict[str, Any] | None = None) -> dict[str, str]:
-    if payload is not None:
-        body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        sig = compute_signature(SECRET, body_bytes)
-    else:
-        sig = compute_signature(SECRET, b"")
-    return {CLUSTER_SIG_HEADER: sig}
+def _sig_headers(
+    payload: dict[str, Any] | None = None, *, method: str = "POST", path: str = "/doc"
+) -> dict[str, str]:
+    """Headers for a direct node call: the client API key (shard data routes) plus a
+    cluster signature bound to *method* + *path* (internal routes)."""
+    body_bytes = (
+        json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else b""
+    )
+    return {
+        CLUSTER_SIG_HEADER: sign_request(SECRET, method, path, body_bytes),
+        CLIENT_KEY_HEADER: CLIENT_KEY,
+    }
 
 
 async def run_demo(fast: bool = True) -> None:

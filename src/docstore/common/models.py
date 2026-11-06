@@ -7,6 +7,7 @@ are defined here so that interface contracts are enforced consistently.
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 from typing import Any
 
@@ -128,9 +129,40 @@ class Document(BaseModel):
         """Reject booleans, non-integers, negatives, and out-of-range values."""
         return _validate_doc_id(v)
 
+    @model_validator(mode="after")
+    def _reject_non_finite_values(self) -> Document:
+        """NaN / Infinity are not JSON and break the total sort order and equality."""
+        stack: list[Any] = list((self.model_extra or {}).values())
+        while stack:
+            v = stack.pop()
+            if isinstance(v, float) and not math.isfinite(v):
+                raise ValueError("Documents may not contain NaN or Infinity values.")
+            if isinstance(v, dict):
+                stack.extend(v.values())
+            elif isinstance(v, list):
+                stack.extend(v)
+        return self
+
     def extra_fields(self) -> dict[str, Any]:
         """Return fields beyond ``doc_id``."""
         return dict(self.model_extra) if self.model_extra else {}
+
+
+def safe_validation_message(exc: Exception) -> str:
+    """Describe a validation error WITHOUT echoing the submitted values back."""
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            items = errors(include_input=False, include_url=False)
+        except TypeError:
+            items = errors()
+        parts = []
+        for e in items:
+            loc = ".".join(str(x) for x in e.get("loc", ()) if x not in ("body",))
+            parts.append(f"{loc}: {e.get('msg', 'invalid')}" if loc else str(e.get("msg")))
+        if parts:
+            return "; ".join(parts)
+    return "Invalid request."
 
 
 def serialized_doc_size(doc: dict[str, Any]) -> int:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import functools
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -41,6 +41,17 @@ class Settings(BaseSettings):
         min_length=16,
         description="API key required by clients hitting the router.",
     )
+
+    @field_validator("CLUSTER_SECRET", "ADMIN_TOKEN", "CLIENT_API_KEY")
+    @classmethod
+    def _reject_placeholder_secret(cls, v: str, info: ValidationInfo) -> str:
+        """Refuse the publicly known placeholder values shipped in .env.example."""
+        if "change-me" in v.lower() or "changeme" in v.lower():
+            raise ValueError(
+                f"{info.field_name} is still the .env.example placeholder; set a real secret "
+                "(e.g. `python -c 'import secrets; print(secrets.token_hex(32))'`)."
+            )
+        return v
 
     # ── Timing parameters ─────────────────────────────────────────────────────
     HEARTBEAT_INTERVAL_S: float = Field(

@@ -2,15 +2,19 @@
 HMAC-SHA256 authentication for inter-node RPC and admin endpoints.
 
 Design:
-- Cluster nodes authenticate each other by including an HMAC-SHA256 signature
-  of the raw request body in the ``X-Cluster-Signature`` header.
+- Cluster nodes authenticate each other with an HMAC-SHA256 signature in the
+  ``X-Cluster-Signature`` header. The signature covers the HTTP method, the
+  path, the query string and the raw body (see :func:`canonical_request`), so a
+  signature captured for one endpoint can never be replayed against another
+  (e.g. a read-only ``/internal/migration/checksum`` against ``.../cleanup``),
+  and a body-less GET signature is not a universal token.
 - Admin endpoints use a separate ``X-Admin-Token`` header.
 - Client-facing router endpoints use ``X-Api-Key``.
 - All comparisons use ``hmac.compare_digest`` (constant-time) to prevent
   timing-based side-channel attacks.
 
 Limitations (documented in docs/security.md):
-- No replay protection (timestamp not included in the HMAC).
+- No replay protection for the *same* request (no timestamp / nonce in the HMAC).
 - Intended for a single-host Docker Compose network only.
 """
 
@@ -19,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import Header, HTTPException, Request
 
@@ -27,7 +32,7 @@ from .errors import AuthError
 # ── Header names ──────────────────────────────────────────────────────────────
 
 CLUSTER_SIG_HEADER = "X-Cluster-Signature"
-ADMIN_TOKEN_HEADER = "X-Admin-Token"  # noqa: S105
+ADMIN_TOKEN_HEADER = "X-Admin-Token"  # noqa: S105 (header name, not a secret)  # nosec B105
 CLIENT_KEY_HEADER = "X-Api-Key"
 
 
@@ -44,6 +49,36 @@ def compute_signature(secret: str, body: bytes) -> str:
         body,
         hashlib.sha256,
     ).hexdigest()
+
+
+def canonical_request(method: str, path: str, query: str, body: bytes) -> bytes:
+    """Bytes covered by a cluster request signature: method, path, query, body."""
+    return f"{method.upper()}\n{path or '/'}\n{query}\n".encode() + body
+
+
+def sign_request(secret: str, method: str, url: str, body: bytes = b"") -> str:
+    """Signature for an outgoing cluster request to *url* (absolute URL or path).
+
+    The host is not covered (nodes are addressed by changing host:port), but the
+    method, path, query string and body are.
+    """
+    parts = urlsplit(url)
+    return compute_signature(secret, canonical_request(method, parts.path, parts.query, body))
+
+
+def cluster_headers(secret: str, method: str, url: str, body: bytes = b"") -> dict[str, str]:
+    """Headers for an outgoing cluster request (JSON content type when a body is sent)."""
+    headers = {CLUSTER_SIG_HEADER: sign_request(secret, method, url, body)}
+    if body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def verify_request_signature(
+    secret: str, method: str, path: str, query: str, body: bytes, provided: str
+) -> bool:
+    """Constant-time check of a request signature produced by :func:`sign_request`."""
+    return verify_signature(secret, canonical_request(method, path, query, body), provided)
 
 
 def verify_signature(secret: str, body: bytes, provided: str) -> bool:
@@ -98,7 +133,14 @@ def make_cluster_auth_dependency(get_secret: ClusterSecretGetter) -> ClusterAuth
             raise AuthError("Missing X-Cluster-Signature header.").to_http_exception()
         body = await request.body()
         secret = get_secret()
-        if not verify_signature(secret, body, x_cluster_signature):
+        if not verify_request_signature(
+            secret,
+            request.method,
+            request.url.path,
+            request.url.query,
+            body,
+            x_cluster_signature,
+        ):
             raise AuthError("Invalid cluster signature.").to_http_exception()
 
     return _dependency  # type: ignore[return-value]

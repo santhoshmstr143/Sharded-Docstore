@@ -82,7 +82,11 @@ def _bootstrap_cluster(tmp_path: Path, settings: Settings) -> CoordinatorService
 
 class MockTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"status": "ok", "message": "success"})
+        # A caught-up follower: /internal/status reports how far it has applied, which
+        # the coordinator checks before promoting it (never promote a lagging replica).
+        return httpx.Response(
+            200, json={"status": "ok", "message": "success", "last_applied_seq": 20}
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

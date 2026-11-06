@@ -1004,9 +1004,9 @@ async def test_snapshot_resync_equal_to_local_committed_seq_safe(tmp_path: Path)
         )
         p_state.engine.last_applied_seq = 2
         p_state.term = 1
-        p_state.wal.append(
-            seq=5, term=1, op="insert", doc_id=5, request_id="req-5", payload={"v": 5}
-        )
+        # Primary WAL compacted up to its snapshot (it can never be compacted past
+        # it): earlier entries are only available via snapshot resync.
+        p_state.wal.reset(p_state.engine.last_applied_seq + 1)
         p_state.follower_state = ReplicaState.CATCHING_UP
 
         async with LifespanManager(follower_app):
@@ -1066,9 +1066,9 @@ async def test_snapshot_resync_above_local_committed_seq_succeeds(tmp_path: Path
         )
         p_state.engine.last_applied_seq = 3
         p_state.term = 1
-        p_state.wal.append(
-            seq=5, term=1, op="insert", doc_id=5, request_id="req-5", payload={"v": 5}
-        )
+        # Primary WAL compacted up to its snapshot (it can never be compacted past
+        # it): earlier entries are only available via snapshot resync.
+        p_state.wal.reset(p_state.engine.last_applied_seq + 1)
         p_state.follower_state = ReplicaState.CATCHING_UP
 
         async with LifespanManager(follower_app):
@@ -1211,9 +1211,9 @@ async def test_snapshot_recovery_persists_snapshot_and_reconstructs_on_restart(
             ),
         )
         # WAL starts at seq 10 (compacted)
-        p_state.wal.append(
-            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 1000}
-        )
+        # Primary WAL compacted up to its snapshot (it can never be compacted past
+        # it): earlier entries are only available via snapshot resync.
+        p_state.wal.reset(p_state.engine.last_applied_seq + 1)
         p_state.follower_state = ReplicaState.CATCHING_UP
 
         snap_file = f_dir / "shard0" / "snapshot.json"
@@ -1369,9 +1369,9 @@ async def test_wal_truncation_occurs_only_after_durable_snapshot_save(tmp_path: 
         )
         p_state.engine.last_applied_seq = 3
         p_state.term = 1
-        p_state.wal.append(
-            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
-        )
+        # Primary WAL compacted up to its snapshot (it can never be compacted past
+        # it): earlier entries are only available via snapshot resync.
+        p_state.wal.reset(p_state.engine.last_applied_seq + 1)
 
         async with LifespanManager(follower_app):
             f_state = follower_app.state.node
@@ -1557,9 +1557,9 @@ async def test_snapshot_newer_ownership_epoch_updates_runtime_ranges(tmp_path: P
             {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
         )
         p_state.engine.last_applied_seq = 2
-        p_state.wal.append(
-            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
-        )
+        # Primary WAL compacted up to its snapshot (it can never be compacted past
+        # it): earlier entries are only available via snapshot resync.
+        p_state.wal.reset(p_state.engine.last_applied_seq + 1)
 
         async with LifespanManager(follower_app):
             f_state = follower_app.state.node
@@ -1777,9 +1777,9 @@ async def test_ownership_epochs_consistent_between_snapshot_runtime_and_metadata
             {"seq": 2, "term": 1, "op": "insert", "doc_id": 2, "payload": {"v": 2}}
         )
         p_state.engine.last_applied_seq = 2
-        p_state.wal.append(
-            seq=10, term=1, op="insert", doc_id=10, request_id="req-10", payload={"v": 10}
-        )
+        # Primary WAL compacted up to its snapshot (it can never be compacted past
+        # it): earlier entries are only available via snapshot resync.
+        p_state.wal.reset(p_state.engine.last_applied_seq + 1)
 
         async with LifespanManager(follower_app):
             f_state = follower_app.state.node

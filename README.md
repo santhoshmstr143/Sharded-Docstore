@@ -177,7 +177,7 @@ python -m docstore.router
 
 ## Testing & Quality Gates
 
-The test suite contains **392 automated tests** covering unit storage, safe query filtering, shard routing, coordinator leases, fail-closed replication durability, failover fencing, and live range migration (391 pass and 1 Docker smoke test is skipped when no live cluster is running).
+The test suite contains **416 automated tests** covering unit storage, safe query filtering, shard routing, coordinator leases, fail-closed replication durability, failover fencing, and live range migration (415 pass and 1 Docker smoke test is skipped when no live cluster is running).
 
 ### Running Fast Tests (Unit + Integration)
 
@@ -539,8 +539,10 @@ curl -X GET http://127.0.0.1:8100/admin/migrate/{migration_id} \
 - **Fail-Closed Synchronous Replication & Degraded Mode:** Writes require durable 2-node synchronous quorum (primary and follower WAL fsync). A primary without a configured follower or with an unavailable follower strictly rejects writes with `503 REPLICATION_UNAVAILABLE` before WAL append. Standalone development mode requires explicit opt-in (`STANDALONE_MODE=true` or `allow_standalone=True`) and is clearly separated from replicated production guarantees.
 - **Clock Assumptions:** Elapsed monotonic clock time is used locally for leases; cross-machine clock synchronization is not required.
 - **Single-Writer Shard Model:** One write at a time per shard lock provides serialized writes within each individual shard; cross-shard multi-document transactions are not coordinated.
+- **Same-request replay:** cluster signatures are bound to method, path, query and body, but carry no timestamp/nonce; someone who can capture internal traffic can re-send that *same* request (see `docs/security.md`).
 - **Coordinator restart with a dead primary:** if the coordinator restarts while a primary is down and its follower had registered with the previous coordinator instance, no automatic failover happens (followers do not re-register). Use `POST /admin/failover/{shard_id}`.
 - **Interrupted migration copies restart from scratch:** copy progress is persisted, but a coordinator restart aborts any migration that has not reached cutover.
+- **Upgrading clients and nodes together:** shard data routes now require `X-Api-Key` and cluster signatures cover the request route, so routers, shards and the coordinator must all run this version. `GET /shardmap` now needs `X-Admin-Token`, and the server refuses to start with the `change-me` placeholder secrets from `.env.example`.
 - **Upgrading old data directories:** nodes now verify WAL sequence continuity on startup. `data/` directories written by older builds may contain a WAL gap left by the old snapshot-install path and will refuse to start — delete them (`rm -rf data/`, or remove the Docker volumes) after upgrading. `make clean` does not touch node data.
 
 ---

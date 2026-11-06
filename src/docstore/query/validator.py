@@ -21,6 +21,25 @@ WHITELIST_LOGICAL_OPS = frozenset({"$and", "$or"})
 WHITELIST_VALUE_OPS = frozenset({"$eq", "$gt", "$gte", "$lt", "$lte", "$in"})
 WHITELIST_ALL_OPS = WHITELIST_LOGICAL_OPS | WHITELIST_VALUE_OPS
 
+# Total number of values (scalars, list items, object members) anywhere in a filter.
+# The clause / $in caps alone do not bound cost: a 1000-item $in whose items are
+# 600-element lists is ~600k comparisons per document.
+FILTER_MAX_VALUES = 10_000
+
+
+def _check_value_budget(filter_dict: Any) -> None:
+    count = 0
+    stack: list[Any] = [filter_dict]
+    while stack:
+        node = stack.pop()
+        count += 1
+        if count > FILTER_MAX_VALUES:
+            raise InvalidQuery(f"Filter contains more than {FILTER_MAX_VALUES} values in total.")
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+
 
 def _reject_non_finite(value: Any, depth: int = 0) -> None:
     """NaN / Infinity are not valid JSON and break routing and comparisons."""
@@ -48,6 +67,7 @@ def validate_query_filter(filter_dict: Any) -> None:
         # Empty filter is valid (matches all documents)
         return
 
+    _check_value_budget(filter_dict)
     _reject_non_finite(filter_dict)
     clause_count = 0
 

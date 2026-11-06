@@ -949,3 +949,751 @@ async def test_report14_migration_apply_waits_for_pending_writes(tmp_path: Path)
         assert r.status_code == 503
         assert state.wal.last_seq == 1  # nothing appended past the unresolved entry
         assert state.engine.last_applied_seq == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Section 3 — security & correctness review, phase 1
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _signed(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[bytes, dict]:
+    """Route-bound cluster signature exactly as production code produces it."""
+    from docstore.common.auth import cluster_headers
+
+    raw = b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
+    return raw, cluster_headers(SECRET, method, path, raw)
+
+
+@pytest.mark.raw_cluster_auth
+@pytest.mark.asyncio
+async def test_sec1_shard_data_routes_require_client_api_key(tmp_path: Path) -> None:
+    app = _standalone(tmp_path)
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            doc = {"request_id": "r1", "document": {"doc_id": 1}}
+            assert (await c.post("/doc", json=doc)).status_code == 401
+            assert (await c.get("/doc/1")).status_code == 401
+            assert (await c.post("/query", json={"filter": {}})).status_code == 401
+            assert (await c.get("/status")).status_code == 401
+            bad = {CLIENT_KEY_HEADER: "x" * 16}
+            assert (await c.post("/doc", json=doc, headers=bad)).status_code == 401
+            good = {CLIENT_KEY_HEADER: CLIENT}
+            assert (await c.post("/doc", json=doc, headers=good)).status_code == 201
+            assert (await c.get("/doc/1", headers=good)).status_code == 200
+            assert (await c.get("/health")).status_code == 200  # liveness stays open
+        assert app.state.node.engine.doc_count() == 1
+
+
+@pytest.mark.raw_cluster_auth
+@pytest.mark.asyncio
+async def test_sec3_signature_cannot_be_replayed_against_another_endpoint(tmp_path: Path) -> None:
+    app = _standalone(tmp_path, ranges=[ShardRangeConfig(start=0, end=100, ownership_epoch=1)])
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            await c.post(
+                "/doc",
+                json={"request_id": "r1", "document": {"doc_id": 5}},
+                headers={CLIENT_KEY_HEADER: CLIENT},
+            )
+            raw, h = _signed("POST", "/internal/migration/checksum", {"start": 0, "end": 100})
+            assert (
+                await c.post("/internal/migration/checksum", content=raw, headers=h)
+            ).status_code == 200
+            # Same bytes + signature against the destructive endpoint: rejected.
+            r = await c.post("/internal/migration/cleanup", content=raw, headers=h)
+            assert r.status_code == 401
+            # Legacy body-only signature: rejected.
+            legacy = {
+                "Content-Type": "application/json",
+                CLUSTER_SIG_HEADER: compute_signature(SECRET, raw),
+            }
+            assert (
+                await c.post("/internal/migration/checksum", content=raw, headers=legacy)
+            ).status_code == 401
+            # A GET signature for one path is not a token for another path / query.
+            _, gh = _signed("GET", "/internal/status")
+            assert (await c.get("/internal/status", headers=gh)).status_code == 200
+            assert (await c.get("/internal/snapshot", headers=gh)).status_code == 401
+            assert (await c.get("/internal/status?x=1", headers=gh)).status_code == 401
+        assert app.state.node.engine.doc_count() == 1
+        assert [(r.start, r.end) for r in app.state.node.ranges] == [(0, 100)]
+
+
+def test_sec_no_body_only_signing_in_src() -> None:
+    """Production code must sign method+path+body; only auth.py may use the raw HMAC.
+
+    (tests/conftest.py's adapter relies on this to never mask a production bug.)
+    """
+    src = Path(__file__).resolve().parents[2] / "src" / "docstore"
+    offenders = [
+        str(p.relative_to(src))
+        for p in src.rglob("*.py")
+        if p.name != "auth.py" and "compute_signature(" in p.read_text()
+    ]
+    assert offenders == []
+
+
+@pytest.mark.raw_cluster_auth
+@pytest.mark.asyncio
+async def test_sec_router_forwards_api_key_and_route_bound_signature(tmp_path: Path) -> None:
+    from docstore.common.auth import verify_request_signature
+
+    mgr = ShardMapManager(tmp_path / "map.json")
+    mgr.save(create_default_3_shard_map(primaries=["p:1", "q:1", "r:1"]))
+    seen: list[httpx.Request] = []
+
+    def shard(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/query":
+            return httpx.Response(200, json={"documents": [], "total": 0})
+        return httpx.Response(201, json={"outcome": "COMMITTED", "seq": 1})
+
+    transports = {a: httpx.MockTransport(shard) for a in ("p:1", "q:1", "r:1")}
+    router = build_router_app(_settings(tmp_path / "r"), mgr, shard_transports=transports)
+    async with LifespanManager(router):
+        async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+            h = {CLIENT_KEY_HEADER: CLIENT}
+            await rc.post("/doc", json={"request_id": "a", "document": {"doc_id": 1}}, headers=h)
+            await rc.post("/query", json={"filter": {}}, headers=h)
+    assert seen
+    for req in seen:
+        assert req.headers[CLIENT_KEY_HEADER] == CLIENT
+        assert verify_request_signature(
+            SECRET,
+            req.method,
+            req.url.path,
+            req.url.query.decode(),
+            req.content,
+            req.headers[CLUSTER_SIG_HEADER],
+        )
+
+
+@pytest.mark.asyncio
+async def test_sec4_query_ranges_are_bounded_and_merged(tmp_path: Path) -> None:
+    app = _standalone(tmp_path)
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            for i in range(5):
+                await _insert(c, {"doc_id": i}, f"r{i}")
+            too_many = [[i, i + 1] for i in range(65)]
+            assert (
+                await c.post("/query", json={"filter": {}, "ranges": too_many})
+            ).status_code == 422
+            bad = {"filter": {}, "ranges": [[10, 5]]}
+            assert (await c.post("/query", json=bad)).status_code == 422
+            dupes = {"filter": {}, "ranges": [[0, KEYSPACE_END]] * 60}
+            r = await c.post("/query", json=dupes)
+            assert r.status_code == 200 and r.json()["total"] == 5  # scanned once, not 60x
+
+
+def _two_shard_setup(tmp_path: Path, smap: ShardMap) -> tuple[Any, Any, ShardMapManager]:
+    """Shard sa owns [0, 100), sb owns [100, 2^63); *smap* is what the map file says."""
+    a = _standalone(tmp_path / "a", "sa", [ShardRangeConfig(start=0, end=100, ownership_epoch=1)])
+    b = _standalone(
+        tmp_path / "b", "sb", [ShardRangeConfig(start=100, end=KEYSPACE_END, ownership_epoch=1)]
+    )
+    mgr = ShardMapManager(tmp_path / "map.json")
+    mgr.save(smap)
+    return a, b, mgr
+
+
+def _entry(sid: str, s: int, e: int, addr: str, epoch: int = 1) -> ShardMapEntry:
+    return ShardMapEntry(
+        shard_id=sid,
+        range=ShardRange(start=s, end=e),
+        primary=addr,
+        ownership_epoch=epoch,
+        map_version=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_q1_and_of_two_doc_id_in_sets_returns_intersection(tmp_path: Path) -> None:
+    smap = ShardMap(
+        map_version=1, entries=[_entry("sa", 0, 100, "a:1"), _entry("sb", 100, KEYSPACE_END, "b:1")]
+    )
+    a, b, mgr = _two_shard_setup(tmp_path, smap)
+    async with LifespanManager(a), LifespanManager(b):
+        ta, tb = ASGITransport(app=a), ASGITransport(app=b)
+        async with AsyncClient(transport=ta, base_url="http://t") as ca:
+            for i in (1, 2, 3):
+                await _insert(ca, {"doc_id": i}, f"a{i}")
+        async with AsyncClient(transport=tb, base_url="http://t") as cb:
+            await _insert(cb, {"doc_id": 150}, "b150")
+        router = build_router_app(
+            _settings(tmp_path / "r"), mgr, shard_transports={"a:1": ta, "b:1": tb}
+        )
+        async with LifespanManager(router):
+            async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+                h = {CLIENT_KEY_HEADER: CLIENT}
+                f1 = {"$and": [{"doc_id": {"$in": [1, 2]}}, {"doc_id": {"$in": [2, 3]}}]}
+                r = await rc.post("/query", json={"filter": f1}, headers=h)
+                assert [d["doc_id"] for d in r.json()["documents"]] == [2]
+                f2 = {"$and": [{"doc_id": {"$in": [1, 150]}}, {"doc_id": {"$in": [2, 3]}}]}
+                r = await rc.post("/query", json={"filter": f2}, headers=h)
+                assert r.json()["documents"] == [] and r.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ctl1_stale_router_query_refreshes_instead_of_dropping_range(tmp_path: Path) -> None:
+    current = ShardMap(
+        map_version=2, entries=[_entry("sa", 0, 100, "a:1"), _entry("sb", 100, KEYSPACE_END, "b:1")]
+    )
+    a, b, mgr = _two_shard_setup(tmp_path, current)
+    # The router still caches the pre-migration map: sa owned [0, 200).
+    mgr.set_map(
+        ShardMap(
+            map_version=1,
+            entries=[_entry("sa", 0, 200, "a:1"), _entry("sb", 200, KEYSPACE_END, "b:1")],
+        )
+    )
+    async with LifespanManager(a), LifespanManager(b):
+        ta, tb = ASGITransport(app=a), ASGITransport(app=b)
+        async with AsyncClient(transport=tb, base_url="http://t") as cb:
+            await _insert(cb, {"doc_id": 150, "tag": "x"}, "b150")
+        router = build_router_app(
+            _settings(tmp_path / "r"), mgr, shard_transports={"a:1": ta, "b:1": tb}
+        )
+        async with LifespanManager(router):
+            async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+                r = await rc.post(
+                    "/query", json={"filter": {"tag": "x"}}, headers={CLIENT_KEY_HEADER: CLIENT}
+                )
+        assert r.status_code == 200
+        assert [d["doc_id"] for d in r.json()["documents"]] == [150]
+        assert mgr.shard_map.map_version == 2  # the router refreshed its map
+
+
+@pytest.mark.asyncio
+async def test_shard2_failed_internal_replication_is_tracked_not_orphaned(tmp_path: Path) -> None:
+    def follower(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error_code": "ERROR", "error_message": "down"})
+
+    client = httpx.AsyncClient(mounts={"http://f:1": httpx.MockTransport(follower)})
+    app = build_app(
+        _settings(tmp_path, SNAPSHOT_EVERY_N_OPS=0, SNAPSHOT_EVERY_S=0),
+        node_id="p",
+        shard_id="s0",
+        follower_url="f:1",
+        http_client=client,
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        node = app.state.node
+        raw, h = _signed(
+            "POST",
+            "/internal/migration/apply-batch",
+            {"migration_id": "m", "documents": [{"doc_id": 5}]},
+        )
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post("/internal/migration/apply-batch", content=raw, headers=h)
+            assert r.status_code == 503
+            assert list(node.pending_unresolved_writes) == ["mig-m-5"]
+            assert node.follower_state == ReplicaState.DOWN
+            # Next client write is rejected cleanly (never committed-then-500).
+            for _ in range(2):
+                r = await _insert(c, {"doc_id": 7}, "w7")
+                assert r.status_code in (202, 503), r.text
+        rids = [e["request_id"] for e in node.wal.replay()]
+        assert rids == ["mig-m-5"]  # no duplicate / orphaned appends
+    await client.aclose()
+
+
+class _Lossy(httpx.AsyncBaseTransport):
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self.inner, self.down = inner, False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.down:
+            raise httpx.ConnectError("down", request=request)
+        return await self.inner.handle_async_request(request)
+
+
+@pytest.mark.asyncio
+async def test_shard6_7_snapshot_resync_catches_up_and_fresh_follower_bootstraps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shard_app_mod, "_WAL_RETAIN_ENTRIES", 1)
+    rng = [ShardRangeConfig(start=0, end=10**6, ownership_epoch=1)]
+    st = lambda d: _settings(d, SNAPSHOT_EVERY_N_OPS=0, SNAPSHOT_EVERY_S=0)  # noqa: E731
+    fol = build_app(
+        st(tmp_path / "f"), node_id="f", shard_id="s0", role=NodeRole.FOLLOWER, ranges=rng
+    )
+    ftx = _Lossy(ASGITransport(app=fol))
+    holder: dict[str, Any] = {}
+
+    class _ToPrimary(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req: httpx.Request) -> httpx.Response:
+            return await ASGITransport(app=holder["p"]).handle_async_request(req)
+
+    client = httpx.AsyncClient(mounts={"http://f": ftx, "http://p": _ToPrimary()})
+    pri = build_app(
+        st(tmp_path / "p"),
+        node_id="p",
+        shard_id="s0",
+        ranges=rng,
+        follower_url="http://f",
+        http_client=client,
+    )
+    holder["p"] = pri
+    async with LifespanManager(fol), LifespanManager(pri):
+        P, F = pri.state.node, fol.state.node
+        async with AsyncClient(transport=ASGITransport(app=pri), base_url="http://p") as c:
+            for i in range(1, 6):
+                assert (await _insert(c, {"doc_id": i}, f"w{i}")).status_code == 201
+            assert await snapshot_and_compact(P) > 0
+            assert P.wal.earliest_seq() > 1
+
+            # (#7) An empty replacement follower bootstraps from the compacted primary.
+            fresh = build_app(
+                st(tmp_path / "g"), node_id="g", shard_id="s0", role=NodeRole.FOLLOWER, ranges=rng
+            )
+            async with LifespanManager(fresh):
+                assert await shard_app_mod.resync_with_primary(
+                    fresh.state.node, "http://p", http_client=client
+                )
+                assert fresh.state.node.engine.doc_count() == 5
+
+            # (#6) A pending write survives a snapshot-path resync and is then confirmed.
+            ftx.down = True
+            assert (await _insert(c, {"doc_id": 6}, "w6")).status_code == 202
+            ftx.down = False
+            assert await shard_app_mod.resync_with_primary(F, "http://p", http_client=client)
+            assert F.wal.last_seq == P.wal.last_seq  # follower got the pending tail too
+            r = await _insert(c, {"doc_id": 7}, "w7")
+            assert r.status_code == 201, r.text
+            assert P.engine.get(6) is not None and not P.pending_unresolved_writes
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shard8_standalone_crash_between_wal_and_metadata_recovers(tmp_path: Path) -> None:
+    rng = [ShardRangeConfig(start=0, end=10**6, ownership_epoch=1)]
+
+    def mk() -> Any:
+        return build_app(
+            _settings(tmp_path, SNAPSHOT_EVERY_N_OPS=0, SNAPSHOT_EVERY_S=0),
+            node_id="n",
+            shard_id="s0",
+            ranges=rng,
+            allow_standalone=True,
+        )
+
+    app = mk()
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            assert (await _insert(c, {"doc_id": 1}, "w1")).status_code == 201
+        w = app.state.node.wal
+        # Crash point: w2 is durable in the WAL, committed_seq not yet persisted.
+        w.append(
+            seq=w.next_seq(), term=1, op="insert", doc_id=2, request_id="w2", payload={"doc_id": 2}
+        )
+    (tmp_path / "s0" / "snapshot.json").unlink(missing_ok=True)  # a crash writes no snapshot
+
+    app2 = mk()
+    async with LifespanManager(app2):
+        node = app2.state.node
+        assert not node.pending_unresolved_writes
+        assert node.engine.get(2) is not None
+        async with AsyncClient(transport=ASGITransport(app=app2), base_url="http://t") as c:
+            assert (await _insert(c, {"doc_id": 3}, "w3")).status_code == 201
+            retry = await _insert(c, {"doc_id": 2}, "w2")
+            assert retry.status_code == 201 and retry.json()["seq"] == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Section 4 — security & correctness review, phase 2
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_p10_wal_fsync_failure_fail_stops_the_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _standalone(tmp_path)
+    async with LifespanManager(app):
+        node = app.state.node
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            assert (await _insert(c, {"doc_id": 1}, "ok")).status_code == 201
+
+            real_fsync = os.fsync
+
+            def broken(fd: int) -> None:
+                raise OSError(errno.EIO, "disk gone")
+
+            monkeypatch.setattr(os, "fsync", broken)
+            r = await _insert(c, {"doc_id": 2}, "w2")
+            monkeypatch.setattr(os, "fsync", real_fsync)
+            # The record may be on disk: the client is told the outcome is unknown.
+            assert r.status_code == 202 and r.json()["error_code"] == "OUTCOME_UNKNOWN"
+            # ...and the node takes itself out of service (no lease, no heartbeats).
+            assert node.ready is False and not node.is_lease_valid()
+            assert (await c.get("/health")).status_code == 503
+            assert (await _insert(c, {"doc_id": 3}, "w3")).status_code == 503
+
+
+def _coord_with_follower(tmp_path: Path) -> CoordinatorService:
+    smap = create_default_3_shard_map(
+        primaries=["p0:1", "p1:1", "p2:1"], followers=["f0:1", None, None]
+    )
+    map_path = tmp_path / "coord" / "shard_map.json"
+    ShardMapManager(map_path).save(smap)
+    return CoordinatorService(_settings(tmp_path / "coord"), map_path=map_path)
+
+
+def _status_transport(seq: int, seen: list[str]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.url.host}{request.url.path}")
+        if request.url.path == "/internal/status":
+            return httpx.Response(200, json={"last_applied_seq": seq})
+        return httpx.Response(200, json={"status": "ok"})
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_p12_unsynced_or_lagging_follower_is_not_promoted(tmp_path: Path) -> None:
+    from docstore.common.models import Heartbeat
+
+    svc = _coord_with_follower(tmp_path)
+    svc._recovery_quarantine_until_monotonic = 0.0
+    svc.register_node(NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1"))
+    hb = Heartbeat(
+        node_id="p0",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        term=1,
+        last_applied_seq=50,
+        follower_acked_seq=40,
+        follower_state=ReplicaState.CATCHING_UP,
+        timestamp_monotonic=time.monotonic(),
+    )
+    svc.handle_heartbeat(hb)
+    svc.leases.clear()
+    seen: list[str] = []
+    async with AsyncClient(transport=_status_transport(50, seen)) as client:
+        # Follower last reported CATCHING_UP: refused even though it answers.
+        assert await svc.trigger_failover("shard0", http_client=client) is False
+        # Synced, but behind the primary's last reported seq: refused.
+        svc.replica_states["shard0"] = ReplicaState.SYNCED
+    async with AsyncClient(transport=_status_transport(10, seen)) as client:
+        assert await svc.trigger_failover("shard0", http_client=client) is False
+    assert svc.shard_terms["shard0"] == 1
+    assert not any(p.endswith("/internal/promote") for p in seen)
+    # Explicit operator override still works.
+    async with AsyncClient(transport=_status_transport(10, seen)) as client:
+        assert await svc.trigger_failover("shard0", http_client=client, force=True) is True
+
+
+@pytest.mark.asyncio
+async def test_p12_restarted_incumbent_is_repromoted_when_follower_unsynced(tmp_path: Path) -> None:
+    svc = _coord_with_follower(tmp_path)
+    svc._recovery_quarantine_until_monotonic = 0.0
+    svc.register_node(NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1"))
+    svc._replica_reported.add("shard0")
+    svc.replica_states["shard0"] = ReplicaState.CATCHING_UP
+    # The primary restarts from disk and re-registers as a follower.
+    svc.register_node(
+        NodeRegistration(
+            node_id="p0", shard_id="shard0", address="p0:1", requested_role=NodeRole.FOLLOWER
+        )
+    )
+    svc.leases.clear()
+    seen: list[str] = []
+    async with AsyncClient(transport=_status_transport(0, seen)) as client:
+        assert await svc.check_and_trigger_failover(http_client=client) == ["shard0"]
+    entry = next(e for e in svc.shard_map.entries if e.shard_id == "shard0")
+    assert (entry.primary, entry.follower) == ("p0:1", "f0:1")  # incumbent kept, not swapped
+    assert svc.shard_terms["shard0"] == 2
+    assert "p0/internal/promote" in seen and "f0/internal/promote" not in seen
+
+
+@pytest.mark.asyncio
+async def test_p13_no_lease_renewal_or_grant_while_failing_over(tmp_path: Path) -> None:
+    from docstore.common.errors import FailoverInProgress
+    from docstore.common.models import Heartbeat
+
+    svc = _coord_with_follower(tmp_path)
+    svc.register_node(NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1"))
+    svc.failover_in_progress.add("shard0")
+    hb = Heartbeat(
+        node_id="p0",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        term=1,
+        last_applied_seq=1,
+        follower_acked_seq=1,
+        follower_state=ReplicaState.SYNCED,
+        timestamp_monotonic=time.monotonic(),
+    )
+    with pytest.raises(FailoverInProgress):
+        svc.handle_heartbeat(hb)
+    resp = svc.register_node(NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1"))
+    assert resp.lease is None
+
+
+def test_p15_placeholder_secrets_are_rejected(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="placeholder"):
+        _settings(tmp_path, CLUSTER_SECRET="change-me-cluster-secret-min-32-chars")
+    with pytest.raises(ValidationError, match="placeholder"):
+        _settings(tmp_path, CLIENT_API_KEY="change-me-client-api-key")
+
+
+@pytest.mark.asyncio
+async def test_p16_query_engine_rejections(tmp_path: Path) -> None:
+    from docstore.query import validate_query_filter
+
+    app = _standalone(tmp_path)
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            await _insert(c, {"doc_id": 1, "x": [1, 2]}, "a")
+            # Sorting on an array field is a client error, not a 500.
+            r = await c.post("/query", json={"filter": {}, "sort_field": "x"})
+            assert r.status_code == 400 and r.json()["error_code"] == "INVALID_QUERY"
+            # NaN in a stored document is rejected.
+            r = await c.post(
+                "/doc",
+                content=b'{"request_id":"n","document":{"doc_id":2,"x":NaN}}',
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status_code == 422
+    # A filter whose $in items are huge lists exceeds the value budget.
+    from docstore.common.errors import InvalidQuery
+
+    with pytest.raises(InvalidQuery, match="values"):
+        validate_query_filter({"a": {"$in": [[0] * 600] * 100}})
+    validate_query_filter({"a": {"$in": list(range(1000))}})  # normal use still fine
+
+
+@pytest.mark.asyncio
+async def test_p16_router_passes_invalid_query_through(tmp_path: Path) -> None:
+    smap = ShardMap(
+        map_version=1,
+        entries=[_entry("sa", 0, 100, "a:1"), _entry("sb", 100, KEYSPACE_END, "b:1")],
+    )
+    a, b, mgr = _two_shard_setup(tmp_path, smap)
+    async with LifespanManager(a), LifespanManager(b):
+        ta, tb = ASGITransport(app=a), ASGITransport(app=b)
+        async with AsyncClient(transport=ta, base_url="http://t") as ca:
+            await _insert(ca, {"doc_id": 1, "x": [1]}, "a1")
+        router = build_router_app(
+            _settings(tmp_path / "r"), mgr, shard_transports={"a:1": ta, "b:1": tb}
+        )
+        async with LifespanManager(router):
+            async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+                r = await rc.post(
+                    "/query",
+                    json={"filter": {}, "sort_field": "x"},
+                    headers={CLIENT_KEY_HEADER: CLIENT},
+                )
+        assert r.status_code == 400 and r.json()["error_code"] == "INVALID_QUERY"
+
+
+def test_p17_client_migrate_and_transport_errors() -> None:
+    from docstore.client.client import DocStoreClient, DocStoreClientError
+
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/admin/migrate":
+            raise httpx.ReadTimeout("slow", request=request)
+        if request.url.path == "/doc":
+            if len([r for r in calls if r.url.path == "/doc"]) == 1:
+                raise httpx.RemoteProtocolError("dropped", request=request)
+            return httpx.Response(201, json={"outcome": "COMMITTED", "seq": 1})
+        return httpx.Response(500, json=["not", "a", "dict"])
+
+    client = DocStoreClient(
+        "http://r",
+        "http://c",
+        "k" * 16,
+        "a" * 32,
+        backoff_base_s=0.0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    # migrate: one attempt only, documented request shape.
+    with pytest.raises(DocStoreClientError):
+        client.migrate("shard0", "shard1", 0, 10, sync=False)
+    migrate_calls = [r for r in calls if r.url.path == "/admin/migrate"]
+    assert len(migrate_calls) == 1
+    assert json.loads(migrate_calls[0].content)["range"] == {"start": 0, "end": 10}
+    # A dropped connection is retried with the SAME request_id.
+    assert client.insert({"doc_id": 1}, request_id="rid-1")["outcome"] == "COMMITTED"
+    doc_calls = [json.loads(r.content)["request_id"] for r in calls if r.url.path == "/doc"]
+    assert doc_calls == ["rid-1", "rid-1"]
+    # A non-object error body does not crash the client.
+    with pytest.raises(DocStoreClientError):
+        client.get(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Section 5 — security & correctness review, phase 3
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_l1_malformed_internal_bodies_are_rejected_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    app = _standalone(tmp_path, ranges=[ShardRangeConfig(start=0, end=100, ownership_epoch=1)])
+    async with LifespanManager(app):
+        node = app.state.node
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            bad = [
+                ("/internal/migration/pause", {"start": "a", "end": None}),
+                ("/internal/migration/cutover", {"start": 500, "end": 10, "ownership_epoch": 2}),
+                ("/internal/migration/cutover", {"start": 0, "end": 10, "ownership_epoch": True}),
+                ("/internal/migration/oplog", {"start": 0, "end": 10, "after_seq": "x"}),
+                ("/internal/migration/snapshot", {"start": 0, "end": 10, "limit": "abc"}),
+                ("/internal/migration/apply-batch", {"documents": [{"doc_id": -1}]}),
+                (
+                    "/internal/migration/apply-oplog",
+                    {"entries": [{"seq": 1, "doc_id": 1, "op": "x"}]},
+                ),
+                ("/internal/snapshot/apply", {"last_applied_seq": {}}),
+            ]
+            for path, body in bad:
+                raw, h = _signed("POST", path, body)
+                r = await c.post(path, content=raw, headers=h)
+                assert r.status_code == 422, (path, r.status_code, r.text)
+            # Nothing was paused, owned or written; writes still work.
+            assert node.paused_ranges == []
+            assert [(r.start, r.end) for r in node.ranges] == [(0, 100)]
+            assert (await _insert(c, {"doc_id": 5}, "after")).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_l2_errors_do_not_leak_addresses_or_input(tmp_path: Path) -> None:
+    mgr = ShardMapManager(tmp_path / "map.json")
+    mgr.save(create_default_3_shard_map(primaries=["10.9.8.7:8200", "q:1", "r:1"]))
+
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused to 10.9.8.7:8200", request=request)
+
+    router = build_router_app(
+        _settings(tmp_path / "r"),
+        mgr,
+        shard_transports={"10.9.8.7:8200": httpx.MockTransport(down)},
+    )
+    async with LifespanManager(router):
+        async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+            h = {CLIENT_KEY_HEADER: CLIENT}
+            r = await rc.get("/doc/1", headers=h)
+            assert r.status_code == 503 and "10.9.8.7" not in r.text
+            secret_value = "SSN-123-45-6789"
+            r = await rc.post(
+                "/doc", json={"request_id": "x", "document": {"doc_id": secret_value}}, headers=h
+            )
+            assert r.status_code == 422 and secret_value not in r.text
+            r = await rc.post(
+                "/doc", json={"request_id": secret_value * 20, "document": {}}, headers=h
+            )
+            assert r.status_code == 422 and secret_value not in r.text
+
+
+@pytest.mark.asyncio
+async def test_l3_query_response_size_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docstore.router import scatter
+
+    monkeypatch.setattr(scatter, "QUERY_MAX_RESPONSE_BYTES", 2_000)
+    smap = ShardMap(
+        map_version=1,
+        entries=[_entry("sa", 0, 100, "a:1"), _entry("sb", 100, KEYSPACE_END, "b:1")],
+    )
+    a, b, mgr = _two_shard_setup(tmp_path, smap)
+    async with LifespanManager(a), LifespanManager(b):
+        ta, tb = ASGITransport(app=a), ASGITransport(app=b)
+        async with AsyncClient(transport=ta, base_url="http://t") as ca:
+            for i in range(20):
+                await _insert(ca, {"doc_id": i, "blob": "x" * 200}, f"a{i}")
+        router = build_router_app(
+            _settings(tmp_path / "r"), mgr, shard_transports={"a:1": ta, "b:1": tb}
+        )
+        async with LifespanManager(router):
+            async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+                h = {CLIENT_KEY_HEADER: CLIENT}
+                r = await rc.post("/query", json={"filter": {}, "limit": 100}, headers=h)
+                assert r.status_code == 413 and r.json()["error_code"] == "RESULT_TOO_LARGE"
+                r = await rc.post("/query", json={"filter": {}, "limit": 2}, headers=h)
+                assert r.status_code == 200
+
+
+def test_l4_migration_never_copies_source_follower_into_destination(tmp_path: Path) -> None:
+    smap = create_default_3_shard_map(
+        primaries=["p0:1", "p1:1", "p2:1"], followers=["f0:1", None, None]
+    )
+    map_path = tmp_path / "shard_map.json"
+    ShardMapManager(map_path).save(smap)
+    svc = CoordinatorService(_settings(tmp_path), map_path=map_path)
+    s0 = next(e for e in svc.shard_map.entries if e.shard_id == "shard0")
+    svc.bump_range_migration("shard0", s0.range.start, s0.range.start + 10, new_shard_id="shard1")
+    for e in svc.shard_map.entries:
+        if e.shard_id == "shard1":
+            assert (e.primary, e.follower) == ("p1:1", None)
+        if e.shard_id == "shard0":
+            assert (e.primary, e.follower) == ("p0:1", "f0:1")
+    with pytest.raises(ValueError, match="Unknown destination"):
+        svc.bump_range_migration(
+            "shard0", s0.range.start + 10, s0.range.start + 20, new_shard_id="nope"
+        )
+
+
+@pytest.mark.asyncio
+async def test_l5_crash_after_snapshot_install_before_wal_reset_recovers(tmp_path: Path) -> None:
+    from docstore.storage.snapshot import SnapshotManager
+
+    data_dir = tmp_path / "s0"
+    data_dir.mkdir(parents=True)
+    # Stale local history 1..3 (from before the resync) ...
+    (data_dir / "shard.wal").write_bytes(b"".join(_wal_line(s, doc_id=s) for s in (1, 2, 3)))
+    # ... superseded by a snapshot installed from the primary at seq 5.
+    SnapshotManager(data_dir).save(
+        documents={10: {"doc_id": 10}},
+        last_applied_seq=5,
+        term=2,
+        ownership_epochs={f"0-{KEYSPACE_END}": 1},
+        dedup_table={},
+        installed=True,
+    )
+    app = build_app(
+        _settings(tmp_path),
+        node_id="n",
+        shard_id="s0",
+        allow_standalone=True,
+        ranges=[ShardRangeConfig(start=0, end=KEYSPACE_END, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        node = app.state.node
+        assert node.ready
+        assert node.wal.earliest_seq() == 6 and node.wal.last_seq == 5
+        assert node.engine.get(10) is not None and node.engine.get(1) is None
+
+
+@pytest.mark.asyncio
+async def test_l6_one_failing_shard_does_not_block_other_failovers(tmp_path: Path) -> None:
+    smap = create_default_3_shard_map(
+        primaries=["p0:1", "p1:1", "p2:1"], followers=["f0:1", "f1:1", None]
+    )
+    map_path = tmp_path / "coord" / "shard_map.json"
+    ShardMapManager(map_path).save(smap)
+    svc = CoordinatorService(_settings(tmp_path / "coord"), map_path=map_path)
+    svc._recovery_quarantine_until_monotonic = 0.0
+    for sid, addr in (("shard0", "p0:1"), ("shard1", "p1:1")):
+        svc.register_node(NodeRegistration(node_id=addr, shard_id=sid, address=addr))
+        svc.nodes[addr].last_seen_monotonic -= 60  # both primaries silent past D
+    svc.leases.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "f0":
+            raise httpx.ConnectError("f0 down", request=request)
+        return httpx.Response(200, json={"last_applied_seq": 0, "status": "ok"})
+
+    async with AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        promoted = await svc.check_and_trigger_failover(http_client=client)
+    assert promoted == ["shard1"]

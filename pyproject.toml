@@ -81,6 +81,7 @@ markers = [
     "integration: multi-component tests using real I/O",
     "fault: fault-injection / crash tests (slow)",
     "security: auth, input-validation and hardening tests",
+    "raw_cluster_auth: disable the legacy-signature test adapter in tests/conftest.py",
 ]
 addopts = "-ra -q --tb=short"
 

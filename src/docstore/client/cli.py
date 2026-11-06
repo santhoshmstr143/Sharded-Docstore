@@ -31,8 +31,20 @@ def _output_json(data: Any) -> None:
     click.echo(json.dumps(data, indent=2, sort_keys=True))
 
 
+_REQUEST_ID_OPTION = click.option(
+    "--request-id",
+    type=str,
+    default=None,
+    help="Idempotency key. Reuse the id printed after an OUTCOME_UNKNOWN error to retry safely.",
+)
+
+
 def _handle_error(exc: Exception) -> None:
     """Print clean error message to stderr and exit with semantic exit code."""
+    rid = getattr(exc, "request_id", None)
+    if rid and isinstance(exc, DocStoreClientError):
+        # Without this id an OUTCOME_UNKNOWN write cannot be retried idempotently.
+        click.echo(f"request_id: {rid} (retry with --request-id {rid})", err=True)
     if isinstance(exc, NotFoundError):
         click.echo(f"Error: {exc.message} ({exc.error_code or 'NOT_FOUND'})", err=True)
         sys.exit(2)
@@ -108,8 +120,11 @@ def cli(
     type=click.Path(exists=True),
     help="Path to JSON file containing document",
 )
+@_REQUEST_ID_OPTION
 @click.pass_context
-def insert_cmd(ctx: click.Context, doc: str | None, file: str | None) -> None:
+def insert_cmd(
+    ctx: click.Context, doc: str | None, file: str | None, request_id: str | None
+) -> None:
     """Insert a new document."""
     client: DocStoreClient = ctx.obj["client"]
     try:
@@ -120,7 +135,7 @@ def insert_cmd(ctx: click.Context, doc: str | None, file: str | None) -> None:
         else:
             raise click.UsageError("Must specify either --doc or --file.")
 
-        result = client.insert(payload)
+        result = client.insert(payload, request_id=request_id)
         _output_json(result)
     except Exception as exc:
         _handle_error(exc)
@@ -155,8 +170,11 @@ def get_cmd(ctx: click.Context, doc_id: int, read_mode: str) -> None:
 @click.argument("doc_id", type=int)
 @click.option("--doc", "-d", type=str, help="Replacement document as JSON string")
 @click.option("--file", "-f", type=click.Path(exists=True), help="Path to JSON file")
+@_REQUEST_ID_OPTION
 @click.pass_context
-def update_cmd(ctx: click.Context, doc_id: int, doc: str | None, file: str | None) -> None:
+def update_cmd(
+    ctx: click.Context, doc_id: int, doc: str | None, file: str | None, request_id: str | None
+) -> None:
     """Replace a document by ID."""
     client: DocStoreClient = ctx.obj["client"]
     try:
@@ -167,7 +185,7 @@ def update_cmd(ctx: click.Context, doc_id: int, doc: str | None, file: str | Non
         else:
             raise click.UsageError("Must specify either --doc or --file.")
 
-        result = client.update(doc_id, payload)
+        result = client.update(doc_id, payload, request_id=request_id)
         _output_json(result)
     except Exception as exc:
         _handle_error(exc)
@@ -178,12 +196,13 @@ def update_cmd(ctx: click.Context, doc_id: int, doc: str | None, file: str | Non
 
 @cli.command("delete")
 @click.argument("doc_id", type=int)
+@_REQUEST_ID_OPTION
 @click.pass_context
-def delete_cmd(ctx: click.Context, doc_id: int) -> None:
+def delete_cmd(ctx: click.Context, doc_id: int, request_id: str | None) -> None:
     """Delete a document by ID."""
     client: DocStoreClient = ctx.obj["client"]
     try:
-        result = client.delete(doc_id)
+        result = client.delete(doc_id, request_id=request_id)
         _output_json(result)
     except Exception as exc:
         _handle_error(exc)

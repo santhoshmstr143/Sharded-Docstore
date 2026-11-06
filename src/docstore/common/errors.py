@@ -156,6 +156,13 @@ class ReplicationUnavailable(DocstoreError):
 # ── Uncertain outcome (202) ───────────────────────────────────────────────────
 
 
+class FailoverInProgress(DocstoreError):
+    """The shard is failing over; its old primary's lease is not renewed meanwhile."""
+
+    http_status = 503
+    error_code = "FAILOVER_IN_PROGRESS"
+
+
 class OutcomeUnknown(DocstoreError):
     """Write was WAL-appended on the primary but no durable follower ack received.
 
