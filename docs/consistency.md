@@ -64,6 +64,23 @@ Every write returns strictly one of three outcomes:
 - **Mechanism:** Served exclusively by the primary holding a valid coordinator lease ($remaining\_lease > 0$).
 - Guarantees that any read reflects all previously acknowledged writes.
 
+### 4.1.1 Primary reads during a range migration
+The guarantee holds through a migration because no two shards ever accept writes for the
+same range, and the old owner stops serving the range before the new owner accepts writes:
+
+| Phase | Writes to the range | Reads of the range |
+|---|---|---|
+| copy / catch-up | source only | source (current data) |
+| `PAUSE` … `VERIFY`, map flip | **none** (source returns `RANGE_PAUSED`) | source — no newer version can exist anywhere |
+| source *release* | none | source answers `OUT_OF_RANGE`; the router refreshes its map |
+| destination activated | destination only | destination |
+
+A router with a stale map therefore never reads an old copy once the destination has taken a
+write: the source has already released the range, so the stale request is refused and
+re-routed (verified by `test_v4_stale_router_read_after_migration_gets_the_new_owner`).
+Reads are not blocked during the write pause; they cannot be stale then because no write is
+accepted anywhere for that range.
+
 ### 4.2 Follower Reads (`read_mode: "follower"`)
 - **Guarantee:** **Bounded Staleness**.
 - **Mechanism:** Served directly by the follower replica.

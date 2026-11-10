@@ -165,7 +165,7 @@ async def test_bug1_node_steps_down_when_registered_as_follower(tmp_path: Path) 
     async with LifespanManager(app):
         state = app.state.node
         assert state.role == NodeRole.PRIMARY
-        await _apply_registration(state, {"role": "follower"}, time.monotonic())
+        await _apply_registration(state, {"shard_id": "s0", "role": "follower"}, time.monotonic())
         assert state.role == NodeRole.FOLLOWER
         meta = json.loads((tmp_path / "s0" / "node_metadata.json").read_text())
         assert meta["role"] == "follower"
@@ -896,7 +896,7 @@ async def test_report12_only_stale_term_409_demotes(tmp_path: Path) -> None:
     def coordinator(request: httpx.Request) -> httpx.Response:
         nonlocal heartbeats
         if request.url.path == "/register":
-            return httpx.Response(200, json={"role": "primary", "term": 1})
+            return httpx.Response(200, json={"shard_id": "s0", "role": "primary", "term": 1})
         heartbeats += 1
         return httpx.Response(409, json={"error_code": hb_error["code"], "error_message": "x"})
 
@@ -1745,12 +1745,16 @@ async def test_r1_cluster_primary_has_no_authority_without_coordinator_lease(
             assert r.status_code == 409 and r.json()["error_code"] == "LEASE_EXPIRED"
             assert (await c.get("/doc/1")).status_code == 409  # no primary reads either
         # A valid grant confers authority; a registration WITHOUT a grant revokes it.
-        await _apply_registration(node, {"role": "primary", "lease": _GRANT}, time.monotonic())
+        await _apply_registration(
+            node, {"shard_id": "s0", "role": "primary", "lease": _GRANT}, time.monotonic()
+        )
         assert node.is_lease_valid()
-        await _apply_registration(node, {"role": "primary"}, time.monotonic())
+        await _apply_registration(node, {"shard_id": "s0", "role": "primary"}, time.monotonic())
         assert not node.is_lease_valid()
         await _apply_registration(
-            node, {"role": "primary", "lease": {"granted_at": 5.0, "expires_at": 1.0}}, 0.0
+            node,
+            {"shard_id": "s0", "role": "primary", "lease": {"granted_at": 5.0, "expires_at": 1.0}},
+            0.0,
         )
         assert not node.is_lease_valid()
 
@@ -2265,3 +2269,127 @@ def test_r18_wal_replay_streams_instead_of_loading_the_file(
     assert wal.next_seq() == 11
     monkeypatch.undo()
     assert [r["seq"] for r in WAL(path).replay()] == list(range(1, 11))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Section 7 — fourth review
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_v4_stale_router_read_after_migration_gets_the_new_owner(tmp_path: Path) -> None:
+    coord, app0, app1 = await _migration_cluster(tmp_path)
+    async with LifespanManager(app0), LifespanManager(app1):
+        t0, t1 = ASGITransport(app=app0), ASGITransport(app=app1)
+        async with AsyncClient(transport=t0, base_url="http://node0") as c0:
+            await _insert(c0, {"doc_id": 150, "v": "old"}, "w1")
+        old_map = coord.shard_map
+        rec = coord.migration_mgr.create_migration("shard0", "shard1", 100, 200, coord)
+        async with AsyncClient(mounts={"http://node0": t0, "http://node1": t1}) as client:
+            assert (
+                await coord.migration_mgr.execute_migration(
+                    rec.migration_id, coord, http_client=client
+                )
+            ).state == MigrationState.DONE
+        async with AsyncClient(transport=t1, base_url="http://node1") as c1:
+            r = await c1.put(
+                "/doc/150", json={"request_id": "w2", "document": {"doc_id": 150, "v": "new"}}
+            )
+            assert r.status_code == 200
+        # A router that still caches the pre-migration map (shared map file is current).
+        mgr = ShardMapManager(coord.map_mgr.path)
+        mgr.set_map(old_map)
+        router = build_router_app(
+            _settings(tmp_path / "r"), mgr, shard_transports={"node0": t0, "node1": t1}
+        )
+        async with LifespanManager(router):
+            async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+                r = await rc.get("/doc/150", headers={CLIENT_KEY_HEADER: CLIENT})
+        assert r.status_code == 200 and r.json()["document"]["v"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_v4_registration_response_is_validated_and_fully_applied(tmp_path: Path) -> None:
+    app = build_app(
+        _settings(tmp_path),
+        node_id="p",
+        shard_id="s0",
+        ranges=[ShardRangeConfig(start=0, end=100, ownership_epoch=2)],
+    )
+    async with LifespanManager(app):
+        node = app.state.node
+        with pytest.raises(ValueError, match="another node"):
+            await _apply_registration(
+                node, {"shard_id": "s9", "role": "primary", "lease": _GRANT}, 0.0
+            )
+        with pytest.raises(ValueError, match="lower the epoch"):
+            await _apply_registration(
+                node,
+                {
+                    "shard_id": "s0",
+                    "role": "primary",
+                    "lease": _GRANT,
+                    "ownership_epochs": {"0-100": 1},
+                },
+                time.monotonic(),
+            )
+        assert not node.is_lease_valid()
+        # Ownership changed while the node was away: adopt term + ranges, durably, then lease.
+        await _apply_registration(
+            node,
+            {
+                "node_id": "p",
+                "shard_id": "s0",
+                "role": "primary",
+                "term": 4,
+                "lease": _GRANT,
+                "ownership_epochs": {"0-50": 3, "70-100": 5},
+            },
+            time.monotonic(),
+        )
+        assert node.term == 4 and node.is_lease_valid()
+        assert [(r.start, r.end, r.ownership_epoch) for r in node.ranges] == [
+            (0, 50, 3),
+            (70, 100, 5),
+        ]
+        meta = json.loads((tmp_path / "s0" / "node_metadata.json").read_text())
+        assert meta["term"] == 4 and len(meta["ranges"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_v4_exhausted_promotion_reaches_an_explicit_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docstore.coordinator import coordinator as coord_mod
+
+    monkeypatch.setattr(coord_mod, "_MAX_PROMOTION_RETRIES", 2)
+    svc = _coord_with_follower(tmp_path)
+    svc._recovery_quarantine_until_monotonic = 0.0
+    svc._unconfirmed_promotions["shard0"] = ("f0:1", "p0:1")
+    svc._set_intent("shard0", {"new_primary": "f0:1", "old_primary": "p0:1", "target_term": 2})
+
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("candidate gone", request=request)
+
+    async with AsyncClient(transport=httpx.MockTransport(down)) as client:
+        for _ in range(2):
+            await svc._retry_unconfirmed_promotions(client)
+    assert "shard0" not in svc._unconfirmed_promotions
+    assert svc.failed_promotions["shard0"]["candidate"] == "f0:1"
+    assert json.loads(svc.intents_path.read_text()) == {}
+    assert "shard0" in svc.leases  # kept until it expires: no overlapping authority
+    assert "failed_promotions" in svc.get_cluster_status()
+
+
+def test_v4_shard_is_marked_initialized_before_its_first_write(tmp_path: Path) -> None:
+    svc = _coord_with_follower(tmp_path)
+    reg = svc.register_node(
+        NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1", fresh_state=True)
+    )
+    assert reg.lease is not None  # first-ever start: primary granted ...
+    assert "shard0" in json.loads(svc.initialized_path.read_text())  # ... and recorded at once
+    # Volume lost before any heartbeat reported data: still never primary while empty.
+    reg = _coord_with_follower(tmp_path).register_node(
+        NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1", fresh_state=True)
+    )
+    assert reg.role == NodeRole.FOLLOWER and reg.lease is None

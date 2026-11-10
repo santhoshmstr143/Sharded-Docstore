@@ -154,7 +154,7 @@ With zero failed operations across all benchmark runs ($\text{error\_rate} = 0.0
 
 ## 5. Verification Checklist & Gate Certification
 
-- [x] All 437 unit, integration, security, and fault tests passing (436 passed + 1 skipped without Docker; 437 passed with live cluster).
+- [x] All 441 unit, integration, security, and fault tests passing (440 passed + 1 skipped without Docker; 441 passed with live cluster).
 - [x] Static type analysis clean with `mypy --strict`.
 - [x] Zero high/medium security issues detected via `bandit` and `pip-audit`.
 - [x] End-to-end interactive demo (`make demo`) verified.

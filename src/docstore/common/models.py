@@ -348,6 +348,8 @@ class RegistrationResponse(BaseModel):
     role: NodeRole
     term: int = Field(ge=0)
     ranges: list[ShardRange]
+    # Authoritative ownership: "start-end" -> ownership_epoch for every range in `ranges`.
+    ownership_epochs: dict[str, int] = Field(default_factory=dict)
     lease: LeaseGrant | None = None
     map_version: int = Field(ge=0)
 

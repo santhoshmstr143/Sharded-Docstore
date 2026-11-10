@@ -842,35 +842,65 @@ def _parse_snapshot_docs(raw_docs: Any) -> dict[int, dict[str, Any]]:
 
 
 async def _apply_registration(state: NodeState, data: dict[str, Any], t_send: float) -> None:
-    """Act on the coordinator's registration decision (BUG 1).
+    """Apply the coordinator's registration decision as one fail-closed transition.
 
-    * Assigned FOLLOWER while acting as primary -> step down (persisted first).
-    * Assigned PRIMARY with a lease -> adopt the lease, counted from send time.
-    A node that recovered from disk registers as follower; the coordinator then
-    promotes the current follower instead, and this node rejoins via resync.
+    * The response must be addressed to this node and shard.
+    * The coordinator's term and authoritative ownership (ranges + epochs) are adopted;
+      an ownership epoch is never lowered.
+    * The resulting term / role / ranges are persisted FIRST; only then does the node act
+      on them, and the lease (primary authority) is switched on last. Any failure leaves
+      the node without a lease, and the caller retries registration.
     """
+    if data.get("shard_id") != state.shard_id or data.get("node_id") not in (
+        None,
+        state.node_id,
+    ):
+        raise ValueError("registration response is addressed to another node/shard")
     role = data.get("role")
-    if role == NodeRole.FOLLOWER.value and state.role == NodeRole.PRIMARY:
-        async with state.write_lock():
-            _persist_node_metadata(state, role=NodeRole.FOLLOWER)
-            state.role = NodeRole.FOLLOWER
-            state.lease_expires_at = 0.0
-        logger.warning(
-            "Node %s: coordinator registered it as FOLLOWER; stepped down", state.node_id
-        )
-    elif role == NodeRole.PRIMARY.value and state.role == NodeRole.PRIMARY:
-        # The lease in THIS response is the only authority: no (or an invalid) grant
-        # revokes whatever lease the node believed it had.
-        duration = lease_duration_from_grant(data.get("lease"), state.settings.LEASE_DURATION_S)
-        state.lease_expires_at = t_send + duration if duration > 0 else 0.0
-    if role == NodeRole.FOLLOWER.value:
-        coord_term = data.get("term")
-        if isinstance(coord_term, int) and not isinstance(coord_term, bool):
-            if coord_term > state.term:
-                # Adopt the cluster's term durably before acting on it.
-                async with state.write_lock():
-                    _persist_node_metadata(state, term=coord_term)
-                    state.term = coord_term
+    coord_term = data.get("term")
+    new_term = state.term
+    if isinstance(coord_term, int) and not isinstance(coord_term, bool) and coord_term > new_term:
+        new_term = coord_term
+
+    new_ranges = list(state.ranges)
+    epochs = data.get("ownership_epochs")
+    if isinstance(epochs, dict) and epochs:
+        local = {(r.start, r.end): r.ownership_epoch for r in state.ranges}
+        parsed: list[ShardRangeConfig] = []
+        for key, ep in epochs.items():
+            try:
+                a, b = (int(x) for x in str(key).split("-"))
+            except ValueError as exc:
+                raise ValueError(f"invalid range key {key!r} in registration") from exc
+            if not isinstance(ep, int) or isinstance(ep, bool) or ep < 0:
+                raise ValueError(f"invalid epoch for {key!r} in registration")
+            if local.get((a, b), 0) > ep:
+                raise ValueError(f"registration would lower the epoch of {key!r}")
+            parsed.append(ShardRangeConfig(start=a, end=b, ownership_epoch=ep))
+        new_ranges = sorted(parsed, key=lambda r: r.start)
+
+    demote = role == NodeRole.FOLLOWER.value and state.role == NodeRole.PRIMARY
+    new_role = NodeRole.FOLLOWER if demote else state.role
+    as_tuple = [(r.start, r.end, r.ownership_epoch) for r in new_ranges]
+    old_tuple = [(r.start, r.end, r.ownership_epoch) for r in state.ranges]
+
+    async with state.write_lock():
+        if new_term != state.term or new_role != state.role or as_tuple != old_tuple:
+            state.lease_expires_at = state.lease_expires_at if state.allow_standalone else 0.0
+            _persist_node_metadata(state, term=new_term, role=new_role, ranges=new_ranges)
+            state.term = new_term
+            state.ranges = new_ranges
+            state.role = new_role
+            if demote:
+                state.lease_expires_at = 0.0
+                logger.warning(
+                    "Node %s: coordinator registered it as FOLLOWER; stepped down", state.node_id
+                )
+        if role == NodeRole.PRIMARY.value and state.role == NodeRole.PRIMARY:
+            # The lease in THIS response is the only authority: no (or an invalid) grant
+            # revokes whatever lease the node believed it had. Activated last.
+            duration = lease_duration_from_grant(data.get("lease"), state.settings.LEASE_DURATION_S)
+            state.lease_expires_at = t_send + duration if duration > 0 else 0.0
 
 
 # ── Replication Helper ────────────────────────────────────────────────────────

@@ -183,6 +183,8 @@ class CoordinatorService:
         self._promotion_attempts: dict[str, int] = {}
         # shard_id -> new follower address the primary has not been told about yet.
         self._follower_updates: dict[str, str] = {}
+        # shard_id -> details of the last promotion abandoned after retry exhaustion.
+        self.failed_promotions: dict[str, dict[str, Any]] = {}
         self._started_at_monotonic: float = time.monotonic()
         self._recovery_quarantine_until_monotonic: float = (
             self._started_at_monotonic + settings.LEASE_DURATION_S + settings.SAFETY_MARGIN_S
@@ -846,9 +848,22 @@ class CoordinatorService:
                     shard_id,
                     attempts,
                 )
+                # Explicit terminal state for this promotion:
+                #  * the durable intent is cleared (nothing left to finish after a restart);
+                #  * the candidate's lease record is KEPT until it expires: if the candidate
+                #    did get promoted (lost response), any new primary must still wait for
+                #    that lease + M before it may write;
+                #  * the shard becomes eligible for headless detection immediately, which
+                #    checks the other replica's status and sequence before promoting it.
                 del self._unconfirmed_promotions[shard_id]
                 self._promotion_attempts.pop(shard_id, None)
                 self._set_intent(shard_id, None)
+                self.failed_promotions[shard_id] = {
+                    "candidate": addr,
+                    "attempts": attempts,
+                    "failed_at": time.time(),
+                }
+                self._last_headless_attempt.pop(shard_id, None)
 
     async def check_and_trigger_failover(
         self,
@@ -1075,6 +1090,7 @@ class CoordinatorService:
             raise InvalidQuery(f"Unknown shard_id {shard_id!r}")
 
         ranges = [e.range for e in entries]
+        epochs = {f"{e.range.start}-{e.range.end}": e.ownership_epoch for e in entries}
         term = self.shard_terms.get(shard_id, 1)
 
         # Determine role
@@ -1204,6 +1220,7 @@ class CoordinatorService:
                 role=role,
                 term=term,
                 ranges=ranges,
+                ownership_epochs=epochs,
                 lease=None,
                 map_version=current_map.map_version,
             )
@@ -1229,6 +1246,7 @@ class CoordinatorService:
                         role=role,
                         term=term,
                         ranges=ranges,
+                        ownership_epochs=epochs,
                         lease=None,
                         map_version=current_map.map_version,
                     )
@@ -1247,10 +1265,15 @@ class CoordinatorService:
                         role=role,
                         term=term,
                         ranges=ranges,
+                        ownership_epochs=epochs,
                         lease=None,
                         map_version=current_map.map_version,
                     )
 
+            # The shard is about to have a writable primary: record durably, BEFORE any
+            # write can happen, that it may hold data. An empty node can then never take
+            # over as primary later (no window between a first write and a heartbeat).
+            self._mark_initialized(shard_id)
             # Grant fresh lease
             expires_wall = now_wall + self.settings.LEASE_DURATION_S
             expires_mono = now_mono + self.settings.LEASE_DURATION_S
@@ -1285,6 +1308,7 @@ class CoordinatorService:
             role=role,
             term=term,
             ranges=ranges,
+            ownership_epochs=epochs,
             lease=lease_grant,
             map_version=current_map.map_version,
         )
@@ -1501,6 +1525,7 @@ class CoordinatorService:
             "map_version": self.map_mgr.shard_map.map_version,
             "shards": shards_info,
             "failover_metrics": calculated_metrics,
+            "failed_promotions": dict(self.failed_promotions),
             "nodes": [
                 {
                     "node_id": n.node_id,

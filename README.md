@@ -524,8 +524,13 @@ the same methods is also available.
 ## Consistency, failover and migration in brief
 
 - **Commit point:** a write is committed once the follower has `fsync`ed it. Primary reads
-  (served only while the primary holds a valid lease) see every committed write; follower reads
-  may lag and report `replication_lag`.
+  (served only while the primary holds a valid lease) see every committed write — also across
+  a migration, because the old owner gives up the range before the new owner accepts any write
+  (see `docs/consistency.md` §4.1.1). Follower reads may lag and report `replication_lag`.
+- **Scope of the guarantees:** they hold for the failure model the project targets — one node
+  failing at a time, a single (non-replicated) coordinator, bounded clock drift and process
+  pauses shorter than the lease safety margin — and are exercised by the fault-injection tests.
+  They are not formally verified, and losing both replicas of a shard loses its data.
 - **Fencing:** every primary change increments the shard's **term**; followers reject writes
   from an older term, and a primary stops writing when its lease runs out. A node holds a lease
   **only** when the coordinator grants one — it starts without one and registers at once, so
@@ -568,7 +573,7 @@ make check            # lint-check + typecheck + security + audit + test-fast
 
 Or run pytest directly, e.g. `.venv/bin/pytest tests/integration/test_bugs.py -v`.
 
-The suite has **437 tests**: 436 pass and 1 Docker smoke test
+The suite has **441 tests**: 440 pass and 1 Docker smoke test
 (`tests/integration/test_smoke_docker.py`) is skipped unless a live cluster is running on
 `127.0.0.1:8000`. `tests/integration/test_bugs.py` holds the regression tests for the bugs fixed
 during the code reviews. `tests/conftest.py` contains a small, documented test-only adapter that
