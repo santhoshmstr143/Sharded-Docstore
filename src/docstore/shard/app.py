@@ -202,11 +202,13 @@ class PromoteRequest(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    shard_id: str | None = None
-    term: StrictInt | None = None
+    # Every field that confers authority is mandatory: a promotion must name the shard,
+    # carry the coordinator's term, the authoritative ownership, and a lease grant.
+    shard_id: str = Field(min_length=1)
+    term: StrictInt = Field(ge=1)
     ownership_epochs: dict[str, StrictInt] | None = None
     ranges: list[ShardRangeConfig] | None = None
-    lease: dict[str, Any] | None = None
+    lease: dict[str, Any]
     follower_url: str | None = None
 
 
@@ -246,6 +248,8 @@ class NodeState:
         self.pending_unresolved_writes: dict[str, dict[str, Any]] = {}
         self.allow_standalone: bool = False
         self.advertise_addr: str = ""
+        # True when recovery found no metadata, snapshot or WAL at all.
+        self.fresh_start: bool = False
         # (start, end) -> (oplog cursor seq, last-touched monotonic): WAL entries after the
         # cursor must survive compaction until the migration's catch-up has read them.
         self.migration_holds: dict[tuple[int, int], tuple[int, float]] = {}
@@ -507,7 +511,11 @@ async def _recover(state: NodeState) -> None:
         snap_epochs = snap.get("ownership_epochs")
 
     # 3. Reconcile all range sources: startup config, persisted metadata, and snapshot
-    if meta_has_ranges and not meta_ranges:
+    explicitly_empty = (meta_has_ranges and not meta_ranges) or (
+        # Metadata lost, but the snapshot explicitly records that the node owned nothing.
+        not meta_has_ranges and snap is not None and snap.get("ownership_epochs") == {}
+    )
+    if explicitly_empty:
         # Persisted metadata says this node *explicitly* owns nothing (every range was
         # migrated away). That is not "missing configuration": never fall back to the
         # environment default range, which would reclaim another shard's keys.
@@ -552,6 +560,14 @@ async def _recover(state: NodeState) -> None:
         state.committed_seq = max(state.committed_seq, wal.last_seq)
     # Without metadata or a snapshot nothing is known to be committed: any WAL entries
     # stay unresolved until reconciled with a follower.
+    if state.committed_seq > wal.last_seq:
+        # Metadata claims committed operations that neither the snapshot nor the WAL can
+        # reproduce (lost / truncated files). Serving, or being promoted, with a hole in
+        # the committed prefix would silently lose acknowledged writes: fail closed.
+        raise RuntimeError(
+            f"Recovery: committed_seq={state.committed_seq} exceeds recoverable history "
+            f"(snapshot + WAL end at seq {wal.last_seq}); refusing to start."
+        )
     for entry in wal_entries:
         entry_term = entry.get("term", 1)
         if entry_term > state.term:
@@ -565,6 +581,7 @@ async def _recover(state: NodeState) -> None:
                     rid,
                     DedupEntry(
                         seq=entry["seq"],
+                        doc_id=entry.get("doc_id"),
                         outcome=WriteOutcome.COMMITTED,
                         result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
                         term=entry_term,
@@ -579,6 +596,7 @@ async def _recover(state: NodeState) -> None:
                     rid,
                     DedupEntry(
                         seq=entry["seq"],
+                        doc_id=entry.get("doc_id"),
                         outcome=WriteOutcome.OUTCOME_UNKNOWN,
                         result={"outcome": WriteOutcome.OUTCOME_UNKNOWN, "seq": entry["seq"]},
                         term=entry_term,
@@ -602,7 +620,10 @@ async def _recover(state: NodeState) -> None:
             except Exception as exc:
                 logger.debug("Startup reconciliation for %s deferred: %s", p_rid, exc)
 
-    if is_disk_recovery or snap is not None or wal_entries or wal.last_seq > 0:
+    state.fresh_start = not (
+        is_disk_recovery or snap is not None or wal_entries or wal.last_seq > 0
+    )
+    if not state.fresh_start:
         if not state.allow_standalone:
             # A node recovering from disk in cluster mode must NOT restore primary authority.
             # It must start in a fenced/recovering, non-authoritative follower state.
@@ -656,6 +677,7 @@ def _rebuild_engine_from_disk(state: NodeState) -> None:
                 rid,
                 DedupEntry(
                     seq=entry["seq"],
+                    doc_id=entry.get("doc_id"),
                     outcome=WriteOutcome.COMMITTED,
                     result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
                     term=entry.get("term", state.term),
@@ -798,7 +820,7 @@ def lease_duration_from_grant(lease: dict[str, Any] | None, local_max_s: float) 
         except (TypeError, ValueError):
             duration = 0.0
     if duration <= 0:
-        return local_max_s
+        return 0.0  # missing / malformed / expired grant: no authority (fail closed)
     return min(duration, local_max_s)
 
 
@@ -837,11 +859,18 @@ async def _apply_registration(state: NodeState, data: dict[str, Any], t_send: fl
             "Node %s: coordinator registered it as FOLLOWER; stepped down", state.node_id
         )
     elif role == NodeRole.PRIMARY.value and state.role == NodeRole.PRIMARY:
-        lease = data.get("lease")
-        if isinstance(lease, dict) and "granted_at" in lease and "expires_at" in lease:
-            state.lease_expires_at = t_send + lease_duration_from_grant(
-                lease, state.settings.LEASE_DURATION_S
-            )
+        # The lease in THIS response is the only authority: no (or an invalid) grant
+        # revokes whatever lease the node believed it had.
+        duration = lease_duration_from_grant(data.get("lease"), state.settings.LEASE_DURATION_S)
+        state.lease_expires_at = t_send + duration if duration > 0 else 0.0
+    if role == NodeRole.FOLLOWER.value:
+        coord_term = data.get("term")
+        if isinstance(coord_term, int) and not isinstance(coord_term, bool):
+            if coord_term > state.term:
+                # Adopt the cluster's term durably before acting on it.
+                async with state.write_lock():
+                    _persist_node_metadata(state, term=coord_term)
+                    state.term = coord_term
 
 
 # ── Replication Helper ────────────────────────────────────────────────────────
@@ -998,6 +1027,7 @@ async def _reconcile_pending_write(state: NodeState, request_id: str) -> WriteOu
             # 1. Complete operation identity match: (term, seq, request_id, entry_id)
             identity_match = (
                 has_op
+                and int(data.get("committed_seq") or 0) >= seq
                 and op_term == term
                 and op_request_id == request_id
                 and None not in (term, seq, request_id, op_term, op_request_id)
@@ -1167,6 +1197,7 @@ def _mark_pending(
             result={"outcome": WriteOutcome.OUTCOME_UNKNOWN, "seq": seq},
             term=state.term,
             fingerprint=fingerprint,
+            doc_id=doc_id,
         ),
     )
 
@@ -1207,6 +1238,16 @@ async def _append_replicated(
     """
     if state.wal is None:  # explicit: asserts are stripped under -O
         raise RuntimeError("state.wal is unavailable")
+    if not state.follower_url and not state.allow_standalone:
+        # Checked BEFORE the WAL append: a cluster-mode primary must never commit an
+        # internal (migration / purge) operation locally without a replica.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "REPLICATION_UNAVAILABLE",
+                "error_message": f"No follower configured; cannot replicate {what}.",
+            },
+        )
     seq = state.wal.next_seq()
     entry = _wal_append(
         state,
@@ -1233,6 +1274,96 @@ async def _append_replicated(
     state.committed_seq = max(state.committed_seq, seq)
     _store_committed(state, request_id, seq)
     return seq
+
+
+def _commit_wal_through(state: NodeState, seq: int) -> None:
+    """Follower: durably commit + apply every local WAL entry up to *seq* (BUG 3).
+
+    On a follower, a WAL entry it has fsynced IS committed (that is the commit point).
+    Before acknowledging such an entry (a duplicate replication, or a reconciliation
+    check), the follower must also have applied it and recorded committed_seq durably:
+    otherwise a crash between WAL append and apply would leave it acknowledged yet
+    "uncommitted" in its own recovery metadata. Synchronous (no awaits): atomic in the
+    event loop with respect to other handlers.
+    """
+    if state.wal is None or seq <= state.engine.last_applied_seq:
+        if seq > state.committed_seq and seq <= state.engine.last_applied_seq:
+            state.committed_seq = seq
+            _persist_node_metadata(state)
+        return
+    for entry in state.wal.replay(after_seq=state.engine.last_applied_seq):
+        if entry["seq"] > seq:
+            break
+        state.engine.apply(entry)
+        rid = entry.get("request_id")
+        if rid:
+            state.pending_unresolved_writes.pop(rid, None)
+            state.engine.dedup_store(
+                rid,
+                DedupEntry(
+                    seq=entry["seq"],
+                    doc_id=entry.get("doc_id"),
+                    outcome=WriteOutcome.COMMITTED,
+                    result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
+                    term=entry.get("term", state.term),
+                ),
+            )
+    if state.engine.last_applied_seq < seq:
+        raise RuntimeError(f"cannot commit through seq {seq}: WAL ends before it")
+    state.committed_seq = max(state.committed_seq, seq)
+    _persist_node_metadata(state)
+
+
+_INTERNAL_RID_PREFIXES = ("mig-", "catchup-", "cleanup-", "abort-")
+
+
+def _range_dedup(state: NodeState, lo: int, hi: int) -> dict[str, Any]:
+    """Committed client dedup records for documents with ``lo <= doc_id < hi``.
+
+    Migration carries these with the data so a client retrying a write after cutover
+    gets the original result from the destination instead of a duplicate execution.
+    """
+    out: dict[str, Any] = {}
+    exported = state.engine.dedup_export()
+    for rid, v in exported.items():
+        doc_id = v.get("doc_id")
+        if (
+            isinstance(doc_id, int)
+            and lo <= doc_id < hi
+            and v.get("outcome") == WriteOutcome.COMMITTED
+            and not rid.startswith(_INTERNAL_RID_PREFIXES)
+        ):
+            out[rid] = v
+    return out
+
+
+def _import_dedup(state: NodeState, records: Any) -> int:
+    """Destination side of :func:`_range_dedup`; never overrides a local record."""
+    if records is None:
+        return 0
+    if not isinstance(records, dict):
+        raise _bad_body("'dedup' must be an object")
+    imported = 0
+    for rid, v in records.items():
+        if not isinstance(rid, str) or not isinstance(v, dict):
+            raise _bad_body("invalid dedup record")
+        if state.engine.dedup_check(rid) is not None:
+            continue
+        try:
+            entry = DedupEntry(
+                seq=int(v["seq"]),
+                outcome=WriteOutcome.COMMITTED,
+                result=dict(v.get("result") or {}),
+                term=int(v.get("term", 1)),
+                created_at=float(v.get("created_at", time.time())),
+                fingerprint=v.get("fingerprint"),
+                doc_id=v.get("doc_id"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _bad_body("invalid dedup record") from exc
+        state.engine.dedup_store(rid, entry)
+        imported += 1
+    return imported
 
 
 def _store_committed(state: NodeState, request_id: str, seq: int) -> None:
@@ -1310,10 +1441,19 @@ async def _execute_write(
             )
 
         # 3b. Fencing tokens: reject writes routed with stale ownership / term info.
-        if ownership_epoch is not None and ownership_epoch < state.epoch_for(doc_id):
+        # Exact match: an older epoch means the router's map is stale; a NEWER one means
+        # this node's ownership metadata is behind the authoritative map. Either way the
+        # write must not be accepted here. Cluster-mode writes must carry the token.
+        local_epoch = state.epoch_for(doc_id)
+        if ownership_epoch is None:
+            if not state.allow_standalone:
+                raise StaleEpoch(
+                    f"Write for doc_id={doc_id} carries no ownership_epoch (required)."
+                )
+        elif ownership_epoch != local_epoch:
             raise StaleEpoch(
-                f"Write carries ownership_epoch {ownership_epoch} < current "
-                f"{state.epoch_for(doc_id)} for doc_id={doc_id}."
+                f"Write carries ownership_epoch {ownership_epoch}; this node holds epoch "
+                f"{local_epoch} for doc_id={doc_id}."
             )
         if term is not None and term != state.term:
             raise StaleTerm(f"Write carries term {term}; primary is at term {state.term}.")
@@ -1474,6 +1614,7 @@ async def _execute_write(
                 result=result,
                 term=state.term,
                 fingerprint=fp,
+                doc_id=doc_id,
             ),
         )
 
@@ -1785,6 +1926,7 @@ async def resync_with_primary(
                         rid,
                         DedupEntry(
                             seq=entry["seq"],
+                            doc_id=entry.get("doc_id"),
                             outcome=WriteOutcome.COMMITTED,
                             result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
                         ),
@@ -1873,7 +2015,11 @@ def build_app(
         state.role = role
         state.term = term
         state.follower_url = follower_url
-        state.follower_state = follower_state
+        # Without a configured follower a cluster-mode primary has no replica at all:
+        # report DOWN (never SYNCED), so the coordinator sees the shard as degraded.
+        state.follower_state = (
+            follower_state if (follower_url or state.allow_standalone) else ReplicaState.DOWN
+        )
         state.advertise_addr = (
             advertise_addr
             or os.environ.get("NODE_ADDRESS")
@@ -1886,8 +2032,9 @@ def build_app(
         if lease_expires_at is not None:
             state.lease_expires_at = lease_expires_at
         elif role == NodeRole.PRIMARY:
-            # Standalone default to inf so unit tests not testing leases pass
-            state.lease_expires_at = float("inf")
+            # Only an explicitly standalone primary may hold an unbounded local lease. In
+            # cluster mode authority comes exclusively from a coordinator-issued lease.
+            state.lease_expires_at = float("inf") if state.allow_standalone else 0.0
         else:
             state.lease_expires_at = 0.0
 
@@ -1927,9 +2074,16 @@ def build_app(
             if coordinator_transport:
                 client_kwargs["transport"] = coordinator_transport
             registered = False
+            first = True
             async with httpx.AsyncClient(**client_kwargs) as hb_client:
                 while True:
-                    await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S)
+                    # Register immediately at startup (a cluster node has no lease until
+                    # then); afterwards heartbeat every H.
+                    if not first:
+                        await asyncio.sleep(settings.HEARTBEAT_INTERVAL_S)
+                    first = False
+                    if state.ready and state.wal is not None and state.wal.failed:
+                        _fail_stop(state, "WAL unusable after an I/O failure")
                     # A node that failed recovery must NOT look healthy to the coordinator.
                     if not state.ready:
                         continue
@@ -1942,6 +2096,10 @@ def build_app(
                                 "shard_id": state.shard_id,
                                 "address": state.advertise_addr,
                                 "requested_role": state.role.value,
+                                # Started with no local data at all: the coordinator must
+                                # not hand primary authority to an empty node for a shard
+                                # that already holds data elsewhere.
+                                "fresh_state": state.fresh_start,
                             }
                             rb = json.dumps(reg_body, separators=(",", ":")).encode("utf-8")
                             rsig = sign_request(settings.CLUSTER_SECRET, "POST", reg_url, rb)
@@ -1954,10 +2112,15 @@ def build_app(
                                     CLUSTER_SIG_HEADER: rsig,
                                 },
                             )
-                            registered = rresp.status_code == 200
-                            if registered:
+                            if rresp.status_code == 200:
+                                # Registered only once the response is durably applied.
                                 await _apply_registration(state, rresp.json(), t_reg)
+                                registered = True
                         except Exception as exc:
+                            registered = False
+                            state.lease_expires_at = (
+                                state.lease_expires_at if state.allow_standalone else 0.0
+                            )
                             node_logger.debug("Registration failed (will retry): %s", exc)
 
                     if state.role != NodeRole.PRIMARY:
@@ -2459,6 +2622,7 @@ def build_app(
                 body.request_id,
                 DedupEntry(
                     seq=body.seq,
+                    doc_id=body.doc_id,
                     outcome=WriteOutcome.COMMITTED,
                     result={"outcome": WriteOutcome.COMMITTED, "seq": body.seq},
                     term=body.term,
@@ -2485,6 +2649,8 @@ def build_app(
             if stored is not None and compute_entry_identity(stored) == compute_entry_identity(
                 incoming
             ):
+                # Acknowledge only once the entry is applied AND durably committed here.
+                _commit_wal_through(state, body.seq)
                 return ReplicationResponse(
                     status="ok", seq=body.seq, last_seq=state.wal.last_seq if state.wal else 0
                 )
@@ -2592,6 +2758,10 @@ def build_app(
                 entry_found = True
                 op_term = dedup_entry.term
                 op_request_id = request_id
+
+        if has_op and state.role == NodeRole.FOLLOWER:
+            # "I have it" must mean "it is applied and durably committed here".
+            _commit_wal_through(state, seq)
 
         return {
             "status": "ok",
@@ -2733,6 +2903,29 @@ def build_app(
                 )
         return {"status": "ok", "term": state.term}
 
+    @app.post("/internal/follower", dependencies=[Depends(cluster_auth)])
+    async def set_follower(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Coordinator -> primary: replicate to this (new) follower from now on.
+
+        The replica starts DOWN: writes are rejected until the primary's recovery loop has
+        resynced it (divergence / snapshot + catch-up) and the rejoin marked it SYNCED.
+        """
+        state = get_node(request)
+        _require_same_shard(state, body.get("shard_id"))
+        url = body.get("follower_url")
+        if not isinstance(url, str) or not url or len(url) > 255:
+            raise _bad_body("'follower_url' must be a non-empty string")
+        async with state.write_lock():
+            if state.role != NodeRole.PRIMARY:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error_code": "NOT_PRIMARY", "error_message": "Not the primary."},
+                )
+            if state.follower_url != url:
+                state.follower_url = url
+                state.follower_state = ReplicaState.DOWN
+        return {"status": "ok", "follower_url": state.follower_url}
+
     @app.post("/internal/resync", dependencies=[Depends(cluster_auth)])
     async def resync(body: dict[str, Any], request: Request) -> dict[str, Any]:
         """Follower: reconcile with the given primary and report back (rejoin/complete)."""
@@ -2773,8 +2966,8 @@ def build_app(
 
         async with state.write_lock():
             # 1. Validate the request completely before touching any state.
-            new_term = body.term if body.term is not None else state.term + 1
-            if new_term < 1 or new_term < state.term:
+            new_term = body.term
+            if new_term < state.term:
                 raise StaleTerm(
                     f"Promotion term {new_term!r} is behind node term {state.term}."
                 ).to_http_exception()
@@ -2815,10 +3008,12 @@ def build_app(
                         )
                     candidate.append(ShardRangeConfig(start=a, end=b, ownership_epoch=ep))
             else:
-                candidate = [
-                    ShardRangeConfig(start=a, end=b, ownership_epoch=old + 1)
-                    for (a, b), old in sorted(current.items())
-                ]
+                raise _reject(
+                    "INVALID_PROMOTION", "Promotion must carry 'ranges' or 'ownership_epochs'."
+                )
+            lease_s = lease_duration_from_grant(body.lease, float(settings.LEASE_DURATION_S))
+            if lease_s <= 0:
+                raise _reject("INVALID_LEASE", "Promotion carries no valid lease grant.")
 
             # Idempotent retry of an already-applied promotion: refresh lease only.
             if state.role == NodeRole.PRIMARY and new_term == state.term:
@@ -2875,6 +3070,7 @@ def build_app(
                                 rid,
                                 DedupEntry(
                                     seq=entry["seq"],
+                                    doc_id=entry.get("doc_id"),
                                     outcome=WriteOutcome.COMMITTED,
                                     result={"outcome": WriteOutcome.COMMITTED, "seq": entry["seq"]},
                                     term=entry.get("term", state.term),
@@ -3192,6 +3388,7 @@ def build_app(
                     "documents": docs,
                     "next_after_doc_id": docs[-1]["doc_id"] if docs else None,
                     "done": True,
+                    "dedup": _range_dedup(state, start, end),
                 }
             # Cursor-paginated copy, bounded by count and serialized bytes.
             after_doc_id = (
@@ -3218,12 +3415,18 @@ def build_app(
                 page.append(d)
                 size += d_size
             done = len(page) == len(fetched) and len(fetched) < max(1, int(limit))
+            # Dedup records for doc ids in this page's interval (the last page covers up
+            # to the range end), so every record in the range travels exactly once —
+            # including those of documents that no longer exist.
+            lo = start if after_doc_id is None else after_doc_id + 1
+            hi = end if done or not page else page[-1]["doc_id"] + 1
             return {
                 "status": "ok",
                 "snapshot_seq": s_seq,
                 "documents": page,
                 "next_after_doc_id": page[-1]["doc_id"] if page else after_doc_id,
                 "done": done,
+                "dedup": _range_dedup(state, lo, hi),
             }
 
     @app.post("/internal/migration/oplog", dependencies=[Depends(cluster_auth)])
@@ -3282,6 +3485,7 @@ def build_app(
             raise RuntimeError("state.wal is unavailable")
         async with state.write_lock():
             await _require_no_pending_writes(state, "apply migration batch")
+            _import_dedup(state, body.get("dedup"))
             try:
                 for doc in docs:
                     doc_id = doc["doc_id"]
@@ -3335,7 +3539,29 @@ def build_app(
                         skipped += 1  # this source op was already replayed
                         continue
 
-                    await _append_replicated(state, op, doc_id, req_id, payload, what="catchup")
+                    dest_seq = await _append_replicated(
+                        state, op, doc_id, req_id, payload, what="catchup"
+                    )
+                    # Keep the client's own idempotency key for this operation, so a retry
+                    # after cutover returns the original outcome instead of re-executing.
+                    orig = entry.get("request_id")
+                    if (
+                        isinstance(orig, str)
+                        and orig
+                        and not orig.startswith(_INTERNAL_RID_PREFIXES)
+                        and state.engine.dedup_check(orig) is None
+                    ):
+                        state.engine.dedup_store(
+                            orig,
+                            DedupEntry(
+                                seq=dest_seq,
+                                outcome=WriteOutcome.COMMITTED,
+                                result={"outcome": WriteOutcome.COMMITTED, "seq": dest_seq},
+                                term=state.term,
+                                fingerprint=_write_fingerprint(op, doc_id, payload),
+                                doc_id=doc_id,
+                            ),
+                        )
             finally:
                 _persist_node_metadata(state)
             return {
@@ -3429,7 +3655,9 @@ def build_app(
 
     async def _relay_to_follower(state: NodeState, path: str, body: dict[str, Any]) -> bool:
         if not state.follower_url:
-            return True
+            # Only an explicitly standalone node may skip the replica; in cluster mode a
+            # missing follower is a failure, never a silent success.
+            return state.allow_standalone
         client = state.http_client or httpx.AsyncClient(
             timeout=state.settings.REPLICATION_TIMEOUT_S
         )
@@ -3450,6 +3678,32 @@ def build_app(
         finally:
             if state.http_client is None:
                 await client.aclose()
+
+    @app.post("/internal/migration/release", dependencies=[Depends(cluster_auth)])
+    async def migration_release(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Source side of cutover: durably stop owning the range (here and on the follower)
+        BEFORE the destination starts accepting writes for it. From then on a router with
+        a stale map gets OUT_OF_RANGE here and refreshes, instead of reading the old copy.
+        Documents are purged later by /cleanup."""
+        state = get_node(request)
+        start, end = _body_range(body)
+        async with state.write_lock():
+            candidate = _subtract_range(state.ranges, start, end)
+            if [(r.start, r.end) for r in candidate] != [(r.start, r.end) for r in state.ranges]:
+                _persist_node_metadata(state, ranges=candidate)
+                state.ranges = candidate
+            relayed = await _relay_to_follower(
+                state, "/internal/migration/ranges/remove", {"start": start, "end": end}
+            )
+            if not relayed:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error_code": "REPLICATION_UNAVAILABLE",
+                        "error_message": "Follower did not ack range release; retry.",
+                    },
+                )
+            return {"status": "ok", "ranges": [r.model_dump() for r in state.ranges]}
 
     @app.post("/internal/migration/cleanup", dependencies=[Depends(cluster_auth)])
     async def migration_cleanup(body: dict[str, Any], request: Request) -> dict[str, Any]:

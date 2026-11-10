@@ -70,6 +70,10 @@ def build_coordinator_app(
                     await svc.check_and_trigger_failover()
                 except Exception as exc:
                     logger.warning("Health monitor failover check error: %s", exc)
+                try:
+                    await svc.push_follower_updates()
+                except Exception as exc:
+                    logger.warning("Follower membership update error: %s", exc)
 
         # Separate loop: migration RPCs (10 s timeouts) must never delay failure detection.
         async def _migration_monitor() -> None:

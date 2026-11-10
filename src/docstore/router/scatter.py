@@ -72,21 +72,22 @@ def resolve_target_shards(
     if constraint.kind == "in":
         if constraint.doc_ids is None:  # explicit: asserts are stripped under -O
             raise RuntimeError("constraint.doc_ids is unavailable")
-        grouped: dict[str, list[int]] = {}
-        entry_map: dict[str, ShardMapEntry] = {}
-
+        # Keep EVERY map entry the ids fall into: a shard may own several disjoint
+        # ranges, and keeping one entry per shard would restrict its query to that one
+        # range and silently drop matches in the others. group_targets_by_shard() later
+        # merges a shard's entries into one request covering all of its hit ranges.
+        hit: dict[tuple[str, int], ShardMapEntry] = {}
         for did in constraint.doc_ids:
             try:
                 entry = map_mgr.get_shard_for_doc_id(did)
-                grouped.setdefault(entry.shard_id, []).append(did)
-                entry_map[entry.shard_id] = entry
             except OutOfRange:
                 continue
+            hit[(entry.shard_id, entry.range.start)] = entry
 
         # Send the client's filter unchanged. Rewriting doc_id.$in per shard used to
         # clobber every other doc_id constraint in an $and (wrong results); the shard
         # already restricts evaluation to its own ranges, so no rewrite is needed.
-        return [(entry_map[shard_id], filter_dict) for shard_id in grouped]
+        return [(entry, filter_dict) for entry in hit.values()]
 
     if constraint.kind == "range":
         if (

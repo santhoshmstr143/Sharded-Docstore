@@ -29,7 +29,7 @@ import httpx
 
 from docstore.common.auth import CLUSTER_SIG_HEADER, sign_request
 from docstore.common.config import Settings
-from docstore.common.errors import FailoverInProgress, InvalidQuery, StaleTerm
+from docstore.common.errors import FailoverInProgress, InvalidQuery, StaleTerm, TopologyBusy
 from docstore.common.logging import get_logger
 from docstore.common.models import (
     Heartbeat,
@@ -62,6 +62,10 @@ def _fsync_dir(dir_path: Path) -> None:
     _wal_fsync_dir(dir_path)
 
 
+class TermsDurabilityError(OSError):
+    """The terms file was replaced but its directory fsync failed."""
+
+
 class _DurableShardTerms(dict[str, int]):
     """In-memory term dictionary with synchronous, durable atomic persistence on disk."""
 
@@ -81,6 +85,8 @@ class _DurableShardTerms(dict[str, int]):
         if self._on_persist is not None:
             try:
                 self._on_persist()
+            except TermsDurabilityError:
+                raise  # file already replaced: keep the new value in memory
             except Exception:
                 if old_val is not None:
                     super().__setitem__(key, old_val)
@@ -98,6 +104,8 @@ class _DurableShardTerms(dict[str, int]):
         if self._on_persist is not None:
             try:
                 self._on_persist()
+            except TermsDurabilityError:
+                raise  # file already replaced: keep the new values in memory
             except Exception:
                 self.clear()
                 super().update(old_state)
@@ -173,6 +181,8 @@ class CoordinatorService:
         self._last_primary_seq: dict[str, int] = {}
         # Consecutive failed retries of an unconfirmed promotion (bounded, see below).
         self._promotion_attempts: dict[str, int] = {}
+        # shard_id -> new follower address the primary has not been told about yet.
+        self._follower_updates: dict[str, str] = {}
         self._started_at_monotonic: float = time.monotonic()
         self._recovery_quarantine_until_monotonic: float = (
             self._started_at_monotonic + settings.LEASE_DURATION_S + settings.SAFETY_MARGIN_S
@@ -203,6 +213,42 @@ class CoordinatorService:
         self.intents_path = target_path.parent / "failover_intents.json"
         self._failover_intents: dict[str, dict[str, Any]] = self._load_intents()
         self._recover_failover_intents()
+
+        # Shards that are known to hold data (a primary reported applied writes, or the
+        # shard has been through a failover). An empty node may never become primary
+        # of such a shard: that would silently serve an empty database.
+        self.initialized_path = target_path.parent / "initialized_shards.json"
+        self._initialized_shards: set[str] = self._load_initialized()
+        for sid, t in self.shard_terms.items():
+            if t > 1:
+                self._initialized_shards.add(sid)
+
+    def _load_initialized(self) -> set[str]:
+        if not self.initialized_path.exists():
+            return set()
+        try:
+            data = json.loads(self.initialized_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Corrupt {self.initialized_path}: {exc}") from exc
+        if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+            raise ValueError(f"Corrupt {self.initialized_path}: expected a list of shard ids")
+        return set(data)
+
+    def _mark_initialized(self, shard_id: str) -> None:
+        if shard_id in self._initialized_shards:
+            return
+        self._initialized_shards.add(shard_id)
+        tmp = self.initialized_path.parent / f".tmp.{uuid.uuid4().hex}.initialized.json"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._initialized_shards), f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.initialized_path)
+            _fsync_dir(self.initialized_path.parent)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     # ── Durable failover intents (BUG 2) ──────────────────────────────────────
 
@@ -290,6 +336,50 @@ class CoordinatorService:
             self._topology_locks[shard_id] = lock
         return lock
 
+    def _mark_promoted(self, shard_id: str, new_primary: str, old_primary: str | None) -> None:
+        """Record roles only AFTER the promotion is confirmed (never a phantom primary)."""
+        now_mono = time.monotonic()
+        term = self.shard_terms.get(shard_id, 1)
+        for n in self.nodes.values():
+            if n.shard_id != shard_id:
+                continue
+            if normalize_url(n.address) == normalize_url(new_primary):
+                n.role = NodeRole.PRIMARY
+                n.term = term
+                n.last_seen_monotonic = now_mono
+            elif old_primary and normalize_url(n.address) == normalize_url(old_primary):
+                n.role = NodeRole.FOLLOWER
+
+    async def push_follower_updates(self, http_client: httpx.AsyncClient | None = None) -> None:
+        """Tell each primary about a newly registered follower (BUG 12).
+
+        The primary switches replication to the new address with the replica marked DOWN,
+        so its recovery loop resyncs the follower (divergence / snapshot + catch-up) and
+        only a successful rejoin marks it SYNCED again.
+        """
+        for shard_id, addr in list(self._follower_updates.items()):
+            entry = next((e for e in self.shard_map.entries if e.shard_id == shard_id), None)
+            if entry is None or normalize_url(entry.follower) != normalize_url(addr):
+                self._follower_updates.pop(shard_id, None)  # superseded
+                continue
+            clean = entry.primary.removeprefix("http://").removeprefix("https://")
+            url = f"http://{clean}/internal/follower"
+            raw = json.dumps({"shard_id": shard_id, "follower_url": addr}).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json",
+                CLUSTER_SIG_HEADER: sign_request(self.settings.CLUSTER_SECRET, "POST", url, raw),
+            }
+            client = http_client or httpx.AsyncClient(timeout=self.settings.REPLICATION_TIMEOUT_S)
+            try:
+                resp = await client.post(url, content=raw, headers=headers)
+                if resp.status_code == 200:
+                    self._follower_updates.pop(shard_id, None)
+            except Exception as exc:
+                logger.warning("Could not tell %s about follower %s: %s", clean, addr, exc)
+            finally:
+                if http_client is None:
+                    await client.aclose()
+
     def _build_promote_body(
         self, shard_id: str, new_primary: str, old_primary: str | None
     ) -> dict[str, Any]:
@@ -302,15 +392,6 @@ class CoordinatorService:
         for n in self.nodes.values():
             if n.shard_id == shard_id and normalize_url(n.address) == normalize_url(new_primary):
                 promoted_node_id = n.node_id
-                n.role = NodeRole.PRIMARY
-                n.term = term
-                n.last_seen_monotonic = now_mono
-            elif (
-                old_primary
-                and n.shard_id == shard_id
-                and normalize_url(n.address) == normalize_url(old_primary)
-            ):
-                n.role = NodeRole.FOLLOWER
         lease = LeaseGrant(
             node_id=promoted_node_id,
             shard_id=shard_id,
@@ -383,7 +464,6 @@ class CoordinatorService:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_file, self.terms_path)
-            _fsync_dir(self.terms_path.parent)
         except Exception:
             if temp_file.exists():
                 try:
@@ -391,6 +471,13 @@ class CoordinatorService:
                 except OSError:
                     pass
             raise
+        try:
+            _fsync_dir(self.terms_path.parent)
+        except OSError as exc:
+            # The new terms file is already in place (and will be read on restart in the
+            # normal case): do NOT roll memory back to the old term, which would make
+            # memory disagree with disk. Surface the durability failure instead.
+            raise TermsDurabilityError(f"terms file replaced but not made durable: {exc}") from exc
 
     def is_shard_degraded(self, shard_id: str) -> bool:
         """A shard is degraded if its follower is not in SYNCED state."""
@@ -642,6 +729,8 @@ class CoordinatorService:
                 finally:
                     if owns_promote_client:
                         await promote_client.aclose()
+                if promoted_ok:
+                    self._mark_promoted(shard_id, candidate, other)
                 if not promoted_ok:
                     # The map already names the candidate as primary. Keep retrying from
                     # the health monitor (and after restarts, via the durable intent).
@@ -734,6 +823,7 @@ class CoordinatorService:
                     body = self._build_promote_body(shard_id, addr, old_primary)
                     ok = await self._send_promote(client, addr, body)
                     if ok:
+                        self._mark_promoted(shard_id, addr, old_primary)
                         self._set_intent(shard_id, None)
             finally:
                 if http_client is None:
@@ -1025,6 +1115,19 @@ class CoordinatorService:
                     raise ValueError(f"Shard {shard_id!r} already has primary and follower.")
                 role = NodeRole.FOLLOWER if has_primary else NodeRole.PRIMARY
 
+        if role == NodeRole.PRIMARY and reg.fresh_state and shard_id in self._initialized_shards:
+            # The node's data directory is empty, but this shard is known to hold data:
+            # its volume was lost. Never let it serve an empty database as primary; it
+            # registers as a follower, the replica holding the data is promoted, and this
+            # node is rebuilt from it by snapshot resync.
+            logger.error(
+                "Registration: %s has NO local data but shard %s holds data; refusing "
+                "primary authority (registered as follower)",
+                reg.node_id,
+                shard_id,
+            )
+            role = NodeRole.FOLLOWER
+
         if role == NodeRole.FOLLOWER:
             for m in reversed(self.failover_metrics):
                 if m["shard_id"] == shard_id and m.get("rejoin_timestamp") is None:
@@ -1037,14 +1140,10 @@ class CoordinatorService:
         for entry in current_map.entries:
             if entry.shard_id == shard_id:
                 if role == NodeRole.PRIMARY and normalize_url(entry.primary) != clean_reg:
-                    # H3: bump ownership_epoch so routers detect the address change
-                    # immediately via epoch staleness, not just after TTL expiry.
-                    entry = entry.model_copy(
-                        update={
-                            "primary": reg.address,
-                            "ownership_epoch": entry.ownership_epoch + 1,
-                        }
-                    )
+                    # Address change only. The ownership epoch is NOT bumped here: the node
+                    # never learns of such a bump, and writes require an exact epoch match.
+                    # Routers notice the move via the map version / connection errors.
+                    entry = entry.model_copy(update={"primary": reg.address})
                     map_changed = True
                 elif (
                     role == NodeRole.FOLLOWER
@@ -1059,11 +1158,28 @@ class CoordinatorService:
             updated_entries.append(entry)
 
         if map_changed:
+            if self.topology_lock(shard_id).locked() or shard_id in self.failover_in_progress:
+                # A failover or migration is mid-flight on this shard and relies on the
+                # topology it captured: do not change it underneath. The node retries
+                # registration on its next heartbeat tick.
+                raise TopologyBusy(
+                    f"Shard {shard_id} is changing topology; retry registration shortly."
+                )
             current_map = ShardMap(
                 map_version=current_map.map_version + 1,
                 entries=updated_entries,
             )
             self.map_mgr.save(current_map)
+            new_follower = next(
+                (e.follower for e in updated_entries if e.shard_id == shard_id), None
+            )
+            if (
+                role == NodeRole.FOLLOWER
+                and new_follower
+                and (normalize_url(new_follower) == clean_reg)
+            ):
+                # Tell the primary about its new replica (pushed by the health monitor).
+                self._follower_updates[shard_id] = reg.address
 
         # Record registered node
         self.nodes[reg.node_id] = RegisteredNode(
@@ -1219,8 +1335,11 @@ class CoordinatorService:
         registered.last_seen_monotonic = now_mono
         registered.term = hb.term
 
-        # Follower heartbeats never receive leases
+        # Follower heartbeats never receive leases. A node that says it is a follower is
+        # recorded as one (never kept as a phantom primary in our bookkeeping).
         if hb.role == NodeRole.FOLLOWER:
+            if registered.role == NodeRole.PRIMARY:
+                registered.role = NodeRole.FOLLOWER
             return None
 
         if hb.role == NodeRole.PRIMARY:
@@ -1281,6 +1400,8 @@ class CoordinatorService:
             self.replica_states[shard_id] = hb.follower_state
             self._replica_reported.add(shard_id)
             self._last_primary_seq[shard_id] = hb.last_applied_seq
+            if hb.last_applied_seq > 0:
+                self._mark_initialized(shard_id)
             if hb.follower_state == ReplicaState.SYNCED and prev_state != ReplicaState.SYNCED:
                 now_wall = time.time()
                 for m in reversed(self.failover_metrics):

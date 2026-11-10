@@ -124,6 +124,8 @@ async def test_issue2_durable_term_and_epoch_persistence(tmp_path: Path):
         async with AsyncClient(transport=transport, base_url="http://node") as client:
             # Promote to term 5 with new epoch
             promote_body = {
+                "shard_id": shard_id,
+                "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                 "term": 5,
                 "role": "primary",
                 "ownership_epochs": {"0-9223372036854775808": 42},
@@ -191,6 +193,7 @@ async def test_restarted_old_primary_cannot_regain_authority_and_rejoins_as_foll
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=ranges,
+        lease_expires_at=float("inf"),
     )
     app_b = build_app(
         settings=settings_b,
@@ -204,6 +207,7 @@ async def test_restarted_old_primary_cannot_regain_authority_and_rejoins_as_foll
         trans_b = ASGITransport(app=app_b)
         async with AsyncClient(transport=trans_b, base_url="http://node_b") as client_b:
             app_a.state.node.follower_url = "node_b"
+            app_a.state.node.follower_state = ReplicaState.SYNCED  # follower attached and in sync
             app_a.state.node.http_client = client_b
 
             trans_a = ASGITransport(app=app_a)
@@ -221,6 +225,8 @@ async def test_restarted_old_primary_cannot_regain_authority_and_rejoins_as_foll
         trans_b = ASGITransport(app=app_b)
         async with AsyncClient(transport=trans_b, base_url="http://node_b") as client_b:
             promote_body = {
+                "shard_id": "shard0",
+                "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                 "term": 2,
                 "role": "primary",
                 "ownership_epochs": {"0-1000": 2},
@@ -288,12 +294,16 @@ async def test_issue3_pending_write_reconciliation_follower_has_op(tmp_path: Pat
         node_id="shard0-primary",
         shard_id="shard0",
         role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(follower_app), LifespanManager(primary_app):
         f_transport = ASGITransport(app=follower_app)
         async with AsyncClient(transport=f_transport, base_url="http://follower") as f_client:
             primary_app.state.node.follower_url = "follower"
+            primary_app.state.node.follower_state = (
+                ReplicaState.SYNCED
+            )  # follower attached and in sync
             primary_app.state.node.http_client = f_client
             primary_app.state.node.ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
             follower_app.state.node.ranges = [
@@ -391,6 +401,7 @@ async def test_pending_write_reconciliation_follower_behind(tmp_path: Path):
         node_id="shard0-primary",
         shard_id="shard0",
         role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(follower_app), LifespanManager(primary_app):
@@ -453,6 +464,7 @@ async def test_pending_write_reconciliation_follower_unavailable(tmp_path: Path)
         node_id="shard0-primary",
         shard_id="shard0",
         role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(primary_app):
@@ -506,6 +518,7 @@ async def test_pending_write_reconciliation_conflicting_op(tmp_path: Path):
         node_id="shard0-primary",
         shard_id="shard0",
         role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(follower_app), LifespanManager(primary_app):
@@ -569,6 +582,7 @@ async def test_pending_write_reconciliation_authoritative_absence(tmp_path: Path
         node_id="shard0-primary",
         shard_id="shard0",
         role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(follower_app), LifespanManager(primary_app):
@@ -661,6 +675,7 @@ async def test_issue4_migration_snapshot_consistency(tmp_path: Path):
         node_id="shard0-primary",
         shard_id="shard0",
         role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
     async with LifespanManager(app):
         transport = ASGITransport(app=app)
@@ -987,7 +1002,14 @@ async def test_wal_restart_uncommitted_entry_discarded_and_sequence_consistent(t
         # Promote to primary to continue serving writes
         transport2 = ASGITransport(app=app2)
         async with AsyncClient(transport=transport2, base_url="http://p2") as c2:
-            prom_bytes = json.dumps({"term": 2}).encode("utf-8")
+            prom_bytes = json.dumps(
+                {
+                    "shard_id": "shard0",
+                    "term": 2,
+                    "ownership_epochs": {"0-9223372036854775808": 2},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+            ).encode("utf-8")
             await c2.post(
                 "/internal/promote",
                 content=prom_bytes,
@@ -1014,7 +1036,11 @@ async def test_reconciliation_follower_has_op_lost_ack(tmp_path: Path):
     p_settings = _make_settings(tmp_path / "primary")
     f_settings = _make_settings(tmp_path / "follower")
     primary_app = build_app(
-        settings=p_settings, node_id="p1", shard_id="shard0", role=NodeRole.PRIMARY
+        settings=p_settings,
+        node_id="p1",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
     follower_app = build_app(
         settings=f_settings, node_id="f1", shard_id="shard0", role=NodeRole.FOLLOWER
@@ -1110,7 +1136,11 @@ async def test_reconciliation_follower_behind_and_unavailable_blocks_writes(tmp_
     """
     settings = _make_settings(tmp_path)
     primary_app = build_app(
-        settings=settings, node_id="p1", shard_id="shard0", role=NodeRole.PRIMARY
+        settings=settings,
+        node_id="p1",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(primary_app):
@@ -1198,7 +1228,11 @@ async def test_reconciliation_follower_promoted_higher_term_and_missing_from_lat
     """
     settings = _make_settings(tmp_path)
     primary_app = build_app(
-        settings=settings, node_id="p1", shard_id="shard0", role=NodeRole.PRIMARY
+        settings=settings,
+        node_id="p1",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(primary_app):
@@ -1226,6 +1260,7 @@ async def test_reconciliation_follower_promoted_higher_term_and_missing_from_lat
                     "has_op": True,
                     "term": 6,
                     "wal_last_seq": 12,
+                    "committed_seq": 12,  # the follower holds the op durably committed
                     "op_term": 5,
                     "op_request_id": "req-committed-survives",
                     "entry_found": True,
@@ -1415,13 +1450,20 @@ async def test_promotion_truncates_uncommitted_tail_and_preserves_committed(tmp_
         # Promote node to PRIMARY in term 2
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://node") as client:
-            prom_bytes = json.dumps({"term": 2}).encode("utf-8")
+            prom_bytes = json.dumps(
+                {
+                    "shard_id": "shard0",
+                    "term": 2,
+                    "ownership_epochs": {"0-1000": 2},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+            ).encode("utf-8")
             p_resp = await client.post(
                 "/internal/promote",
                 content=prom_bytes,
                 headers=_cluster_headers(prom_bytes),
             )
-            assert p_resp.status_code == 200
+            assert p_resp.status_code == 200, p_resp.text
             assert state.role == NodeRole.PRIMARY
             assert state.term == 2
 
@@ -1612,6 +1654,7 @@ async def test_crash_window_primary_restart_follower_available_committed_survive
             ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
             follower_url="http://f1",
             http_client=AsyncClient(mounts={"http://f1": f_transport}),
+            lease_expires_at=float("inf"),
         )
         async with LifespanManager(p_app1):
             p1_state = p_app1.state.node
@@ -1672,6 +1715,7 @@ async def test_crash_window_primary_restart_follower_available_committed_survive
             ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
             follower_url="http://f1",
             http_client=AsyncClient(mounts={"http://f1": f_transport}),
+            lease_expires_at=float("inf"),
         )
         async with LifespanManager(p_app2):
             p2_state = p_app2.state.node
@@ -1755,6 +1799,7 @@ async def test_crash_window_primary_restart_follower_unavailable_blocks_writes(
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url="http://follower",
         http_client=down_client,
+        lease_expires_at=float("inf"),
     )
     async with LifespanManager(p_app2):
         p2_state = p_app2.state.node
@@ -1770,7 +1815,15 @@ async def test_crash_window_primary_restart_follower_unavailable_blocks_writes(
         # Promote to primary to attempt writes
         transport2 = ASGITransport(app=p_app2)
         async with AsyncClient(transport=transport2, base_url="http://p2") as c2:
-            prom_bytes = json.dumps({"term": 2, "follower_url": "http://follower"}).encode("utf-8")
+            prom_bytes = json.dumps(
+                {
+                    "shard_id": "shard0",
+                    "term": 2,
+                    "follower_url": "http://follower",
+                    "ownership_epochs": {"0-1000": 2},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+            ).encode("utf-8")
             await c2.post(
                 "/internal/promote",
                 content=prom_bytes,
@@ -1830,6 +1883,7 @@ async def test_crash_window_follower_promoted_before_old_primary_restarts(
             shard_id=shard_id,
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+            lease_expires_at=float("inf"),
         )
         async with LifespanManager(p_app1):
             p1_state = p_app1.state.node
@@ -1882,7 +1936,14 @@ async def test_crash_window_follower_promoted_before_old_primary_restarts(
 
         # Primary is crashed. Promote follower F1 to PRIMARY under term 2!
         async with AsyncClient(transport=f_transport, base_url="http://f1") as fc:
-            prom_bytes = json.dumps({"term": 2, "ownership_epochs": {"0-1000": 2}}).encode("utf-8")
+            prom_bytes = json.dumps(
+                {
+                    "shard_id": "shard0",
+                    "term": 2,
+                    "ownership_epochs": {"0-1000": 2},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+            ).encode("utf-8")
             p_resp = await fc.post(
                 "/internal/promote", content=prom_bytes, headers=_cluster_headers(prom_bytes)
             )
@@ -1898,6 +1959,7 @@ async def test_crash_window_follower_promoted_before_old_primary_restarts(
             shard_id=shard_id,
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+            lease_expires_at=float("inf"),
         )
         async with LifespanManager(p_app2):
             p2_state = p_app2.state.node
@@ -1990,6 +2052,7 @@ async def test_crash_window_uncommitted_operation_authoritatively_discarded(
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url="http://follower",
         http_client=absent_client,
+        lease_expires_at=float("inf"),
     )
     async with LifespanManager(p_app2):
         p2_state = p_app2.state.node
@@ -1997,7 +2060,15 @@ async def test_crash_window_uncommitted_operation_authoritatively_discarded(
         # Promote to primary
         transport2 = ASGITransport(app=p_app2)
         async with AsyncClient(transport=transport2, base_url="http://p2") as c2:
-            prom_bytes = json.dumps({"term": 2, "follower_url": "http://follower"}).encode("utf-8")
+            prom_bytes = json.dumps(
+                {
+                    "shard_id": "shard0",
+                    "term": 2,
+                    "follower_url": "http://follower",
+                    "ownership_epochs": {"0-1000": 2},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+            ).encode("utf-8")
             await c2.post(
                 "/internal/promote",
                 content=prom_bytes,
@@ -2048,6 +2119,7 @@ async def test_regression_follower_unavailable_write_rejected_and_no_local_ack(t
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url="http://follower",
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(p_app):
@@ -2127,6 +2199,7 @@ async def test_regression_primary_crash_after_degraded_write_follower_promoted(t
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url="http://follower",
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(f_app), LifespanManager(p_app):
@@ -2171,9 +2244,11 @@ async def test_regression_primary_crash_after_degraded_write_follower_promoted(t
         async with AsyncClient(transport=prom_trans, base_url="http://f1") as fc:
             prom_bytes = json.dumps(
                 {
+                    "shard_id": "shard0",
                     "term": 2,
                     "follower_url": "http://old-primary",
                     "ownership_epochs": {"0-1000": 2},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                 }
             ).encode("utf-8")
             prom_resp = await fc.post(
@@ -2231,6 +2306,7 @@ async def test_regression_writes_resume_after_follower_sync_restored(tmp_path: P
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url="http://follower",
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(f_app), LifespanManager(p_app):
@@ -2306,6 +2382,7 @@ async def test_regression_unresolved_write_preserves_outcome_unknown_and_blocks_
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url="http://follower",
         http_client=fail_client,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(p_app):
@@ -2373,6 +2450,7 @@ async def test_regression_primary_without_follower_url_fails_closed(tmp_path: Pa
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
         follower_url=None,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):

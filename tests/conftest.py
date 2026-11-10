@@ -25,7 +25,10 @@ os.environ.setdefault("CLIENT_API_KEY", "test-client-api-key-ok")
 #     replaced by the equivalent route-bound signature (a wrong/forged signature is
 #     left untouched, so negative auth tests still fail as they should);
 #   * a request to a shard's /doc, /query or /status that carries no X-Api-Key gets
-#     the shard's configured key.
+#     the shard's configured key;
+#   * a direct write to a shard's /doc without an ``ownership_epoch`` gets the epoch the
+#     shard currently holds for that doc_id — exactly what the router attaches (cluster
+#     mode rejects writes without one).
 #
 # Production code never emits body-only signatures (enforced by
 # tests/integration/test_bugs.py::test_sec_no_body_only_signing_in_src), so this cannot
@@ -60,6 +63,12 @@ async def _adapted_handle(self: httpx.ASGITransport, request: httpx.Request) -> 
     settings, is_shard = _target_settings(self.app)
     if settings is not None:
         body = await request.aread()
+        if (
+            is_shard
+            and request.method in ("POST", "PUT", "DELETE")
+            and request.url.path.startswith("/doc")
+        ):
+            request, body = _with_ownership_epoch(self.app, request, body)
         secret = settings.CLUSTER_SECRET  # type: ignore[attr-defined]
         sig = request.headers.get(CLUSTER_SIG_HEADER)
         if sig and verify_signature(secret, body, sig):
@@ -73,6 +82,31 @@ async def _adapted_handle(self: httpx.ASGITransport, request: httpx.Request) -> 
         ):
             request.headers[CLIENT_KEY_HEADER] = settings.CLIENT_API_KEY  # type: ignore[attr-defined]
     return await _original_asgi_handle(self, request)
+
+
+def _with_ownership_epoch(
+    app: object, request: httpx.Request, body: bytes
+) -> tuple[httpx.Request, bytes]:
+    import json
+
+    try:
+        payload = json.loads(body) if body else None
+    except ValueError:
+        return request, body
+    if not isinstance(payload, dict) or "ownership_epoch" in payload:
+        return request, body
+    tail = request.url.path.rsplit("/", 1)[-1]
+    if tail.isdigit():
+        doc_id: object = int(tail)
+    else:
+        doc = payload.get("document")
+        doc_id = doc.get("doc_id") if isinstance(doc, dict) else None
+    if not isinstance(doc_id, int) or isinstance(doc_id, bool):
+        return request, body
+    payload["ownership_epoch"] = app.state.node.epoch_for(doc_id)  # type: ignore[attr-defined]
+    new_body = json.dumps(payload).encode("utf-8")
+    headers = [(k, v) for k, v in request.headers.items() if k.lower() != "content-length"]
+    return httpx.Request(request.method, request.url, headers=headers, content=new_body), new_body
 
 
 @pytest.fixture(autouse=True)

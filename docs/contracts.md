@@ -154,9 +154,18 @@ Synchronous replication is **never** relaxed (no single-node acknowledgements).
 - If lease expires before the client acknowledgement → `outcome_unknown`.
   Never return `COMMITTED` after lease expiry.
 - Coordinator waits for the old lease to expire **plus M** before the new primary may write.
+- A node has **no lease until the coordinator grants one** at registration (it registers
+  immediately at startup). It never gives itself a lease; a missing, malformed or expired
+  grant means no authority, and a registration without a grant revokes any local lease.
+  Only explicit standalone mode runs with an unbounded local lease.
 - A restarted node must register and obtain a fresh lease; it never resumes as primary
   from its old state. A node that recovers from disk registers as a follower; if it was the
   primary in the shard map, the coordinator promotes the current follower instead.
+- A node whose data directory is **empty** never becomes primary of a shard the coordinator
+  knows holds data (`initialized_shards.json`): it registers as a follower and is rebuilt
+  from the replica by snapshot resync.
+- A node refuses to start if its recorded `committed_seq` is beyond what its snapshot + WAL
+  can reproduce.
 - Lease length taken from a coordinator grant is `expires_at − granted_at` **capped at the
   node's own `L`**, and is added to the node's own monotonic clock.
 - A primary steps down on a heartbeat reply only when it is `409 STALE_TERM`.
@@ -198,7 +207,7 @@ All errors return JSON: `{"error_code": "<CODE>", "error_message": "<human text>
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `STALE_EPOCH` | 409 | `ownership_epoch` is behind the current epoch |
+| `STALE_EPOCH` | 409 | `ownership_epoch` missing (cluster mode) or not equal to the range's current epoch |
 | `STALE_TERM` | 409 | `term` is behind the current term |
 | `NOT_PRIMARY` | 409 | Request sent to a non-primary node |
 | `LEASE_EXPIRED` | 409 | Primary lease has expired |
@@ -214,6 +223,7 @@ All errors return JSON: `{"error_code": "<CODE>", "error_message": "<human text>
 | `ROUTING_FAILED` | 500 | Router exceeded retry limit during map recovery |
 | `RESULT_TOO_LARGE` | 413 | Query would exceed the 32 MB response budget |
 | `FAILOVER_IN_PROGRESS` | 503 | Lease renewal refused while the shard fails over |
+| `TOPOLOGY_BUSY` | 503 | Registration deferred while the shard's topology is changing |
 | `AUTH_FAILED` | 401 | Invalid cluster secret, admin token, or client API key |
 | `BODY_TOO_LARGE` | 413 | Request body exceeds 2 MB (also enforced without `Content-Length`) |
 | `DOC_TOO_LARGE` | 413 | A single document exceeds 1 MB serialized |

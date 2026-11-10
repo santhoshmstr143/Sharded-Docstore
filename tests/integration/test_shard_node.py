@@ -65,7 +65,7 @@ def tmp_data(tmp_path: Path) -> str:
 @pytest_asyncio.fixture
 async def client(tmp_data: str) -> AsyncClient:
     settings = _make_settings(tmp_data)
-    app = build_app(settings, node_id="test-node", shard_id="shard0")
+    app = build_app(settings, node_id="test-node", shard_id="shard0", lease_expires_at=float("inf"))
     async with LifespanManager(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
@@ -219,7 +219,9 @@ async def test_insert_out_of_range(tmp_path: Path) -> None:
     os.environ["SHARD_RANGE_END"] = "100"
     os.environ["SHARD_OWNERSHIP_EPOCH"] = "1"
     settings = _make_settings(str(tmp_path / "narrow"))
-    app = build_app(settings, node_id="n-narrow", shard_id="shard-narrow")
+    app = build_app(
+        settings, node_id="n-narrow", shard_id="shard-narrow", lease_expires_at=float("inf")
+    )
     async with LifespanManager(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
@@ -317,7 +319,9 @@ async def test_corrupted_wal_node_returns_503(tmp_path: Path) -> None:
     wal_path.write_text(json.dumps(record) + "\n")
 
     settings = _make_settings(str(tmp_path))
-    app = build_app(settings, node_id="corrupt-node", shard_id=shard_id)
+    app = build_app(
+        settings, node_id="corrupt-node", shard_id=shard_id, lease_expires_at=float("inf")
+    )
     # LifespanManager starts lifespan; recovery fails but app still starts
     async with LifespanManager(app):
         transport = ASGITransport(app=app)
@@ -336,7 +340,7 @@ async def test_restart_data_persists(tmp_path: Path) -> None:
 
     # First boot
     settings1 = _make_settings(data_dir)
-    app1 = build_app(settings1, node_id="n", shard_id="shard0")
+    app1 = build_app(settings1, node_id="n", shard_id="shard0", lease_expires_at=float("inf"))
     async with LifespanManager(app1):
         transport1 = ASGITransport(app=app1)
         async with AsyncClient(transport=transport1, base_url="http://test") as c:
@@ -354,7 +358,7 @@ async def test_restart_data_persists(tmp_path: Path) -> None:
 
     # Second boot
     settings2 = _make_settings(data_dir)
-    app2 = build_app(settings2, node_id="n", shard_id="shard0")
+    app2 = build_app(settings2, node_id="n", shard_id="shard0", lease_expires_at=float("inf"))
     async with LifespanManager(app2):
         transport2 = ASGITransport(app=app2)
         async with AsyncClient(transport=transport2, base_url="http://test") as c:

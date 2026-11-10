@@ -71,7 +71,13 @@ async def test_shard_query_ownership_filtering(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path)
     # Shard owns [100, 200)
     owned_ranges = [ShardRangeConfig(start=100, end=200, ownership_epoch=1)]
-    shard_app = build_app(settings, node_id="node-test", shard_id="shard-test", ranges=owned_ranges)
+    shard_app = build_app(
+        settings,
+        node_id="node-test",
+        shard_id="shard-test",
+        ranges=owned_ranges,
+        lease_expires_at=float("inf"),
+    )
 
     async with LifespanManager(shard_app):
         transport = ASGITransport(app=shard_app)
@@ -96,7 +102,13 @@ async def test_shard_query_ownership_filtering(tmp_path: Path) -> None:
 async def test_shard_query_sorting_and_pagination(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path)
     owned_ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
-    shard_app = build_app(settings, node_id="node-test", shard_id="shard0", ranges=owned_ranges)
+    shard_app = build_app(
+        settings,
+        node_id="node-test",
+        shard_id="shard0",
+        ranges=owned_ranges,
+        lease_expires_at=float("inf"),
+    )
 
     async with LifespanManager(shard_app):
         transport = ASGITransport(app=shard_app)
@@ -171,9 +183,27 @@ async def test_router_scatter_gather_cluster_execution(tmp_path: Path) -> None:
     ranges_s1 = [ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)]
     ranges_s2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
-    app_s0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=ranges_s0)
-    app_s1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=ranges_s1)
-    app_s2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=ranges_s2)
+    app_s0 = build_app(
+        settings,
+        node_id="node0",
+        shard_id="shard0",
+        ranges=ranges_s0,
+        lease_expires_at=float("inf"),
+    )
+    app_s1 = build_app(
+        settings,
+        node_id="node1",
+        shard_id="shard1",
+        ranges=ranges_s1,
+        lease_expires_at=float("inf"),
+    )
+    app_s2 = build_app(
+        settings,
+        node_id="node2",
+        shard_id="shard2",
+        ranges=ranges_s2,
+        lease_expires_at=float("inf"),
+    )
 
     t0 = ASGITransport(app=app_s0)
     t1 = ASGITransport(app=app_s1)
@@ -336,7 +366,13 @@ async def test_router_partial_failure_policy(tmp_path: Path) -> None:
     mgr.save(s_map)
 
     ranges_s0 = [ShardRangeConfig(start=0, end=_S1, ownership_epoch=1)]
-    app_s0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=ranges_s0)
+    app_s0 = build_app(
+        settings,
+        node_id="node0",
+        shard_id="shard0",
+        ranges=ranges_s0,
+        lease_expires_at=float("inf"),
+    )
 
     # Shard 1 and 2 are NOT running / mock unavailable transports
     shard_transports = {
@@ -377,9 +413,27 @@ async def test_router_shard_call_counts_optimization(tmp_path: Path) -> None:
     ranges_s1 = [ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)]
     ranges_s2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
-    app_s0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=ranges_s0)
-    app_s1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=ranges_s1)
-    app_s2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=ranges_s2)
+    app_s0 = build_app(
+        settings,
+        node_id="node0",
+        shard_id="shard0",
+        ranges=ranges_s0,
+        lease_expires_at=float("inf"),
+    )
+    app_s1 = build_app(
+        settings,
+        node_id="node1",
+        shard_id="shard1",
+        ranges=ranges_s1,
+        lease_expires_at=float("inf"),
+    )
+    app_s2 = build_app(
+        settings,
+        node_id="node2",
+        shard_id="shard2",
+        ranges=ranges_s2,
+        lease_expires_at=float("inf"),
+    )
 
     # Use a custom transport handler to count requests
     counts = {"shard0": 0, "shard1": 0, "shard2": 0}

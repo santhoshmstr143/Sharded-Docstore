@@ -220,7 +220,14 @@ async def test_bug3_promote_fails_closed_when_metadata_persist_fails(
             real(st, **kw)
 
         monkeypatch.setattr(shard_app_mod, "_persist_node_metadata", failing)
-        body, h = _sig({"shard_id": "s0", "term": term_before + 1})
+        body, h = _sig(
+            {
+                "shard_id": "s0",
+                "term": term_before + 1,
+                "ownership_epochs": {f"0-{KEYSPACE_END}": 1},
+                "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+            }
+        )
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://t") as c:
             r = await c.post("/internal/promote", content=body, headers=h)
@@ -235,10 +242,19 @@ async def test_bug29_promote_rejects_wrong_shard_and_mismatched_ranges(tmp_path:
     app = build_app(_settings(tmp_path), node_id="f", shard_id="s0", role=NodeRole.FOLLOWER)
     async with LifespanManager(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-            body, h = _sig({"shard_id": "s9", "term": 5})
+            body, h = _sig(
+                {"shard_id": "s9", "term": 5, "lease": {"granted_at": 0.0, "expires_at": 3600.0}}
+            )
             r = await c.post("/internal/promote", content=body, headers=h)
             assert r.status_code == 409 and r.json()["error_code"] == "WRONG_SHARD"
-            body, h = _sig({"shard_id": "s0", "term": 5, "ownership_epochs": {"0-10": 3}})
+            body, h = _sig(
+                {
+                    "shard_id": "s0",
+                    "term": 5,
+                    "ownership_epochs": {"0-10": 3},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+            )
             r = await c.post("/internal/promote", content=body, headers=h)
             assert r.status_code == 409 and r.json()["error_code"] == "RANGE_MISMATCH"
         assert app.state.node.role == NodeRole.FOLLOWER
@@ -863,9 +879,10 @@ def test_report8_wall_clock_lease_is_capped_locally() -> None:
     assert lease_duration_from_grant({"granted_at": 100.0, "expires_at": 900.0}, 3.0) == 3.0
     # shorter grant is honoured (safe direction)
     assert lease_duration_from_grant({"granted_at": 100.0, "expires_at": 101.5}, 3.0) == 1.5
-    # nonsense -> local default
-    assert lease_duration_from_grant({"granted_at": 5.0, "expires_at": 1.0}, 3.0) == 3.0
-    assert lease_duration_from_grant(None, 3.0) == 3.0
+    # missing / malformed / expired grant -> NO authority (fail closed)
+    assert lease_duration_from_grant({"granted_at": 5.0, "expires_at": 1.0}, 3.0) == 0.0
+    assert lease_duration_from_grant(None, 3.0) == 0.0
+    assert lease_duration_from_grant({"granted_at": "x"}, 3.0) == 0.0
 
 
 # ── #12: only a STALE_TERM 409 demotes the primary ──────────────────────────
@@ -890,6 +907,7 @@ async def test_report12_only_stale_term_409_demotes(tmp_path: Path) -> None:
         role=NodeRole.PRIMARY,
         coordinator_url="coord:1",
         coordinator_transport=httpx.MockTransport(coordinator),
+        lease_expires_at=float("inf"),
     )
     async with LifespanManager(app):
         state = app.state.node
@@ -1177,6 +1195,7 @@ async def test_shard2_failed_internal_replication_is_tracked_not_orphaned(tmp_pa
         follower_url="f:1",
         http_client=client,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+        lease_expires_at=float("inf"),
     )
     async with LifespanManager(app):
         node = app.state.node
@@ -1235,6 +1254,7 @@ async def test_shard6_7_snapshot_resync_catches_up_and_fresh_follower_bootstraps
         ranges=rng,
         follower_url="http://f",
         http_client=client,
+        lease_expires_at=float("inf"),
     )
     holder["p"] = pri
     async with LifespanManager(fol), LifespanManager(pri):
@@ -1697,3 +1717,551 @@ async def test_l6_one_failing_shard_does_not_block_other_failovers(tmp_path: Pat
     async with AsyncClient(transport=httpx.MockTransport(handler)) as client:
         promoted = await svc.check_and_trigger_failover(http_client=client)
     assert promoted == ["shard1"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Section 6 — third review (docs/bugs.md, round 3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_GRANT = {"granted_at": 0.0, "expires_at": 3600.0}
+
+
+@pytest.mark.asyncio
+async def test_r1_cluster_primary_has_no_authority_without_coordinator_lease(
+    tmp_path: Path,
+) -> None:
+    app = build_app(
+        _settings(tmp_path),
+        node_id="p",
+        shard_id="s0",
+        role=NodeRole.PRIMARY,
+        follower_url="f:1",
+    )
+    async with LifespanManager(app):
+        node = app.state.node
+        assert not node.is_lease_valid()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await _insert(c, {"doc_id": 1}, "w1")
+            assert r.status_code == 409 and r.json()["error_code"] == "LEASE_EXPIRED"
+            assert (await c.get("/doc/1")).status_code == 409  # no primary reads either
+        # A valid grant confers authority; a registration WITHOUT a grant revokes it.
+        await _apply_registration(node, {"role": "primary", "lease": _GRANT}, time.monotonic())
+        assert node.is_lease_valid()
+        await _apply_registration(node, {"role": "primary"}, time.monotonic())
+        assert not node.is_lease_valid()
+        await _apply_registration(
+            node, {"role": "primary", "lease": {"granted_at": 5.0, "expires_at": 1.0}}, 0.0
+        )
+        assert not node.is_lease_valid()
+
+
+@pytest.mark.asyncio
+async def test_r1_standalone_primary_keeps_unbounded_lease(tmp_path: Path) -> None:
+    app = _standalone(tmp_path)
+    async with LifespanManager(app):
+        assert app.state.node.is_lease_valid()
+
+
+@pytest.mark.asyncio
+async def test_r11_promotion_requires_complete_authority(tmp_path: Path) -> None:
+    app = build_app(_settings(tmp_path), node_id="f", shard_id="s0", role=NodeRole.FOLLOWER)
+    async with LifespanManager(app):
+        node = app.state.node
+        epochs = {f"{r.start}-{r.end}": r.ownership_epoch + 1 for r in node.ranges}
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://t") as c:
+            for body in (
+                {"term": 2},  # the reported reproduction
+                {"shard_id": "s0", "term": 2, "ownership_epochs": epochs},  # no lease
+                {"shard_id": "s0", "ownership_epochs": epochs, "lease": _GRANT},  # no term
+                {"term": 2, "ownership_epochs": epochs, "lease": _GRANT},  # no shard_id
+            ):
+                raw, h = _sig(body)
+                r = await c.post("/internal/promote", content=raw, headers=h)
+                assert r.status_code == 422, (body, r.text)
+            for body, code in (
+                ({"shard_id": "s0", "term": 2, "lease": _GRANT}, "INVALID_PROMOTION"),
+                (
+                    {
+                        "shard_id": "s0",
+                        "term": 2,
+                        "ownership_epochs": epochs,
+                        "lease": {"granted_at": 9.0, "expires_at": 1.0},
+                    },
+                    "INVALID_LEASE",
+                ),
+            ):
+                raw, h = _sig(body)
+                r = await c.post("/internal/promote", content=raw, headers=h)
+                assert r.status_code == 409 and r.json()["error_code"] == code
+            assert node.role == NodeRole.FOLLOWER and not node.is_lease_valid()
+            raw, h = _sig(
+                {"shard_id": "s0", "term": 2, "ownership_epochs": epochs, "lease": _GRANT}
+            )
+            assert (await c.post("/internal/promote", content=raw, headers=h)).status_code == 200
+            assert node.role == NodeRole.PRIMARY and node.is_lease_valid()
+
+
+def test_r2_empty_node_never_becomes_primary_of_a_shard_with_data(tmp_path: Path) -> None:
+    from docstore.common.models import Heartbeat
+
+    svc = _coord_with_follower(tmp_path)
+    # First-ever start: an empty primary is fine.
+    reg = svc.register_node(
+        NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1", fresh_state=True)
+    )
+    assert reg.role == NodeRole.PRIMARY
+    svc.handle_heartbeat(
+        Heartbeat(
+            node_id="p0",
+            shard_id="shard0",
+            role=NodeRole.PRIMARY,
+            term=1,
+            last_applied_seq=10_000,
+            follower_acked_seq=10_000,
+            follower_state=ReplicaState.SYNCED,
+            timestamp_monotonic=time.monotonic(),
+        )
+    )
+    # The primary's volume is wiped and it restarts empty: it must not be primary again,
+    # including after a coordinator restart (the fact is durable).
+    for coordinator in (svc, _coord_with_follower(tmp_path)):
+        reg = coordinator.register_node(
+            NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1", fresh_state=True)
+        )
+        assert reg.role == NodeRole.FOLLOWER and reg.lease is None
+
+
+@pytest.mark.asyncio
+async def test_r2_shard_reports_empty_data_directory(tmp_path: Path) -> None:
+    app = build_app(_settings(tmp_path), node_id="p", shard_id="s0", lease_expires_at=float("inf"))
+    async with LifespanManager(app):
+        assert app.state.node.fresh_start is True
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            await c.get("/health")
+    app2 = build_app(_settings(tmp_path), node_id="p", shard_id="s0", lease_expires_at=float("inf"))
+    async with LifespanManager(app2):
+        assert app2.state.node.fresh_start is False  # metadata now exists
+
+
+@pytest.mark.asyncio
+async def test_r3_follower_acks_only_applied_and_durably_committed_entries(tmp_path: Path) -> None:
+    app = build_app(_settings(tmp_path), node_id="f", shard_id="s0", role=NodeRole.FOLLOWER)
+    async with LifespanManager(app):
+        node = app.state.node
+        # Crash window: the entry reached the follower's WAL, but was neither applied nor
+        # recorded as committed.
+        node.wal.append(
+            seq=1, term=1, op="insert", doc_id=7, request_id="r7", payload={"doc_id": 7}
+        )
+        assert node.committed_seq == 0 and node.engine.get(7) is None
+        body = {
+            "shard_id": "s0",
+            "term": 1,
+            "seq": 1,
+            "op": "insert",
+            "doc_id": 7,
+            "request_id": "r7",
+            "payload": {"doc_id": 7},
+        }
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            raw, h = _sig(body)
+            r = await c.post("/internal/replicate", content=raw, headers=h)
+        assert r.status_code == 200 and r.json()["status"] == "ok"
+        assert node.committed_seq == 1 and node.engine.get(7) is not None
+        meta = json.loads((tmp_path / "s0" / "node_metadata.json").read_text())
+        assert meta["committed_seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_r3_check_op_has_op_implies_committed_on_follower(tmp_path: Path) -> None:
+    app = build_app(_settings(tmp_path), node_id="f", shard_id="s0", role=NodeRole.FOLLOWER)
+    async with LifespanManager(app):
+        node = app.state.node
+        node.wal.append(
+            seq=1, term=1, op="insert", doc_id=7, request_id="r7", payload={"doc_id": 7}
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            raw, h = _sig({"shard_id": "s0", "seq": 1, "term": 1, "request_id": "r7"})
+            data = (await c.post("/internal/check-op", content=raw, headers=h)).json()
+        assert data["has_op"] is True and data["committed_seq"] >= 1
+        assert node.engine.get(7) is not None
+
+
+@pytest.mark.asyncio
+async def test_r4_cluster_primary_without_follower_never_commits_locally(tmp_path: Path) -> None:
+    app = build_app(
+        _settings(tmp_path),
+        node_id="p",
+        shard_id="s0",
+        lease_expires_at=float("inf"),
+        ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+    )
+    async with LifespanManager(app):
+        node = app.state.node
+        assert node.follower_state == ReplicaState.DOWN  # never SYNCED without a follower
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            raw, h = _signed(
+                "POST",
+                "/internal/migration/apply-batch",
+                {"migration_id": "m", "documents": [{"doc_id": 5}]},
+            )
+            r = await c.post("/internal/migration/apply-batch", content=raw, headers=h)
+            assert r.status_code == 503
+            raw, h = _signed("POST", "/internal/migration/cleanup", {"start": 0, "end": 10})
+            r = await c.post("/internal/migration/cleanup", content=raw, headers=h)
+            assert r.status_code == 503  # the replica cannot be told: not a success
+        assert node.wal.last_seq == 0 and node.engine.doc_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_r15_recovery_refuses_unrecoverable_committed_prefix(tmp_path: Path) -> None:
+    data_dir = tmp_path / "s0"
+    data_dir.mkdir(parents=True)
+    (data_dir / "node_metadata.json").write_text(
+        json.dumps(
+            {
+                "term": 1,
+                "role": "follower",
+                "committed_seq": 10,
+                "ranges": [{"start": 0, "end": 100, "ownership_epoch": 1}],
+            }
+        )
+    )
+    state = NodeState(_settings(tmp_path), node_id="n", shard_id="s0")
+    with pytest.raises(RuntimeError, match="exceeds recoverable history"):
+        await _recover(state)
+
+
+def test_r16_failed_truncate_poisons_the_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wal = WAL(tmp_path / "w.wal")
+    wal.open()
+    for i in (1, 2, 3):
+        wal.append(seq=i, term=1, op="insert", doc_id=i, request_id=f"r{i}", payload=None)
+
+    def broken(fd: int) -> None:
+        raise OSError(errno.EIO, "disk gone")
+
+    monkeypatch.setattr(os, "fsync", broken)
+    with pytest.raises(OSError):
+        wal.truncate_after(1)
+    monkeypatch.undo()
+    assert wal.failed
+    with pytest.raises(WALFailedError):
+        wal.append(seq=2, term=1, op="insert", doc_id=9, request_id="x", payload=None)
+
+
+@pytest.mark.asyncio
+async def test_r5_non_durable_map_flip_never_cleans_up_the_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docstore.router.shard_map import MapDurabilityError
+
+    coord, app0, app1 = await _migration_cluster(tmp_path)
+    async with LifespanManager(app0), LifespanManager(app1):
+        t0, t1 = ASGITransport(app=app0), ASGITransport(app=app1)
+        async with AsyncClient(transport=t0, base_url="http://node0") as c0:
+            for i in range(3):
+                await _insert(c0, {"doc_id": 100 + i}, f"i{i}")
+
+        def no_dir_fsync(path: Path) -> None:
+            raise MapDurabilityError("directory fsync failed")
+
+        monkeypatch.setattr(coord.map_mgr, "_make_durable", no_dir_fsync)
+        rec = coord.migration_mgr.create_migration("shard0", "shard1", 100, 200, coord)
+        mounts = {"http://node0": t0, "http://node1": t1}
+        async with AsyncClient(mounts=mounts) as client:
+            with pytest.raises(Exception):  # noqa: B017
+                await coord.migration_mgr.execute_migration(
+                    rec.migration_id, coord, http_client=client
+                )
+        assert coord.migration_mgr.migrations[rec.migration_id].state == MigrationState.CUTOVER
+        assert app0.state.node.engine.doc_count() == 3  # source untouched: not durable yet
+        assert app0.state.node.owns(150)
+
+        monkeypatch.undo()  # the disk recovers
+        async with AsyncClient(mounts=mounts) as client:
+            await coord.migration_mgr.retry_post_cutover(coord, http_client=client)
+        assert coord.migration_mgr.migrations[rec.migration_id].state == MigrationState.DONE
+        assert app0.state.node.engine.doc_count() == 0 and app1.state.node.engine.doc_count() == 3
+
+
+def test_r5_terms_keep_new_value_when_file_was_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docstore.coordinator import coordinator as coord_mod
+
+    svc = _coord_with_follower(tmp_path)
+
+    def broken(path: Path) -> None:
+        raise OSError(errno.EIO, "dir fsync failed")
+
+    monkeypatch.setattr(coord_mod, "_fsync_dir", broken)
+    with pytest.raises(coord_mod.TermsDurabilityError):
+        svc.shard_terms["shard0"] = 7
+    monkeypatch.undo()
+    assert svc.shard_terms["shard0"] == 7  # memory matches the replaced file
+    assert json.loads(svc.terms_path.read_text())["shard0"] == 7
+
+
+@pytest.mark.asyncio
+async def test_r12_new_follower_is_pushed_to_the_primary(tmp_path: Path) -> None:
+    smap = create_default_3_shard_map(primaries=["p0:1", "p1:1", "p2:1"])  # no followers
+    map_path = tmp_path / "coord" / "shard_map.json"
+    ShardMapManager(map_path).save(smap)
+    svc = CoordinatorService(_settings(tmp_path / "coord"), map_path=map_path)
+    svc.register_node(
+        NodeRegistration(
+            node_id="f0", shard_id="shard0", address="f0:1", requested_role=NodeRole.FOLLOWER
+        )
+    )
+    assert svc._follower_updates == {"shard0": "f0:1"}
+
+    primary = build_app(
+        _settings(tmp_path / "p"), node_id="p0", shard_id="shard0", lease_expires_at=float("inf")
+    )
+    async with LifespanManager(primary):
+        mounts = {"http://p0:1": ASGITransport(app=primary)}
+        async with AsyncClient(mounts=mounts) as client:
+            await svc.push_follower_updates(http_client=client)
+        node = primary.state.node
+        assert node.follower_url == "f0:1"
+        assert node.follower_state == ReplicaState.DOWN  # SYNCED only after a real resync
+    assert svc._follower_updates == {}
+
+
+@pytest.mark.asyncio
+async def test_r13_registration_cannot_change_topology_mid_operation(tmp_path: Path) -> None:
+    from docstore.common.errors import TopologyBusy
+
+    smap = create_default_3_shard_map(primaries=["p0:1", "p1:1", "p2:1"])
+    map_path = tmp_path / "coord" / "shard_map.json"
+    ShardMapManager(map_path).save(smap)
+    svc = CoordinatorService(_settings(tmp_path / "coord"), map_path=map_path)
+    v_before = svc.shard_map.map_version
+    async with svc.topology_lock("shard0"):
+        with pytest.raises(TopologyBusy):
+            svc.register_node(
+                NodeRegistration(
+                    node_id="f0",
+                    shard_id="shard0",
+                    address="f0:1",
+                    requested_role=NodeRole.FOLLOWER,
+                )
+            )
+    assert svc.shard_map.map_version == v_before
+    svc.register_node(  # allowed once the operation is over
+        NodeRegistration(
+            node_id="f0", shard_id="shard0", address="f0:1", requested_role=NodeRole.FOLLOWER
+        )
+    )
+    assert svc.shard_map.entries[0].follower == "f0:1"
+
+
+@pytest.mark.asyncio
+async def test_r14_failed_promotion_never_leaves_a_phantom_primary(tmp_path: Path) -> None:
+    from docstore.common.models import Heartbeat
+
+    svc = _coord_with_follower(tmp_path)
+    svc._recovery_quarantine_until_monotonic = 0.0
+    svc.register_node(NodeRegistration(node_id="p0", shard_id="shard0", address="p0:1"))
+    svc.register_node(
+        NodeRegistration(
+            node_id="f0", shard_id="shard0", address="f0:1", requested_role=NodeRole.FOLLOWER
+        )
+    )
+    svc.leases.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/internal/promote":
+            return httpx.Response(500, json={"error_code": "ERROR"})
+        return httpx.Response(200, json={"last_applied_seq": 0})
+
+    async with AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await svc.trigger_failover("shard0", http_client=client) is False
+    assert svc.nodes["f0"].role == NodeRole.FOLLOWER  # not marked primary unconfirmed
+    # A node registered as primary that heartbeats as a follower is recorded as one.
+    svc.nodes["f0"].role = NodeRole.PRIMARY
+    svc.handle_heartbeat(
+        Heartbeat(
+            node_id="f0",
+            shard_id="shard0",
+            role=NodeRole.FOLLOWER,
+            term=svc.shard_terms["shard0"],
+            last_applied_seq=0,
+            follower_acked_seq=0,
+            follower_state=ReplicaState.DOWN,
+            timestamp_monotonic=time.monotonic(),
+        )
+    )
+    assert svc.nodes["f0"].role == NodeRole.FOLLOWER
+
+
+@pytest.mark.raw_cluster_auth
+@pytest.mark.asyncio
+async def test_r6_write_epoch_must_match_exactly_and_is_required(tmp_path: Path) -> None:
+    app = build_app(
+        _settings(tmp_path),
+        node_id="p",
+        shard_id="s0",
+        lease_expires_at=float("inf"),
+        ranges=[ShardRangeConfig(start=0, end=100, ownership_epoch=3)],
+    )
+    async with LifespanManager(app):
+        h = {CLIENT_KEY_HEADER: CLIENT}
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            for extra in ({}, {"ownership_epoch": 2}, {"ownership_epoch": 999}):
+                r = await c.post(
+                    "/doc", json={"request_id": "w", "document": {"doc_id": 1}, **extra}, headers=h
+                )
+                assert r.status_code == 409 and r.json()["error_code"] == "STALE_EPOCH", extra
+            r = await c.post(
+                "/doc",
+                json={"request_id": "w", "document": {"doc_id": 1}, "ownership_epoch": 3},
+                headers=h,
+            )
+            # Epoch accepted; this primary has no follower, so replication rejects it.
+            assert r.json()["error_code"] == "REPLICATION_UNAVAILABLE"
+        assert app.state.node.wal.last_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_r9_released_range_is_no_longer_readable_on_the_source(tmp_path: Path) -> None:
+    app = _standalone(tmp_path, ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)])
+    async with LifespanManager(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            await _insert(c, {"doc_id": 150, "v": "old"}, "w")
+            assert (await c.get("/doc/150")).status_code == 200
+            raw, h = _signed("POST", "/internal/migration/release", {"start": 100, "end": 200})
+            assert (
+                await c.post("/internal/migration/release", content=raw, headers=h)
+            ).status_code == 200
+            # Stale routers now get OUT_OF_RANGE (and refresh) instead of the old copy.
+            r = await c.get("/doc/150")
+            assert r.status_code == 400 and r.json()["error_code"] == "OUT_OF_RANGE"
+            r = await c.post("/query", json={"filter": {}, "ranges": [[100, 200]]})
+            assert r.status_code == 400
+        assert app.state.node.engine.get(150) is not None  # purged later by cleanup
+
+
+@pytest.mark.asyncio
+async def test_r7_in_query_covers_every_range_of_a_multi_range_shard(tmp_path: Path) -> None:
+    a = _standalone(
+        tmp_path / "a",
+        "sa",
+        [
+            ShardRangeConfig(start=0, end=100, ownership_epoch=1),
+            ShardRangeConfig(start=200, end=KEYSPACE_END, ownership_epoch=1),
+        ],
+    )
+    b = _standalone(tmp_path / "b", "sb", [ShardRangeConfig(start=100, end=200, ownership_epoch=1)])
+    smap = ShardMap(
+        map_version=1,
+        entries=[
+            _entry("sa", 0, 100, "a:1"),
+            _entry("sb", 100, 200, "b:1"),
+            _entry("sa", 200, KEYSPACE_END, "a:1"),
+        ],
+    )
+    mgr = ShardMapManager(tmp_path / "map.json")
+    mgr.save(smap)
+    async with LifespanManager(a), LifespanManager(b):
+        ta, tb = ASGITransport(app=a), ASGITransport(app=b)
+        async with AsyncClient(transport=ta, base_url="http://t") as ca:
+            for i in (1, 201):
+                await _insert(ca, {"doc_id": i}, f"a{i}")
+        router = build_router_app(
+            _settings(tmp_path / "r"), mgr, shard_transports={"a:1": ta, "b:1": tb}
+        )
+        async with LifespanManager(router):
+            async with AsyncClient(transport=ASGITransport(app=router), base_url="http://r") as rc:
+                r = await rc.post(
+                    "/query",
+                    json={"filter": {"doc_id": {"$in": [1, 201]}}},
+                    headers={CLIENT_KEY_HEADER: CLIENT},
+                )
+    assert sorted(d["doc_id"] for d in r.json()["documents"]) == [1, 201]
+
+
+@pytest.mark.asyncio
+async def test_r8_client_retries_after_migration_return_the_original_result(tmp_path: Path) -> None:
+    coord, app0, app1 = await _migration_cluster(tmp_path)
+    async with LifespanManager(app0), LifespanManager(app1):
+        t0, t1 = ASGITransport(app=app0), ASGITransport(app=app1)
+        async with AsyncClient(transport=t0, base_url="http://node0") as c0:
+            assert (await _insert(c0, {"doc_id": 100, "v": 1}, "ins-100")).status_code == 201
+            r = await c0.put(
+                "/doc/100", json={"request_id": "upd-100", "document": {"doc_id": 100, "v": 2}}
+            )
+            assert r.status_code == 200
+            assert (await _insert(c0, {"doc_id": 101}, "ins-101")).status_code == 201
+            r = await c0.request("DELETE", "/doc/101", json={"request_id": "del-101"})
+            assert r.status_code == 200
+
+        async def write_during_catchup(phase: MigrationState) -> None:
+            if phase == MigrationState.SNAPSHOT_COPY:  # replayed through the oplog
+                async with AsyncClient(transport=t0, base_url="http://node0") as c:
+                    await _insert(c, {"doc_id": 102}, "ins-102")
+
+        rec = coord.migration_mgr.create_migration("shard0", "shard1", 100, 200, coord)
+        async with AsyncClient(mounts={"http://node0": t0, "http://node1": t1}) as client:
+            res = await coord.migration_mgr.execute_migration(
+                rec.migration_id, coord, http_client=client, on_phase_hook=write_during_catchup
+            )
+        assert res.state == MigrationState.DONE
+
+        async with AsyncClient(transport=t1, base_url="http://node1") as c1:
+            # Retries now reach the destination: original outcomes, nothing re-executed.
+            r = await _insert(c1, {"doc_id": 100, "v": 1}, "ins-100")
+            assert r.status_code == 201 and r.json()["outcome"] == "COMMITTED"
+            r = await c1.put(
+                "/doc/100", json={"request_id": "upd-100", "document": {"doc_id": 100, "v": 2}}
+            )
+            assert r.status_code == 200
+            r = await c1.request("DELETE", "/doc/101", json={"request_id": "del-101"})
+            assert r.status_code == 200  # not NOT_FOUND
+            r = await _insert(c1, {"doc_id": 102}, "ins-102")  # came through catch-up
+            assert r.status_code == 201
+        assert app1.state.node.engine.get(100) == {"doc_id": 100, "v": 2}
+        assert app1.state.node.engine.get(101) is None
+
+
+@pytest.mark.asyncio
+async def test_r17_snapshot_with_empty_ownership_is_respected_without_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docstore.storage.snapshot import SnapshotManager
+
+    monkeypatch.setenv("SHARD_RANGE_START", "0")
+    monkeypatch.setenv("SHARD_RANGE_END", str(KEYSPACE_END))
+    data_dir = tmp_path / "s0"
+    data_dir.mkdir(parents=True)
+    # Every range was migrated away, then the metadata file was lost.
+    SnapshotManager(data_dir).save(
+        documents={}, last_applied_seq=0, term=1, ownership_epochs={}, dedup_table={}
+    )
+    state = NodeState(_settings(tmp_path), node_id="n", shard_id="s0")
+    await _recover(state)
+    assert state.ranges == [] and not state.owns(5)
+
+
+def test_r18_wal_replay_streams_instead_of_loading_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "w.wal"
+    path.write_bytes(b"".join(_wal_line(s) for s in range(1, 51)) + b'{"seq": 51, "tor')
+    wal = WAL(path)
+    wal.open()
+
+    def no_full_read(self: Path) -> bytes:
+        raise AssertionError("replay must not read the whole WAL into memory")
+
+    monkeypatch.setattr(Path, "read_bytes", no_full_read)
+    assert [r["seq"] for r in wal.replay(after_seq=45)] == [46, 47, 48, 49, 50]
+    assert wal.next_seq() == 51  # torn tail dropped
+    wal.truncate_after(10)
+    assert wal.next_seq() == 11
+    monkeypatch.undo()
+    assert [r["seq"] for r in WAL(path).replay()] == list(range(1, 11))

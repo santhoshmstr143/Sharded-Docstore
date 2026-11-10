@@ -124,6 +124,7 @@ async def test_sync_replication_both_wals_durably_fsynced(tmp_path: Path) -> Non
             follower_url="127.0.0.1:8100",
             follower_state=ReplicaState.SYNCED,
             follower_transport=follower_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(primary_app):
@@ -222,6 +223,7 @@ async def test_follower_serves_reads_with_lag(tmp_path: Path) -> None:
             follower_url="127.0.0.1:8100",
             follower_state=ReplicaState.SYNCED,
             follower_transport=follower_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(primary_app):
@@ -259,6 +261,7 @@ async def test_write_rejected_when_follower_not_synced(tmp_path: Path) -> None:
         ranges=ranges,
         follower_url="127.0.0.1:8100",
         follower_state=ReplicaState.DOWN,  # follower is DOWN!
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(primary_app):
@@ -381,6 +384,7 @@ async def test_router_read_mode_follower_and_fallback(tmp_path: Path) -> None:
             follower_url="127.0.0.1:8201",
             follower_state=ReplicaState.SYNCED,
             follower_transport=f_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(primary_app):
@@ -502,6 +506,7 @@ async def test_m4_gate_replicated_cluster(tmp_path: Path) -> None:
             follower_url="127.0.0.1:8001",
             follower_state=ReplicaState.SYNCED,
             follower_transport=t_f0,
+            lease_expires_at=float("inf"),
         )
         p1_app = build_app(
             settings.model_copy(update={"DATA_DIR": str(tmp_path / "p1")}),
@@ -512,6 +517,7 @@ async def test_m4_gate_replicated_cluster(tmp_path: Path) -> None:
             follower_url="127.0.0.1:8003",
             follower_state=ReplicaState.SYNCED,
             follower_transport=t_f1,
+            lease_expires_at=float("inf"),
         )
         p2_app = build_app(
             settings.model_copy(update={"DATA_DIR": str(tmp_path / "p2")}),
@@ -522,6 +528,7 @@ async def test_m4_gate_replicated_cluster(tmp_path: Path) -> None:
             follower_url="127.0.0.1:8005",
             follower_state=ReplicaState.SYNCED,
             follower_transport=t_f2,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(p0_app), LifespanManager(p1_app), LifespanManager(p2_app):

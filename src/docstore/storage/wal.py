@@ -191,72 +191,90 @@ class WAL:
         if not self._path.exists():
             return
 
-        raw = self._path.read_bytes()
-
-        # Detect torn tail: file does not end with newline
-        if raw and not raw.endswith(b"\n"):
-            # Find the last complete record boundary
-            last_newline = raw.rfind(b"\n")
-            if last_newline == -1:
-                # No complete record at all — entire file is torn
+        # Torn tail: drop an incomplete final line (found by scanning back from the end,
+        # without reading the whole file).
+        safe_len = self._complete_prefix_len()
+        size = self._path.stat().st_size
+        if safe_len < size:
+            if safe_len == 0:
                 logger.warning(
                     "WAL %s has no complete records (torn write); truncating to empty",
                     self._path,
                 )
-                self._truncate_bytes(0)
-                return
-            # Truncate the incomplete tail
-            safe_len = last_newline + 1
-            logger.warning(
-                "WAL %s has a torn tail; truncating %d trailing bytes",
-                self._path,
-                len(raw) - safe_len,
-            )
+            else:
+                logger.warning(
+                    "WAL %s has a torn tail; truncating %d trailing bytes",
+                    self._path,
+                    size - safe_len,
+                )
             self._truncate_bytes(safe_len)
-            raw = raw[:safe_len]
+            if safe_len == 0:
+                return
 
+        # Stream line by line: memory stays bounded by one record, not the WAL size.
         max_seq = after_seq
         prev_seq: int | None = None
-        for lineno, line in enumerate(raw.splitlines(), start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise WALCorruptionError(
-                    f"WAL {self._path}: line {lineno} is not valid JSON: {exc}"
-                ) from exc
-
-            if not _check_crc(record):
-                raise WALCorruptionError(
-                    f"WAL {self._path}: line {lineno} has a bad CRC32 "
-                    f"(seq={record.get('seq')}). Node refuses to start."
-                )
-
-            seq = record.get("seq")
-            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
-                raise WALCorruptionError(
-                    f"WAL {self._path}: line {lineno} has an invalid seq {seq!r}."
-                )
-            if prev_seq is None:
-                if base_seq is not None and seq > base_seq + 1:
+        with open(self._path, "rb") as f:
+            for lineno, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
                     raise WALCorruptionError(
-                        f"WAL {self._path}: first retained seq={seq} leaves a gap after "
-                        f"snapshot seq={base_seq}."
+                        f"WAL {self._path}: line {lineno} is not valid JSON: {exc}"
+                    ) from exc
+
+                if not _check_crc(record):
+                    raise WALCorruptionError(
+                        f"WAL {self._path}: line {lineno} has a bad CRC32 "
+                        f"(seq={record.get('seq')}). Node refuses to start."
                     )
-            elif seq != prev_seq + 1:
-                kind = "duplicate/out-of-order" if seq <= prev_seq else "gap in"
-                raise WALCorruptionError(
-                    f"WAL {self._path}: line {lineno}: {kind} sequence "
-                    f"(seq={seq} after seq={prev_seq}). Node refuses to start."
-                )
-            prev_seq = seq
-            if seq > after_seq:
-                yield record
-                max_seq = max(max_seq, seq)
+
+                seq = record.get("seq")
+                if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                    raise WALCorruptionError(
+                        f"WAL {self._path}: line {lineno} has an invalid seq {seq!r}."
+                    )
+                if prev_seq is None:
+                    if base_seq is not None and seq > base_seq + 1:
+                        raise WALCorruptionError(
+                            f"WAL {self._path}: first retained seq={seq} leaves a gap after "
+                            f"snapshot seq={base_seq}."
+                        )
+                elif seq != prev_seq + 1:
+                    kind = "duplicate/out-of-order" if seq <= prev_seq else "gap in"
+                    raise WALCorruptionError(
+                        f"WAL {self._path}: line {lineno}: {kind} sequence "
+                        f"(seq={seq} after seq={prev_seq}). Node refuses to start."
+                    )
+                prev_seq = seq
+                if seq > after_seq:
+                    yield record
+                    max_seq = max(max_seq, seq)
 
         self._next_seq = max_seq + 1
+
+    def _complete_prefix_len(self, chunk: int = 64 * 1024) -> int:
+        """Byte length of the WAL up to and including its last newline."""
+        size = self._path.stat().st_size
+        if size == 0:
+            return 0
+        with open(self._path, "rb") as f:
+            f.seek(size - 1)
+            if f.read(1) == b"\n":
+                return size
+            pos = size
+            while pos > 0:
+                start = max(0, pos - chunk)
+                f.seek(start)
+                buf = f.read(pos - start)
+                idx = buf.rfind(b"\n")
+                if idx != -1:
+                    return start + idx + 1
+                pos = start
+        return 0
 
     # ── Append ────────────────────────────────────────────────────────────────
 
@@ -351,24 +369,27 @@ class WAL:
         if not self._path.exists():
             return
 
-        # Read all complete records up to and including *seq*
-        raw = self._path.read_bytes()
-        keep_lines: list[bytes] = []
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                record = json.loads(stripped)
-            except json.JSONDecodeError:
-                break  # treat as torn tail boundary
-            if record.get("seq", 0) <= seq:
-                keep_lines.append(stripped + b"\n")
-            else:
-                break  # WAL is ordered; stop once we pass seq
+        # Stream: find the byte offset just after the last record with seq <= *seq*.
+        keep_len = 0
+        offset = 0
+        with open(self._path, "rb") as f:
+            for line in f:
+                offset += len(line)
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not line.endswith(b"\n"):
+                    break  # torn tail boundary
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    break  # treat as torn tail boundary
+                if record.get("seq", 0) <= seq:
+                    keep_len = offset
+                else:
+                    break  # WAL is ordered; stop once we pass seq
 
-        keep_bytes = b"".join(keep_lines)
-        self._truncate_bytes(len(keep_bytes))
+        self._truncate_bytes(keep_len)
         self._next_seq = seq + 1
         logger.info("WAL truncated after seq=%d; next_seq=%d", seq, self._next_seq)
 
@@ -386,7 +407,18 @@ class WAL:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _truncate_bytes(self, length: int) -> None:
-        """Truncate the WAL file to *length* bytes, fsynced."""
+        """Truncate the WAL file to *length* bytes, fsynced.
+
+        Any failure leaves the on-disk state uncertain: the instance is marked failed
+        (no further appends) so the owning node fail-stops and re-runs recovery.
+        """
+        try:
+            self._truncate_bytes_unchecked(length)
+        except BaseException:
+            self._failed = True
+            raise
+
+    def _truncate_bytes_unchecked(self, length: int) -> None:
         # Must close current fd, truncate, re-open for appending
         if self._fd is not None:
             self._fd.flush()

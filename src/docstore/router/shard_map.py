@@ -31,6 +31,14 @@ from docstore.storage.wal import _fsync_dir
 
 logger = logging.getLogger(__name__)
 
+
+class MapDurabilityError(OSError):
+    """The new shard map was atomically replaced (it is VISIBLE) but making the rename
+    crash-durable (directory fsync) failed: after a power loss the old map could return.
+    Callers must treat the transition as not yet committed (e.g. never clean up a
+    migration source) until :meth:`ShardMapManager.ensure_durable` succeeds."""
+
+
 # Full key space: [0, 2^63)
 KEY_SPACE_START: int = DOC_ID_MIN
 KEY_SPACE_END: int = 2**63  # 9_223_372_036_854_775_808
@@ -127,6 +135,8 @@ class ShardMapManager:
         self.path: Path | None = Path(path) if path else None
         self.history_log_path: Path | None = Path(history_log_path) if history_log_path else None
         self._shard_map: ShardMap | None = None
+        # False between a visible os.replace() and a successful directory fsync.
+        self.durable: bool = True
         # L3: track last-saved content hash to avoid duplicate history entries
         self._last_saved_hash: str | None = None
 
@@ -195,7 +205,8 @@ class ShardMapManager:
         # with it even if the directory fsync below fails, so the two never disagree.
         self._shard_map = shard_map
         self.path = target_path
-        _fsync_dir(target_path.parent)
+        self.durable = False
+        self._make_durable(target_path)
 
         if append_history:
             # L3: only append history when the map content actually changed.
@@ -219,6 +230,28 @@ class ShardMapManager:
                     )
 
         logger.info("Saved shard map v%d atomically to %s", shard_map.map_version, target_path)
+
+    def _make_durable(self, target_path: Path) -> None:
+        last: OSError | None = None
+        for _ in range(3):
+            try:
+                _fsync_dir(target_path.parent)
+                self.durable = True
+                return
+            except OSError as exc:
+                last = exc
+        raise MapDurabilityError(f"shard map replaced but directory fsync failed: {last}") from last
+
+    def ensure_durable(self) -> None:
+        """Re-confirm that the current map file is crash-durable (file + directory fsync).
+
+        Raises :class:`MapDurabilityError` if it still cannot be confirmed.
+        """
+        if self.path is None:
+            raise MapDurabilityError("shard map has no path")
+        with open(self.path, "rb") as f:
+            os.fsync(f.fileno())
+        self._make_durable(self.path)
 
     def _append_history_log(self, shard_map: ShardMap, target_path: Path) -> None:
         """Append an entry to the append-only epoch history log."""

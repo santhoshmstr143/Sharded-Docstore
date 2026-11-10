@@ -326,14 +326,19 @@ class MigrationManager:
                     rec.last_caught_up_seq = s_seq
                     self.save_record(rec)
                 docs: list[dict[str, Any]] = page.get("documents", [])
+                # Client idempotency records for this slice of the range travel with it
+                # (sent with the page's first batch, or alone if the page has no docs).
+                dedup = page.get("dedup") or {}
+                batches = _batches_by_size(docs, batch_bytes) or ([[]] if dedup else [])
                 # Ingest into destination via normal replicated path
-                for batch in _batches_by_size(docs, batch_bytes):
+                for i, batch in enumerate(batches):
                     await _rpc(
                         f"{dest_url}/internal/migration/apply-batch",
                         {
                             "migration_id": rec.migration_id,
                             "documents": batch,
                             "source_seq": s_seq,
+                            **({"dedup": dedup} if i == 0 and dedup else {}),
                         },
                     )
                 if docs:
@@ -545,6 +550,7 @@ class MigrationManager:
                     or now_dest is None
                     or now_src.primary != src_url
                     or now_dest.primary != dest_url
+                    or now_dest.follower != dest_entry.follower
                     or now_terms != start_terms
                 ):
                     raise RuntimeError(
@@ -620,18 +626,11 @@ class MigrationManager:
                 for lk in reversed(locks):
                     lk.release()
 
-            # Activate range on destination primary AND follower. The follower's ownership
-            # metadata is mandatory: if it is missing and the destination primary later
-            # fails, the promoted follower would not own the migrated range. A failure
-            # here leaves the record in CUTOVER, and it is retried until both confirm.
-            cutover_body = {
-                "start": rec.range_start,
-                "end": rec.range_end,
-                "ownership_epoch": new_epoch,
-            }
-            await _rpc(f"{dest_url}/internal/migration/cutover", cutover_body)
-            if dest_entry.follower:
-                await _rpc(f"{dest_entry.follower}/internal/migration/cutover", cutover_body)
+            # Nothing irreversible happens until the map change is crash-durable: a visible
+            # but non-durable map could revert after a power loss, after the source had
+            # already given the range away. Raising here leaves the record in CUTOVER.
+            coord.map_mgr.ensure_durable()
+            await self._post_cutover(coord, rec, new_epoch, _rpc)
 
             # ── 7. CLEANUP ───────────────────────────────────────────────────
             rec.state = MigrationState.CLEANUP
@@ -729,6 +728,38 @@ class MigrationManager:
                 if e.shard_id == rec.from_shard:
                     return False
         return None
+
+    async def _post_cutover(
+        self, coord: CoordinatorService, rec: MigrationRecord, epoch: int, rpc: Any
+    ) -> None:
+        """Source release -> destination primary + follower activation.
+
+        1. The source durably stops owning the range (on its follower too), so a router
+           with a stale map can no longer read the old copy there (it is told
+           OUT_OF_RANGE and refreshes) — no stale reads once the destination takes writes.
+        2. The destination primary AND follower take ownership. The follower is
+           mandatory: if the destination primary later fails, the promoted follower must
+           own the range.
+        Addresses are read from the CURRENT map (a failover or follower replacement may
+        have changed them). Any failure leaves the record in CUTOVER for retry.
+        """
+        cur = coord.map_mgr.shard_map
+        src = next((e for e in cur.entries if e.shard_id == rec.from_shard), None)
+        dest = next((e for e in cur.entries if e.shard_id == rec.to_shard), None)
+        if dest is None or not dest.primary:
+            raise RuntimeError(
+                f"Destination shard {rec.to_shard} primary entry missing from shard map"
+            )
+        if src is None or not src.primary:
+            raise RuntimeError(
+                f"Source shard {rec.from_shard} primary entry missing from shard map"
+            )
+        body = {"start": rec.range_start, "end": rec.range_end}
+        await rpc(f"{src.primary}/internal/migration/release", body)
+        cutover_body = {**body, "ownership_epoch": epoch}
+        await rpc(f"{dest.primary}/internal/migration/cutover", cutover_body)
+        if dest.follower:
+            await rpc(f"{dest.follower}/internal/migration/cutover", cutover_body)
 
     async def retry_post_cutover(
         self,
@@ -833,46 +864,17 @@ class MigrationManager:
                     self.save_record(rec)
 
                     recovery_errors: list[str] = []
-
-                    if not dest_entry or not dest_entry.primary:
-                        err = (
-                            f"Destination shard {rec.to_shard} primary entry missing from shard map"
-                        )
+                    try:
+                        coord.map_mgr.ensure_durable()
+                        await self._post_cutover(coord, rec, epoch, _rpc)
+                    except Exception as exc:
+                        err = f"Post-cutover activation failed: {exc}"
                         logger.warning("%s", err)
                         recovery_errors.append(err)
-                    else:
-                        try:
-                            await _rpc(
-                                f"{dest_entry.primary}/internal/migration/cutover",
-                                {
-                                    "start": rec.range_start,
-                                    "end": rec.range_end,
-                                    "ownership_epoch": epoch,
-                                },
-                            )
-                        except Exception as exc:
-                            err = f"Cutover RPC to dest primary {dest_entry.primary} failed: {exc}"
-                            logger.warning("%s", err)
-                            recovery_errors.append(err)
 
-                    if dest_entry and dest_entry.follower:
-                        try:
-                            await _rpc(
-                                f"{dest_entry.follower}/internal/migration/cutover",
-                                {
-                                    "start": rec.range_start,
-                                    "end": rec.range_end,
-                                    "ownership_epoch": epoch,
-                                },
-                            )
-                        except Exception as exc:
-                            err = (
-                                f"Cutover RPC to dest follower {dest_entry.follower} failed: {exc}"
-                            )
-                            logger.warning("%s", err)
-                            recovery_errors.append(err)
-
-                    if not src_entry or not src_entry.primary:
+                    if recovery_errors:
+                        pass  # never clean up the source before activation succeeded
+                    elif not src_entry or not src_entry.primary:
                         err = f"Source shard {rec.from_shard} primary entry missing from shard map"
                         logger.warning("%s", err)
                         recovery_errors.append(err)

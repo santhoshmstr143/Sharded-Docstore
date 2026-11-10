@@ -130,7 +130,12 @@ async def test_divergence_same_term_and_seq_different_request_id(tmp_path: Path)
     settings = _make_settings(tmp_path / "primary")
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -193,7 +198,12 @@ async def test_divergence_same_term_seq_req_different_payload(tmp_path: Path) ->
     settings = _make_settings(tmp_path / "primary")
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -263,7 +273,12 @@ async def test_divergence_identical_entries_different_key_order(tmp_path: Path) 
     settings = _make_settings(tmp_path / "primary")
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -309,7 +324,12 @@ async def test_divergence_followed_by_later_matching_entry(tmp_path: Path) -> No
     settings = _make_settings(tmp_path / "primary")
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -394,7 +414,12 @@ async def test_divergence_normal_matching_histories(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path / "primary")
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -449,7 +474,12 @@ async def test_recovery_after_legitimate_primary_failover(tmp_path: Path) -> Non
     # 1. New primary (promoted follower) in term 2
     f_settings = _make_settings(tmp_path / "new_primary")
     new_p_app = build_app(
-        f_settings, node_id="new-primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        f_settings,
+        node_id="new-primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     # 2. Old primary: seq 1 committed, seq 2 uncommitted in term 1
@@ -559,7 +589,12 @@ async def test_rejoin_refuses_to_overwrite_committed_history_fail_closed(tmp_pat
     # New primary has seq 1 and seq 2
     f_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        f_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        f_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     # Rejoining node also COMMITTED seq 2 with different data
@@ -614,7 +649,12 @@ async def test_divergence_entry_validation_correct_fields_and_entry_id(tmp_path:
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     settings = _make_settings(tmp_path / "node")
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -672,7 +712,12 @@ async def test_divergence_entry_validation_stale_entry_id_diff_payload(tmp_path:
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     settings = _make_settings(tmp_path / "node")
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -726,7 +771,12 @@ async def test_divergence_entry_validation_stale_entry_id_diff_request_id(tmp_pa
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     settings = _make_settings(tmp_path / "node")
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -774,7 +824,12 @@ async def test_divergence_entry_validation_incorrect_supplied_entry_id(tmp_path:
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     settings = _make_settings(tmp_path / "node")
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -822,7 +877,12 @@ async def test_divergence_entry_validation_missing_required_fields_fails_closed(
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     settings = _make_settings(tmp_path / "node")
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -867,7 +927,12 @@ async def test_divergence_legacy_record_without_entry_id(tmp_path: Path) -> None
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     settings = _make_settings(tmp_path / "node")
     app = build_app(
-        settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -918,7 +983,12 @@ async def test_snapshot_resync_below_local_committed_seq_rejected(tmp_path: Path
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     r_settings = _make_settings(tmp_path / "follower")
@@ -985,7 +1055,12 @@ async def test_snapshot_resync_equal_to_local_committed_seq_safe(tmp_path: Path)
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     r_settings = _make_settings(tmp_path / "follower")
@@ -1044,7 +1119,12 @@ async def test_snapshot_resync_above_local_committed_seq_succeeds(tmp_path: Path
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     r_settings = _make_settings(tmp_path / "follower")
@@ -1107,7 +1187,12 @@ async def test_failed_snapshot_validation_does_not_notify_primary(tmp_path: Path
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     r_settings = _make_settings(tmp_path / "follower")
@@ -1175,7 +1260,12 @@ async def test_snapshot_recovery_persists_snapshot_and_reconstructs_on_restart(
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     f_dir = tmp_path / "follower"
@@ -1274,7 +1364,12 @@ async def test_snapshot_persistence_failure_fails_closed_without_truncation(tmp_
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     f_dir = tmp_path / "follower"
@@ -1345,7 +1440,12 @@ async def test_wal_truncation_occurs_only_after_durable_snapshot_save(tmp_path: 
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
     p_settings = _make_settings(tmp_path / "primary")
     primary_app = build_app(
-        p_settings, node_id="primary", shard_id="shard0", role=NodeRole.PRIMARY, ranges=ranges
+        p_settings,
+        node_id="primary",
+        shard_id="shard0",
+        role=NodeRole.PRIMARY,
+        ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     f_dir = tmp_path / "follower"
@@ -1438,6 +1538,7 @@ async def test_directory_fsync_failure_during_snapshot_resync(
         role=NodeRole.PRIMARY,
         follower_url="follower",
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+        lease_expires_at=float("inf"),
     )
     follower_app = build_app(
         f_settings,
@@ -1539,6 +1640,7 @@ async def test_snapshot_newer_ownership_epoch_updates_runtime_ranges(tmp_path: P
         role=NodeRole.PRIMARY,
         follower_url="follower",
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=5)],
+        lease_expires_at=float("inf"),
     )
     follower_app = build_app(
         f_settings,
@@ -1650,6 +1752,7 @@ async def test_snapshot_incompatible_range_mapping_fails_closed(tmp_path: Path) 
         role=NodeRole.PRIMARY,
         follower_url="follower",
         ranges=[ShardRangeConfig(start=0, end=500, ownership_epoch=2)],
+        lease_expires_at=float("inf"),
     )
     follower_app = build_app(
         f_settings,
@@ -1759,6 +1862,7 @@ async def test_ownership_epochs_consistent_between_snapshot_runtime_and_metadata
         role=NodeRole.PRIMARY,
         follower_url="follower",
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=7)],
+        lease_expires_at=float("inf"),
     )
     follower_app = build_app(
         f_settings,
@@ -2033,7 +2137,7 @@ async def test_recovery_metadata_directory_fsync_failure_not_ready(
             {
                 "term": 1,
                 "role": "follower",
-                "committed_seq": 1,
+                "committed_seq": 0,  # nothing committed yet: no WAL/snapshot needed
                 "ranges": [{"start": 0, "end": 1000, "ownership_epoch": 9}],
             }
         )
@@ -2377,6 +2481,7 @@ async def test_recovery_metadata_persistence_fsync_atomic_replacement_and_reload
         shard_id="shard1",
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=5)],
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):

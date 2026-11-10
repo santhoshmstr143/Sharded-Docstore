@@ -48,7 +48,9 @@ def sec_settings(tmp_path: Path) -> Settings:
 async def test_internal_rpc_rejects_missing_signature(sec_settings: Settings) -> None:
     """Every /internal/* endpoint must reject requests missing X-Cluster-Signature."""
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
-    shard_app = build_app(sec_settings, node_id="n1", shard_id="shard0", ranges=ranges)
+    shard_app = build_app(
+        sec_settings, node_id="n1", shard_id="shard0", ranges=ranges, lease_expires_at=float("inf")
+    )
 
     async with AsyncClient(
         transport=ASGITransport(app=shard_app), base_url="http://shard"
@@ -73,7 +75,9 @@ async def test_internal_rpc_rejects_missing_signature(sec_settings: Settings) ->
 async def test_internal_rpc_rejects_tampered_payload(sec_settings: Settings) -> None:
     """Tampering with body bytes after computing signature causes 401 AUTH_FAILED."""
     ranges = [ShardRangeConfig(start=0, end=1000, ownership_epoch=1)]
-    shard_app = build_app(sec_settings, node_id="n1", shard_id="shard0", ranges=ranges)
+    shard_app = build_app(
+        sec_settings, node_id="n1", shard_id="shard0", ranges=ranges, lease_expires_at=float("inf")
+    )
 
     original_body = b'{"op": "insert", "doc_id": 10}'
     valid_sig = compute_signature(sec_settings.CLUSTER_SECRET, original_body)

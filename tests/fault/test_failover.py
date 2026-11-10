@@ -141,6 +141,7 @@ async def test_promotion_procedure_and_degraded_mode(tmp_path: Path) -> None:
             follower_url="127.0.0.1:8201",
             follower_state=ReplicaState.SYNCED,
             follower_transport=follower_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(primary_app):
@@ -266,6 +267,7 @@ async def test_old_primary_rejoin_divergence_truncation_resync(tmp_path: Path) -
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=ranges,
+        lease_expires_at=float("inf"),
     )
 
     follower_dir = tmp_path / "promoted_follower"
@@ -311,6 +313,7 @@ async def test_old_primary_rejoin_divergence_truncation_resync(tmp_path: Path) -
                     "term": 2,
                     "ownership_epochs": {"0-1000": 2},
                     "follower_url": "127.0.0.1:8200",
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                 },
                 headers=_sig_headers(
                     {
@@ -318,6 +321,7 @@ async def test_old_primary_rejoin_divergence_truncation_resync(tmp_path: Path) -
                         "term": 2,
                         "ownership_epochs": {"0-1000": 2},
                         "follower_url": "127.0.0.1:8200",
+                        "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                     }
                 ),
             )
@@ -474,6 +478,7 @@ async def test_crash_point_2_after_primary_fsync(tmp_path: Path) -> None:
             ranges=ranges,
             follower_url="127.0.0.1:8201",
             follower_transport=f_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(p_app):
@@ -522,6 +527,7 @@ async def test_crash_point_3_after_follower_fsync_before_ack(tmp_path: Path) -> 
             ranges=ranges,
             follower_url="127.0.0.1:8201",
             follower_transport=f_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(p_app):
@@ -580,6 +586,7 @@ async def test_crash_point_4_after_follower_ack_before_client_ack(tmp_path: Path
             ranges=ranges,
             follower_url="127.0.0.1:8201",
             follower_transport=f_transport,
+            lease_expires_at=float("inf"),
         )
 
         async with LifespanManager(p_app):
@@ -700,6 +707,7 @@ async def test_m5_gate_repeat_failovers_zero_data_loss(tmp_path: Path) -> None:
         role=NodeRole.PRIMARY,
         ranges=ranges,
         follower_url="127.0.0.1:8201",
+        lease_expires_at=float("inf"),
     )
     app_b = build_app(
         settings.model_copy(update={"DATA_DIR": str(dir_b)}),
@@ -747,6 +755,7 @@ async def test_m5_gate_repeat_failovers_zero_data_loss(tmp_path: Path) -> None:
                         "term": new_term,
                         "ownership_epochs": {"0-10000": cycle + 1},
                         "follower_url": curr_p_addr,
+                        "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                     },
                     headers=_sig_headers(
                         {
@@ -754,6 +763,7 @@ async def test_m5_gate_repeat_failovers_zero_data_loss(tmp_path: Path) -> None:
                             "term": new_term,
                             "ownership_epochs": {"0-10000": cycle + 1},
                             "follower_url": curr_p_addr,
+                            "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                         }
                     ),
                 )

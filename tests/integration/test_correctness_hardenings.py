@@ -119,6 +119,7 @@ async def test_rejoin_complete_stale_term_rejected(tmp_path: Path) -> None:
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -154,6 +155,7 @@ async def test_rejoin_complete_sequence_lag_rejected(tmp_path: Path) -> None:
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -190,6 +192,7 @@ async def test_rejoin_complete_stale_epoch_rejected(tmp_path: Path) -> None:
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=5)],
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -226,6 +229,7 @@ async def test_rejoin_complete_healthy_follower_synced(tmp_path: Path) -> None:
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=2)],
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):
@@ -394,6 +398,7 @@ async def test_migration_oplog_compacted_cursor_returns_needs_snapshot(tmp_path:
         shard_id="shard0",
         role=NodeRole.PRIMARY,
         ranges=[ShardRangeConfig(start=0, end=1000, ownership_epoch=1)],
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app):

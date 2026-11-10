@@ -60,7 +60,7 @@ Errors return JSON and **never expose stack traces**:
 | `LENGTH_REQUIRED` | 411 | Chunked (`Transfer-Encoding`) request bodies are not accepted |
 | `VALIDATION_ERROR` | 422 | Pydantic payload schema validation failure |
 | `DUPLICATE_KEY` | 409 | Document with specified `doc_id` already exists |
-| `STALE_EPOCH` | 409 | Write was routed with an `ownership_epoch` older than the shard's epoch for that range |
+| `STALE_EPOCH` | 409 | Write's `ownership_epoch` is missing (cluster mode) or differs from the shard's epoch for that range |
 | `STALE_TERM` | 409 | Request `term` differs from the node's current term (stale leader or stale client) |
 | `WRONG_SHARD` | 409 | Internal RPC carried a `shard_id` that does not match the receiving node |
 | `NOT_PRIMARY` | 409 | Write or primary read routed to non-primary replica |
@@ -73,6 +73,7 @@ Errors return JSON and **never expose stack traces**:
 | `ROUTING_FAILED` | 500 | Router exceeded retry limit during map recovery |
 | `RESULT_TOO_LARGE` | 413 | A query would pull more than 32 MB of shard responses; reduce `skip`/`limit` or narrow the filter |
 | `FAILOVER_IN_PROGRESS` | 503 | (Coordinator `/heartbeat`) the shard is failing over; its old primary's lease is not renewed |
+| `TOPOLOGY_BUSY` | 503 | (Coordinator `/register`) a failover or migration is changing this shard's topology; the node retries registration |
 
 #### Router retries and write fencing
 
@@ -82,7 +83,10 @@ Errors return JSON and **never expose stack traces**:
 - Every retry reuses the **same `request_id`**, so a write that already committed is
   answered from the shard's dedup table instead of executing twice.
 - Every forwarded write carries the `ownership_epoch` of the map entry it was routed by.
-  The primary rejects it with `STALE_EPOCH` if it holds a newer epoch for that range.
+  The epoch must **equal** the shard's epoch for that range: an older one means the router's
+  map is stale, a newer one means the shard's metadata is behind. Either way the shard
+  answers `STALE_EPOCH` and the router refreshes its map. In cluster mode a write with no
+  epoch is rejected too (standalone nodes accept it).
   Clients may additionally pin a shard `term` in write bodies; the primary rejects it with
   `STALE_TERM` if its own term differs.
 
@@ -366,6 +370,10 @@ Sent by the coordinator during failover. Body is strictly validated:
 }
 ```
 
+- `shard_id`, `term` and `lease` are **required** (missing → `422`), and so is either
+  `ranges` or `ownership_epochs` (`409 INVALID_PROMOTION`). A lease grant that is missing,
+  malformed or expired (`expires_at <= granted_at`) → `409 INVALID_LEASE`; a promotion never
+  confers authority without a coordinator lease.
 - `term` lower than the node's term → `409 STALE_TERM`.
 - The coordinator checks the target first: a follower that its primary last reported as not
   `SYNCED`, or that is behind the primary's last reported sequence number, is not promoted
@@ -392,8 +400,23 @@ Sent by the coordinator during failover. Body is strictly validated:
   is detected by its deterministic per-document request id and is not re-appended
   (`skipped` in the response). Rejected with 503 while the destination has unresolved
   pending writes.
+- Snapshot pages also carry `dedup`: the committed client idempotency records for the
+  document ids in that page's interval. `apply-batch` imports them on the destination, and
+  `apply-oplog` keeps each replayed operation's original `request_id`, so a client retry
+  after cutover returns the original result.
+- `POST /internal/migration/release` — source side of cutover: the source (and its follower)
+  durably stops owning the range **before** the destination takes writes, so stale-map
+  reads get `OUT_OF_RANGE` instead of the old copy. Documents are purged later by `/cleanup`.
 - `POST /internal/migration/cutover`, `/cleanup`, `/ranges/remove` — range ownership
   changes are persisted to `node_metadata.json` **before** they take effect.
+- Migration copy, catch-up and purge writes are rejected (`503`) on a cluster-mode node with
+  no follower; they are never committed locally only.
+
+### 4.6 Replica membership (`POST /internal/follower`)
+
+Coordinator → primary when a new follower registers: `{"shard_id", "follower_url"}`. The
+primary switches replication to the new address with the replica marked `DOWN`; its
+recovery loop resyncs the follower and only a successful rejoin makes it `SYNCED`.
 
 ---
 

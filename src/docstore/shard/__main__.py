@@ -20,7 +20,6 @@ Environment variables (all required unless defaults are noted):
 from __future__ import annotations
 
 import os
-import time
 
 import uvicorn
 
@@ -57,8 +56,9 @@ def main() -> None:
         )
         initial_lease: float | None = float("inf")
     else:
-        # Give a short initial lease; the heartbeat task will renew it.
-        initial_lease = time.monotonic() + settings.LEASE_DURATION_S
+        # No authority until the coordinator grants a lease at registration: a node must
+        # never accept writes (or primary reads) on a lease it gave itself.
+        initial_lease = 0.0
 
     app = build_app(
         settings,

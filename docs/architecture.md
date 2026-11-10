@@ -40,6 +40,7 @@ Sharded-Docstore is a distributed, horizontally partitioned document store inspi
 ### 1.2 Coordinator (Cluster Topology & Leases)
 - **Role:** Authoritative owner of the persistent cluster shard map, node registrations, and primary leader leases.
 - **Lease Manager:** Grants time-bounded leases (`L = 3.0s`) to shard primaries based on periodic heartbeats (`H = 1.0s`), verified using monotonic local clocks.
+- **Lease-only authority:** nodes start without a lease and register immediately; only a coordinator grant makes a primary writable. Empty nodes are never made primary of a shard known to hold data (`initialized_shards.json`).
 - **Fencing Authority:** Bumps `map_version` on topology changes, increments per-range `ownership_epoch` on repartitioning or failover, and increments per-shard `term` on leader changes.
 - **Crash-safe topology changes:** failovers are recorded as durable intents before the map changes; a per-shard topology lock serialises failover with migration cutover; migrations stuck past cutover are retried by the health monitor.
 

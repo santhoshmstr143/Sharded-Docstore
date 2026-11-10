@@ -42,6 +42,8 @@ class DedupEntry:
     term: int = 1
     created_at: float = field(default_factory=time.time)
     fingerprint: str | None = None
+    # Document the request touched: lets migration carry a range's idempotency history.
+    doc_id: int | None = None
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -267,6 +269,7 @@ class StorageEngine:
                 "term": e.term,
                 "created_at": e.created_at,
                 "fingerprint": e.fingerprint,
+                "doc_id": e.doc_id,
             }
             for rid, e in self._dedup.items()
         }
@@ -283,6 +286,7 @@ class StorageEngine:
                 term=v.get("term", 1),
                 created_at=v.get("created_at", now),
                 fingerprint=v.get("fingerprint"),
+                doc_id=v.get("doc_id"),
             )
             # Skip entries older than TTL
             if now - entry.created_at <= _DEDUP_TTL_S:

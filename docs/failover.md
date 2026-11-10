@@ -103,4 +103,8 @@ When an old crashed primary restarts, it must never resume as primary from its s
 | **Unrelated 409 on heartbeat** | Ignored; a primary steps down only on `STALE_TERM`. |
 | **WAL write/fsync fails on a node** | The node fail-stops: it stops serving (`NODE_NOT_READY`), heartbeating and holding a lease, so the coordinator fails over; the client gets `OUTCOME_UNKNOWN` and retries with the same `request_id`. |
 | **Follower is unsynced when the primary dies** | No automatic promotion (it could lose writes); the shard waits for the primary or an operator's forced failover. |
+| **Primary's data directory is wiped** | It restarts empty; the coordinator knows the shard holds data and registers it as a follower, promotes the replica, and the empty node is rebuilt by snapshot resync. |
+| **Promotion response lost / RPC fails** | The coordinator only records the new primary once promotion is confirmed (no phantom primary); a node heartbeating as a follower is recorded as one. Promotions without a valid lease grant are refused by the node. |
+| **New follower registers in an empty slot** | The coordinator pushes the address to the primary (`/internal/follower`), which resyncs it; it is `SYNCED` only after a successful rejoin. |
+| **Follower crashed between WAL append and apply** | It never acknowledges an entry (duplicate replication or reconciliation check) before applying it and durably recording it as committed. |
 | **Promotion target never confirms** | Retried, then abandoned after 30 attempts so the shard can fail over to the other replica. |

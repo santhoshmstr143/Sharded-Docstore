@@ -128,9 +128,15 @@ async def test_router_crud_and_routing(tmp_path: Path) -> None:
     r1 = [ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)]
     r2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
-    app0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=r0)
-    app1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=r1)
-    app2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=r2)
+    app0 = build_app(
+        settings, node_id="node0", shard_id="shard0", ranges=r0, lease_expires_at=float("inf")
+    )
+    app1 = build_app(
+        settings, node_id="node1", shard_id="shard1", ranges=r1, lease_expires_at=float("inf")
+    )
+    app2 = build_app(
+        settings, node_id="node2", shard_id="shard2", ranges=r2, lease_expires_at=float("inf")
+    )
 
     async with LifespanManager(app0), LifespanManager(app1), LifespanManager(app2):
         transports = {
@@ -222,9 +228,15 @@ async def test_router_boundary_keys(tmp_path: Path) -> None:
     r1 = [ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)]
     r2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
-    app0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=r0)
-    app1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=r1)
-    app2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=r2)
+    app0 = build_app(
+        settings, node_id="node0", shard_id="shard0", ranges=r0, lease_expires_at=float("inf")
+    )
+    app1 = build_app(
+        settings, node_id="node1", shard_id="shard1", ranges=r1, lease_expires_at=float("inf")
+    )
+    app2 = build_app(
+        settings, node_id="node2", shard_id="shard2", ranges=r2, lease_expires_at=float("inf")
+    )
 
     async with LifespanManager(app0), LifespanManager(app1), LifespanManager(app2):
         transports = {
@@ -272,9 +284,15 @@ async def test_router_idempotency_pass_through(tmp_path: Path) -> None:
     r1 = [ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)]
     r2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
-    app0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=r0)
-    app1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=r1)
-    app2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=r2)
+    app0 = build_app(
+        settings, node_id="node0", shard_id="shard0", ranges=r0, lease_expires_at=float("inf")
+    )
+    app1 = build_app(
+        settings, node_id="node1", shard_id="shard1", ranges=r1, lease_expires_at=float("inf")
+    )
+    app2 = build_app(
+        settings, node_id="node2", shard_id="shard2", ranges=r2, lease_expires_at=float("inf")
+    )
 
     async with LifespanManager(app0), LifespanManager(app1), LifespanManager(app2):
         transports = {
@@ -314,9 +332,15 @@ async def test_router_stale_map_refresh_and_retry(tmp_path: Path) -> None:
     r1 = [ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)]
     r2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
-    app0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=r0)
-    app1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=r1)
-    app2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=r2)
+    app0 = build_app(
+        settings, node_id="node0", shard_id="shard0", ranges=r0, lease_expires_at=float("inf")
+    )
+    app1 = build_app(
+        settings, node_id="node1", shard_id="shard1", ranges=r1, lease_expires_at=float("inf")
+    )
+    app2 = build_app(
+        settings, node_id="node2", shard_id="shard2", ranges=r2, lease_expires_at=float("inf")
+    )
 
     async with LifespanManager(app0), LifespanManager(app1), LifespanManager(app2):
         transports = {
@@ -381,9 +405,15 @@ async def test_m2_gate_1000_docs_distribution_and_restart(tmp_path: Path) -> Non
     r2 = [ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)]
 
     # ── Phase 1: Boot cluster, insert 1000 docs ───────────────────────────────
-    app0 = build_app(settings, node_id="node0", shard_id="shard0", ranges=r0)
-    app1 = build_app(settings, node_id="node1", shard_id="shard1", ranges=r1)
-    app2 = build_app(settings, node_id="node2", shard_id="shard2", ranges=r2)
+    app0 = build_app(
+        settings, node_id="node0", shard_id="shard0", ranges=r0, lease_expires_at=float("inf")
+    )
+    app1 = build_app(
+        settings, node_id="node1", shard_id="shard1", ranges=r1, lease_expires_at=float("inf")
+    )
+    app2 = build_app(
+        settings, node_id="node2", shard_id="shard2", ranges=r2, lease_expires_at=float("inf")
+    )
 
     doc_ids: list[int] = []
 
@@ -464,9 +494,15 @@ async def test_m2_gate_1000_docs_distribution_and_restart(tmp_path: Path) -> Non
                 assert d.status_code == 200
 
     # ── Phase 2: Restart all nodes & router -> verify persistence ─────────────
-    app0_reboot = build_app(settings, node_id="node0", shard_id="shard0", ranges=r0)
-    app1_reboot = build_app(settings, node_id="node1", shard_id="shard1", ranges=r1)
-    app2_reboot = build_app(settings, node_id="node2", shard_id="shard2", ranges=r2)
+    app0_reboot = build_app(
+        settings, node_id="node0", shard_id="shard0", ranges=r0, lease_expires_at=float("inf")
+    )
+    app1_reboot = build_app(
+        settings, node_id="node1", shard_id="shard1", ranges=r1, lease_expires_at=float("inf")
+    )
+    app2_reboot = build_app(
+        settings, node_id="node2", shard_id="shard2", ranges=r2, lease_expires_at=float("inf")
+    )
 
     async with (
         LifespanManager(app0_reboot),

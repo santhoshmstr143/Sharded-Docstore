@@ -120,6 +120,7 @@ async def run_throughput_latency_suite(results_dir: Path, raw_dir: Path) -> list
                 role=NodeRole.PRIMARY,
                 ranges=ranges,
                 follower_url=f"127.0.0.1:{8201 + i * 2}",
+                lease_expires_at=float("inf"),
             )
             app_f = build_app(
                 settings.model_copy(update={"DATA_DIR": str(tmp_path / f"f{i}")}),
@@ -296,6 +297,7 @@ async def run_query_comparison_suite(results_dir: Path, raw_dir: Path) -> list[d
                 role=NodeRole.PRIMARY,
                 ranges=ranges,
                 follower_url=f"127.0.0.1:{8201 + i * 2}",
+                lease_expires_at=float("inf"),
             )
             app_f = build_app(
                 settings.model_copy(update={"DATA_DIR": str(tmp_path / f"f{i}")}),
@@ -514,6 +516,7 @@ async def run_failover_recovery_suite(
                 role=NodeRole.PRIMARY,
                 ranges=ranges,
                 follower_url="127.0.0.1:8201",
+                lease_expires_at=float("inf"),
             )
             app_b = build_app(
                 settings.model_copy(update={"DATA_DIR": str(dir_b)}),
@@ -535,7 +538,11 @@ async def run_failover_recovery_suite(
                 )
 
                 # Seed one write before crash
-                init_body = {"request_id": f"init-{run_idx}", "document": {"doc_id": 10, "v": 1}}
+                init_body = {
+                    "request_id": f"init-{run_idx}",
+                    "document": {"doc_id": 10, "v": 1},
+                    "ownership_epoch": app_a.state.node.epoch_for(10),
+                }
                 async with AsyncClient(transport=trans_a, base_url="http://node-a") as ca:
                     await ca.post(
                         "/doc",
@@ -556,6 +563,8 @@ async def run_failover_recovery_suite(
                         "term": 2,
                         "ownership_epochs": {"0-10000": 2},
                         "follower_url": "127.0.0.1:8200",
+                        # The coordinator's lease grant (only the duration matters).
+                        "lease": {"granted_at": 0.0, "expires_at": 3600.0},
                     }
                     prom_resp = await cb.post(
                         "/internal/promote",
@@ -570,7 +579,11 @@ async def run_failover_recovery_suite(
                     t_first_read = time.perf_counter()
 
                     # Writes should be rejected during degraded mode
-                    deg_body = {"request_id": f"deg-{run_idx}", "document": {"doc_id": 20, "v": 2}}
+                    deg_body = {
+                        "request_id": f"deg-{run_idx}",
+                        "document": {"doc_id": 20, "v": 2},
+                        "ownership_epoch": app_b.state.node.epoch_for(20),
+                    }
                     r_deg = await cb.post(
                         "/doc",
                         json=deg_body,
@@ -594,7 +607,11 @@ async def run_failover_recovery_suite(
                 )
 
                 # Now write should succeed on new primary
-                succ_body = {"request_id": f"succ-{run_idx}", "document": {"doc_id": 20, "v": 2}}
+                succ_body = {
+                    "request_id": f"succ-{run_idx}",
+                    "document": {"doc_id": 20, "v": 2},
+                    "ownership_epoch": app_b.state.node.epoch_for(20),
+                }
                 async with AsyncClient(transport=trans_b, base_url="http://promoted") as cb:
                     r_write = await cb.post(
                         "/doc",
@@ -693,6 +710,7 @@ async def run_migration_metrics_suite(results_dir: Path, raw_dir: Path) -> list[
                 shard_id="shard0",
                 role=NodeRole.PRIMARY,
                 ranges=[ShardRangeConfig(start=0, end=100000, ownership_epoch=1)],
+                lease_expires_at=float("inf"),
             )
             app_s1 = build_app(
                 settings.model_copy(update={"DATA_DIR": str(shard1_dir)}),
@@ -700,6 +718,7 @@ async def run_migration_metrics_suite(results_dir: Path, raw_dir: Path) -> list[
                 shard_id="shard1",
                 role=NodeRole.PRIMARY,
                 ranges=[ShardRangeConfig(start=100000, end=KEY_SPACE_END, ownership_epoch=1)],
+                lease_expires_at=float("inf"),
             )
 
             trans_s0 = ASGITransport(app=app_s0)

@@ -234,6 +234,7 @@ async def test_invisibility_invariant_before_cutover(tmp_path: Path) -> None:
         node_id="dest-node",
         shard_id="shard1",
         ranges=dest_ranges,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(dest_app):
@@ -348,12 +349,14 @@ async def test_live_migration_concurrent_writes_and_catchup(tmp_path: Path) -> N
         node_id="n0",
         shard_id="shard0",
         ranges=ranges0,
+        lease_expires_at=float("inf"),
     )
     app1 = build_app(
         settings.model_copy(update={"DATA_DIR": str(dir1)}),
         node_id="n1",
         shard_id="shard1",
         ranges=ranges1,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app0), LifespanManager(app1):
@@ -477,12 +480,14 @@ async def test_pause_and_router_retry_transparent_cutover(tmp_path: Path) -> Non
         node_id="pn0",
         shard_id="shard0",
         ranges=ranges0,
+        lease_expires_at=float("inf"),
     )
     app1 = build_app(
         settings.model_copy(update={"DATA_DIR": str(dir1)}),
         node_id="pn1",
         shard_id="shard1",
         ranges=ranges1,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app0), LifespanManager(app1):
@@ -592,12 +597,14 @@ async def test_abort_before_cutover_safe(tmp_path: Path) -> None:
         node_id="ab0",
         shard_id="shard0",
         ranges=ranges0,
+        lease_expires_at=float("inf"),
     )
     app1 = build_app(
         settings.model_copy(update={"DATA_DIR": str(dir1)}),
         node_id="ab1",
         shard_id="shard1",
         ranges=ranges1,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app0), LifespanManager(app1):
@@ -686,12 +693,14 @@ async def test_m6_gate_migration_under_workload_checksum_verified(tmp_path: Path
         node_id="gate0",
         shard_id="shard0",
         ranges=ranges0,
+        lease_expires_at=float("inf"),
     )
     app1 = build_app(
         settings.model_copy(update={"DATA_DIR": str(dir1)}),
         node_id="gate1",
         shard_id="shard1",
         ranges=ranges1,
+        lease_expires_at=float("inf"),
     )
 
     async with LifespanManager(app0), LifespanManager(app1):

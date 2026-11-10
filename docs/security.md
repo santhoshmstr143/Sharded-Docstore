@@ -44,7 +44,8 @@ Sharded-Docstore enforces defense-in-depth authentication using three distinct c
 3. **Coordinator Admin Token (`ADMIN_TOKEN`):**
    - Transmitted in the `X-Admin-Token` HTTP header.
    - Strictly isolates administrative actions (`GET /admin/status`, `POST /admin/migrate`, `POST /admin/failover/{shard}`, and the topology view `GET /shardmap`) from general cluster secret RPCs.
-4. **Secret hygiene:** settings refuse to start with the placeholder values from `.env.example` (anything containing `change-me`), in addition to the minimum lengths (32 / 32 / 16).
+4. **No self-granted authority:** a shard node only holds primary authority while it has a lease granted by the coordinator; promotion requests must carry the shard id, term, ownership and a valid lease grant. A shared cluster secret therefore cannot be used to make a node primary with an incomplete request.
+5. **Secret hygiene:** settings refuse to start with the placeholder values from `.env.example` (anything containing `change-me`), in addition to the minimum lengths (32 / 32 / 16).
 
 ---
 

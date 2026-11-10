@@ -527,8 +527,14 @@ the same methods is also available.
   (served only while the primary holds a valid lease) see every committed write; follower reads
   may lag and report `replication_lag`.
 - **Fencing:** every primary change increments the shard's **term**; followers reject writes
-  from an older term, and a primary stops writing when its lease runs out. Every routed write also
-  carries the range's **ownership epoch**, so writes routed with an outdated map are rejected.
+  from an older term, and a primary stops writing when its lease runs out. A node holds a lease
+  **only** when the coordinator grants one — it starts without one and registers at once, so
+  a freshly started primary rejects writes for up to one heartbeat interval. Every routed
+  write carries the range's **ownership epoch**, which must match the shard's exactly; writes
+  routed with an outdated map are rejected and the router refreshes.
+- **Lost data directory:** a node that starts with an empty data directory is never made
+  primary of a shard that already holds data; it becomes a follower and is rebuilt from the
+  replica.
 - **Failover:** if a primary stops heartbeating for `D` seconds, the coordinator waits until its
   lease has surely expired (+`M`), records the failover durably, bumps the term and epochs, and
   promotes the follower. A follower that is known to be out of sync is not promoted automatically.
@@ -562,7 +568,7 @@ make check            # lint-check + typecheck + security + audit + test-fast
 
 Or run pytest directly, e.g. `.venv/bin/pytest tests/integration/test_bugs.py -v`.
 
-The suite has **416 tests**: 415 pass and 1 Docker smoke test
+The suite has **437 tests**: 436 pass and 1 Docker smoke test
 (`tests/integration/test_smoke_docker.py`) is skipped unless a live cluster is running on
 `127.0.0.1:8000`. `tests/integration/test_bugs.py` holds the regression tests for the bugs fixed
 during the code reviews. `tests/conftest.py` contains a small, documented test-only adapter that
@@ -610,7 +616,8 @@ docs/            design and API documentation, report
 | Startup error mentioning the `.env.example` **placeholder** | Replace the `change-me` secrets in `.env` with generated values. |
 | Startup error about **`H < L < D`** or **`T + M < L - H`** | Your timing variables violate the lease constraints; restore the defaults or adjust them. |
 | `401 AUTH_FAILED` | Missing/wrong `X-Api-Key` (data) or `X-Admin-Token` (admin), or nodes started with different `CLUSTER_SECRET`s. |
-| Writes fail with `409 LEASE_EXPIRED` | The primary cannot renew its lease: is the coordinator running and is `COORDINATOR_URL` set on the shard nodes? |
+| Writes fail with `409 LEASE_EXPIRED` | The primary has no coordinator lease: is the coordinator running and is `COORDINATOR_URL` set on the shard nodes? Right after a node starts this is normal for about one heartbeat interval. |
+| Writes sent straight to a shard fail with `409 STALE_EPOCH` | In cluster mode every write must carry the range's current `ownership_epoch` (the router adds it). Send writes through the router. |
 | Writes fail with `503 REPLICATION_UNAVAILABLE` | The shard's follower is down or still catching up (e.g. right after a failover). Reads keep working; writes resume once the follower is `SYNCED`. |
 | A node returns `503 NODE_NOT_READY` / refuses to start | Its local data failed a safety check (corrupt WAL, sequence gap, or a node data directory from an older build). Check its log; for old development data, delete the node's data directory (`rm -rf data/...`, or `make reset` with Docker). |
 | A shard never gets a primary after restarting everything | Startup takes a few seconds: the coordinator waits for old leases to expire (`L + M`) and for failure detection (`D`) before promoting. Watch `GET /admin/status`. |

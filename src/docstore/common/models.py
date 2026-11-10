@@ -334,6 +334,10 @@ class NodeRegistration(BaseModel):
     shard_id: str
     address: str = Field(description="host:port for reaching this node.")
     requested_role: NodeRole | None = Field(default=None)
+    fresh_state: bool = Field(
+        default=False,
+        description="Node started with an empty data directory (no metadata/snapshot/WAL).",
+    )
 
 
 class RegistrationResponse(BaseModel):

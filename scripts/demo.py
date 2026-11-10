@@ -145,6 +145,7 @@ async def run_demo(fast: bool = True) -> None:
             shard_id="shard0",
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=0, end=_S1, ownership_epoch=1)],
+            lease_expires_at=float("inf"),
         )
         app_s0_f = build_app(
             make_node_settings("node0-follower"),
@@ -161,6 +162,7 @@ async def run_demo(fast: bool = True) -> None:
             shard_id="shard1",
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=_S1, end=_S2, ownership_epoch=1)],
+            lease_expires_at=float("inf"),
         )
         app_s1_f = build_app(
             make_node_settings("node1-follower"),
@@ -177,6 +179,7 @@ async def run_demo(fast: bool = True) -> None:
             shard_id="shard2",
             role=NodeRole.PRIMARY,
             ranges=[ShardRangeConfig(start=_S2, end=KEY_SPACE_END, ownership_epoch=1)],
+            lease_expires_at=float("inf"),
         )
         app_s2_f = build_app(
             make_node_settings("node2-follower"),
@@ -441,6 +444,8 @@ async def run_demo(fast: bool = True) -> None:
             json={
                 "request_id": "deg-test-01",
                 "document": {"doc_id": 1999, "data": "should_fail"},
+                # Direct node writes carry the range's ownership epoch, as the router does.
+                "ownership_epoch": app_s0_f.state.node.epoch_for(1999),
             },
             headers=_sig_headers(),
         )
@@ -464,7 +469,11 @@ async def run_demo(fast: bool = True) -> None:
         )
         fenced_write = await old_p_client.post(
             "/doc",
-            json={"request_id": "fenced-req-1", "document": {"doc_id": 1000, "data": "bad"}},
+            json={
+                "request_id": "fenced-req-1",
+                "document": {"doc_id": 1000, "data": "bad"},
+                "ownership_epoch": 1,  # what a client with the pre-failover map would send
+            },
             headers=_sig_headers(),
         )
         assert fenced_write.status_code != 201, "Old primary must not accept writes!"
@@ -495,6 +504,7 @@ async def run_demo(fast: bool = True) -> None:
             json={
                 "request_id": "resume-req-01",
                 "document": {"doc_id": 1999, "title": "Post-Failover-Write"},
+                "ownership_epoch": app_s0_f.state.node.epoch_for(1999),
             },
             headers=_sig_headers(),
         )

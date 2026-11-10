@@ -163,6 +163,13 @@ class FailoverInProgress(DocstoreError):
     error_code = "FAILOVER_IN_PROGRESS"
 
 
+class TopologyBusy(DocstoreError):
+    """A topology change (failover / migration) is in progress for the shard."""
+
+    http_status = 503
+    error_code = "TOPOLOGY_BUSY"
+
+
 class OutcomeUnknown(DocstoreError):
     """Write was WAL-appended on the primary but no durable follower ack received.
 

@@ -144,9 +144,18 @@ async def test_promote_never_lowers_term_and_primary_rejects_replication(tmp_pat
     async with LifespanManager(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
             n = app.state.node
-            body, h = _sig({"term": n.term + 1})
+
+            def promotion(term: int) -> dict[str, Any]:
+                return {
+                    "shard_id": "s0",
+                    "term": term,
+                    "ownership_epochs": {f"{r.start}-{r.end}": r.ownership_epoch for r in n.ranges},
+                    "lease": {"granted_at": 0.0, "expires_at": 3600.0},
+                }
+
+            body, h = _sig(promotion(n.term + 1))
             assert (await c.post("/internal/promote", content=body, headers=h)).status_code == 200
-            body, h = _sig({"term": 0})
+            body, h = _sig(promotion(1))  # lower than the node's term now
             assert (await c.post("/internal/promote", content=body, headers=h)).status_code == 409
             assert n.term >= 2
             body, h = _sig(
@@ -211,6 +220,7 @@ async def test_failed_recovery_node_does_not_heartbeat(tmp_path: Path) -> None:
         shard_id="s0",
         coordinator_url="http://coord",
         coordinator_transport=httpx.MockTransport(handler),
+        lease_expires_at=float("inf"),
     )
     async with LifespanManager(app):
         await asyncio.sleep(0.5)
